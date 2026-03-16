@@ -623,6 +623,7 @@ function round1_(value) {
 var FL2_SHEET_FORWARD_LOAD = 'План загрузки';
 var FL2_SHEET_MAILING = 'Отправка';
 var FL2_SHEET_OVERALL_FORECAST = 'Общий план';
+var FL2_SHEET_DISCOUNTS_EMAIL_STATE = 'Состояние рассылки скидок';
 var FL2_PROP_FORWARD_BATCH_STATE = 'FL2_PROP_FORWARD_BATCH_STATE';
 var FL2_PROP_FORWARD_BATCH_PENDING_EMAIL = 'FL2_PROP_FORWARD_BATCH_PENDING_EMAIL';
 var FL2_PROP_FORWARD_BATCH_RUN_ID = 'FL2_PROP_FORWARD_BATCH_RUN_ID';
@@ -2231,49 +2232,63 @@ function sendDiscountsEmails(options) {
     return;
   }
 
+  const doctorRows = discountRows.filter((r) => str_(r['Врачи']));
+  const ppAndOnlineRows = doctorRows.filter((r) => hasNonZeroDiscountValue_(r['Скидка ПП']) || hasNonZeroDiscountValue_(r['Скидка Онлайн']) || isTruthyCell_(r['Бесплатный ПП с МРТ']));
+  const aggregatorsRows = doctorRows.filter((r) => hasNonZeroDiscountValue_(r['Скидка Агрегаторы']));
+  const pRows = doctorRows.filter((r) => hasNonZeroDiscountValue_(r['Скидка П']));
+  const smmRows = doctorRows.filter((r) => isTruthyCell_(r['SMM'])
+    && (hasNonZeroDiscountValue_(r['Скидка ПП']) || hasNonZeroDiscountValue_(r['Скидка Агрегаторы']) || isTruthyCell_(r['Бесплатный ПП с МРТ'])));
+  const siteRows = doctorRows.filter((r) => isTruthyCell_(r['Сайт'])
+    && (hasNonZeroDiscountValue_(r['Скидка ПП']) || hasNonZeroDiscountValue_(r['Скидка Агрегаторы']) || isTruthyCell_(r['Бесплатный ПП с МРТ'])));
+
+  const currentState = {
+    aggregators: buildDoctorSetFromRows_(aggregatorsRows),
+    smm: buildDoctorSetFromRows_(smmRows),
+    site: buildDoctorSetFromRows_(siteRows),
+  };
+  const previousState = readDiscountsEmailState_(ss);
+  const removedDiff = diffRemovedDoctorsByChannel_(previousState, currentState);
+
   const sections = [
     {
       title: 'Скидки на ПП и Онлайн',
       intro: 'Врачи с ненулевыми значениями по скидкам ПП/Онлайн или Бесплатный ПП с МРТ.',
-      rows: discountRows.filter((r) => str_(r['Врачи'])
-        && (hasNonZeroDiscountValue_(r['Скидка ПП']) || hasNonZeroDiscountValue_(r['Скидка Онлайн']) || isTruthyCell_(r['Бесплатный ПП с МРТ']))),
+      rows: ppAndOnlineRows,
       columns: ['Врачи', 'Скидка ПП', 'Скидка Онлайн', 'Бесплатный ПП с МРТ'],
     },
     {
       title: 'Скидки для агрегаторов',
       intro: 'Врачи с ненулевыми значениями в колонке Скидка Агрегаторы.',
-      rows: discountRows.filter((r) => str_(r['Врачи']) && hasNonZeroDiscountValue_(r['Скидка Агрегаторы'])),
+      rows: aggregatorsRows,
       columns: ['Врачи', 'Скидка Агрегаторы'],
     },
     {
       title: 'Скидки на П',
       intro: 'Врачи с ненулевыми значениями в колонке Скидка П.',
-      rows: discountRows.filter((r) => str_(r['Врачи']) && hasNonZeroDiscountValue_(r['Скидка П'])),
+      rows: pRows,
       columns: ['Врачи', 'Скидка П'],
     },
     {
       title: 'Скидки для SMM',
       intro: 'Врачи с включенным флагом SMM и ненулевыми значениями ПП/Агрегаторы/Бесплатный ПП с МРТ.',
-      rows: discountRows.filter((r) => str_(r['Врачи']) && isTruthyCell_(r['SMM'])
-        && (hasNonZeroDiscountValue_(r['Скидка ПП']) || hasNonZeroDiscountValue_(r['Скидка Агрегаторы']) || isTruthyCell_(r['Бесплатный ПП с МРТ']))),
+      rows: smmRows,
       columns: ['Врачи', 'Скидка ПП', 'Скидка Агрегаторы', 'Бесплатный ПП с МРТ'],
     },
     {
       title: 'Скидки для Сайта',
       intro: 'Врачи с включенным флагом Сайт и ненулевыми значениями ПП/Агрегаторы/Бесплатный ПП с МРТ.',
-      rows: discountRows.filter((r) => str_(r['Врачи']) && isTruthyCell_(r['Сайт'])
-        && (hasNonZeroDiscountValue_(r['Скидка ПП']) || hasNonZeroDiscountValue_(r['Скидка Агрегаторы']) || isTruthyCell_(r['Бесплатный ПП с МРТ']))),
+      rows: siteRows,
       columns: ['Врачи', 'Скидка ПП', 'Скидка Агрегаторы', 'Бесплатный ПП с МРТ'],
     },
   ];
 
   const nonEmptySections = sections.filter((section) => section.rows.length);
-  if (!nonEmptySections.length) {
+  if (!nonEmptySections.length && !hasRemovedDoctors_(removedDiff)) {
     if (!silent) SpreadsheetApp.getActive().toast('Нет данных для отправки скидок', MENU_NAME, 5);
     return;
   }
 
-  const htmlBody = buildDiscountsDigestHtmlBody_(nonEmptySections);
+  const htmlBody = buildDiscountsDigestHtmlBody_(nonEmptySections, removedDiff);
   MailApp.sendEmail({
     to: to.join(','),
     cc: cc.join(','),
@@ -2281,24 +2296,134 @@ function sendDiscountsEmails(options) {
     htmlBody,
   });
 
+  saveDiscountsEmailState_(ss, currentState);
+
   if (!silent) {
     SpreadsheetApp.getActive().toast('Рассылка скидок отправлена: 1', MENU_NAME, 5);
   }
 }
 
-function buildDiscountsDigestHtmlBody_(sections) {
+function buildDiscountsDigestHtmlBody_(sections, removedDiff) {
   const blocks = (sections || []).map((section) => {
     const title = `<h3 style="font-family:Arial,sans-serif;margin:20px 0 8px;">${section.title}</h3>`;
     const table = buildDiscountsHtmlBody_(section.intro, section.rows, section.columns);
     return `${title}${table}`;
   });
 
+  const removedBlock = buildRemovedDiscountsHtmlBlock_(removedDiff);
+
   return [
     '<div style="font-family:Arial,sans-serif;font-size:13px;line-height:1.4;">',
     '<p>Коллеги, добрый день! Ниже актуальная сводка по скидкам, разбитая по логическим блокам.</p>',
+    removedBlock,
     ...blocks,
     '</div>',
+  ].filter((part) => str_(part)).join('');
+}
+
+function buildRemovedDiscountsHtmlBlock_(removedDiff) {
+  if (!hasRemovedDoctors_(removedDiff)) return '';
+  const labels = {
+    aggregators: 'Агрегаторы',
+    smm: 'SMM',
+    site: 'Сайт',
+  };
+
+  const channels = ['aggregators', 'smm', 'site'];
+  const listItems = channels.map((channel) => {
+    const doctors = Array.isArray(removedDiff && removedDiff[channel]) ? removedDiff[channel] : [];
+    if (!doctors.length) return '';
+    return `<li><b>${labels[channel]}:</b> ${doctors.join(', ')}</li>`;
+  }).filter((item) => item).join('');
+
+  if (!listItems) return '';
+
+  return [
+    '<h3 style="font-family:Arial,sans-serif;margin:20px 0 8px;color:#b71c1c;">Кого нужно убрать из каналов</h3>',
+    '<p>Блок сформирован по сравнению с последней отправленной рассылкой скидок.</p>',
+    '<ul style="margin:0 0 12px 20px;padding:0;">',
+    listItems,
+    '</ul>',
   ].join('');
+}
+
+function hasRemovedDoctors_(removedDiff) {
+  if (!removedDiff) return false;
+  return ['aggregators', 'smm', 'site'].some((channel) => Array.isArray(removedDiff[channel]) && removedDiff[channel].length);
+}
+
+function buildDoctorSetFromRows_(rows) {
+  const doctors = new Set();
+  (rows || []).forEach((row) => {
+    const doctor = str_(row && row['Врачи']);
+    if (doctor) doctors.add(doctor);
+  });
+  return doctors;
+}
+
+function diffRemovedDoctorsByChannel_(previousState, currentState) {
+  const channels = ['aggregators', 'smm', 'site'];
+  const diff = {};
+  channels.forEach((channel) => {
+    const prevSet = previousState && previousState[channel] instanceof Set ? previousState[channel] : new Set();
+    const curSet = currentState && currentState[channel] instanceof Set ? currentState[channel] : new Set();
+    diff[channel] = [...prevSet].filter((doctor) => !curSet.has(doctor)).sort((a, b) => a.localeCompare(b, 'ru'));
+  });
+  return diff;
+}
+
+function readDiscountsEmailState_(ss) {
+  const sheet = getOrCreateSheet_(ss, FL2_SHEET_DISCOUNTS_EMAIL_STATE);
+  const values = sheet.getDataRange().getValues();
+  if (!values.length) {
+    sheet.getRange(1, 1, 1, 4).setValues([['Канал', 'Врач', 'Состояние', 'Обновлено']]);
+    return { aggregators: new Set(), smm: new Set(), site: new Set() };
+  }
+
+  const header = values[0].map((h) => str_(h));
+  const idxChannel = header.indexOf('Канал');
+  const idxDoctor = header.indexOf('Врач');
+  const idxState = header.indexOf('Состояние');
+  if (idxChannel < 0 || idxDoctor < 0 || idxState < 0) {
+    sheet.clearContents();
+    sheet.getRange(1, 1, 1, 4).setValues([['Канал', 'Врач', 'Состояние', 'Обновлено']]);
+    return { aggregators: new Set(), smm: new Set(), site: new Set() };
+  }
+
+  const out = { aggregators: new Set(), smm: new Set(), site: new Set() };
+  for (let i = 1; i < values.length; i += 1) {
+    const row = values[i];
+    const channel = str_(row[idxChannel]).toLowerCase();
+    const doctor = str_(row[idxDoctor]);
+    const state = str_(row[idxState]).toLowerCase();
+    if (!doctor || state !== 'active') continue;
+    if (channel === 'aggregators' || channel === 'smm' || channel === 'site') {
+      out[channel].add(doctor);
+    }
+  }
+  return out;
+}
+
+function saveDiscountsEmailState_(ss, state) {
+  const sheet = getOrCreateSheet_(ss, FL2_SHEET_DISCOUNTS_EMAIL_STATE);
+  sheet.clearContents();
+  const header = ['Канал', 'Врач', 'Состояние', 'Обновлено'];
+  sheet.getRange(1, 1, 1, header.length).setValues([header]);
+
+  const now = new Date();
+  const channels = ['aggregators', 'smm', 'site'];
+  const rows = [];
+  channels.forEach((channel) => {
+    const doctors = state && state[channel] instanceof Set ? [...state[channel]] : [];
+    doctors.sort((a, b) => a.localeCompare(b, 'ru'));
+    doctors.forEach((doctor) => {
+      rows.push([channel, doctor, 'active', now]);
+    });
+  });
+
+  if (rows.length) {
+    sheet.getRange(2, 1, rows.length, header.length).setValues(rows);
+  }
 }
 
 function hasNonZeroDiscountValue_(value) {
