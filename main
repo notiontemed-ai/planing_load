@@ -2020,6 +2020,7 @@ function buildOverallForecastReport() {
   if (sendAnswer === ui.Button.YES) {
     sendOverallForecastEmail(ss, reportDate || formatDateDDMMYYYY_(new Date()));
   }
+  refreshDiscountsAfterPlanUpdate_();
   SpreadsheetApp.getActive().toast('Общий план собран', MENU_NAME, 5);
 }
 
