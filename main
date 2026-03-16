@@ -2219,75 +2219,86 @@ function sendDiscountsEmails(options) {
 
   const discountRows = getSheetObjects_(discountsSheet);
   const mailingRows = getSheetObjects_(mailingSheet);
+  const mailingTarget = mailingRows.find((r) => str_(r['Филиал']) === 'Скидки');
+  if (!mailingTarget) {
+    throw new Error('В листе "Отправка" не найдена строка "Скидки"');
+  }
 
-  const ppRows = discountRows.filter((r) => str_(r['Врачи'])
-    && (hasNonZeroDiscountValue_(r['Скидка ПП']) || hasNonZeroDiscountValue_(r['Скидка Онлайн']) || isTruthyCell_(r['Бесплатный ПП с МРТ'])));
-  const aggrRows = discountRows.filter((r) => str_(r['Врачи']) && hasNonZeroDiscountValue_(r['Скидка Агрегаторы']));
-  const pRows = discountRows.filter((r) => str_(r['Врачи']) && hasNonZeroDiscountValue_(r['Скидка П']));
-  const smmRows = discountRows.filter((r) => str_(r['Врачи']) && isTruthyCell_(r['SMM'])
-    && (hasNonZeroDiscountValue_(r['Скидка ПП']) || hasNonZeroDiscountValue_(r['Скидка Агрегаторы']) || isTruthyCell_(r['Бесплатный ПП с МРТ'])));
-  const siteRows = discountRows.filter((r) => str_(r['Врачи']) && isTruthyCell_(r['Сайт'])
-    && (hasNonZeroDiscountValue_(r['Скидка ПП']) || hasNonZeroDiscountValue_(r['Скидка Агрегаторы']) || isTruthyCell_(r['Бесплатный ПП с МРТ'])));
+  const to = parseEmailList(mailingTarget['Кому']);
+  const cc = parseEmailList(mailingTarget['Копия']);
+  if (!to.length) {
+    if (!silent) SpreadsheetApp.getActive().toast('Для рассылки скидок не заполнена колонка "Кому"', MENU_NAME, 5);
+    return;
+  }
 
-  const groups = [
+  const sections = [
     {
-      mailingKey: 'Скидки на ПП',
-      subject: 'Скидки на ПП и Онлайн',
+      title: 'Скидки на ПП и Онлайн',
       intro: 'Врачи с ненулевыми значениями по скидкам ПП/Онлайн или Бесплатный ПП с МРТ.',
-      rows: ppRows,
+      rows: discountRows.filter((r) => str_(r['Врачи'])
+        && (hasNonZeroDiscountValue_(r['Скидка ПП']) || hasNonZeroDiscountValue_(r['Скидка Онлайн']) || isTruthyCell_(r['Бесплатный ПП с МРТ']))),
       columns: ['Врачи', 'Скидка ПП', 'Скидка Онлайн', 'Бесплатный ПП с МРТ'],
     },
     {
-      mailingKey: 'Агрегаторы',
-      subject: 'Скидки для агрегаторов',
+      title: 'Скидки для агрегаторов',
       intro: 'Врачи с ненулевыми значениями в колонке Скидка Агрегаторы.',
-      rows: aggrRows,
+      rows: discountRows.filter((r) => str_(r['Врачи']) && hasNonZeroDiscountValue_(r['Скидка Агрегаторы'])),
       columns: ['Врачи', 'Скидка Агрегаторы'],
     },
     {
-      mailingKey: 'Скидки на П',
-      subject: 'Скидки на П',
+      title: 'Скидки на П',
       intro: 'Врачи с ненулевыми значениями в колонке Скидка П.',
-      rows: pRows,
+      rows: discountRows.filter((r) => str_(r['Врачи']) && hasNonZeroDiscountValue_(r['Скидка П'])),
       columns: ['Врачи', 'Скидка П'],
     },
     {
-      mailingKey: 'SMM',
-      subject: 'Скидки для SMM',
+      title: 'Скидки для SMM',
       intro: 'Врачи с включенным флагом SMM и ненулевыми значениями ПП/Агрегаторы/Бесплатный ПП с МРТ.',
-      rows: smmRows,
+      rows: discountRows.filter((r) => str_(r['Врачи']) && isTruthyCell_(r['SMM'])
+        && (hasNonZeroDiscountValue_(r['Скидка ПП']) || hasNonZeroDiscountValue_(r['Скидка Агрегаторы']) || isTruthyCell_(r['Бесплатный ПП с МРТ']))),
       columns: ['Врачи', 'Скидка ПП', 'Скидка Агрегаторы', 'Бесплатный ПП с МРТ'],
     },
     {
-      mailingKey: 'Сайт',
-      subject: 'Скидки для Сайта',
+      title: 'Скидки для Сайта',
       intro: 'Врачи с включенным флагом Сайт и ненулевыми значениями ПП/Агрегаторы/Бесплатный ПП с МРТ.',
-      rows: siteRows,
+      rows: discountRows.filter((r) => str_(r['Врачи']) && isTruthyCell_(r['Сайт'])
+        && (hasNonZeroDiscountValue_(r['Скидка ПП']) || hasNonZeroDiscountValue_(r['Скидка Агрегаторы']) || isTruthyCell_(r['Бесплатный ПП с МРТ']))),
       columns: ['Врачи', 'Скидка ПП', 'Скидка Агрегаторы', 'Бесплатный ПП с МРТ'],
     },
   ];
 
-  let sentCount = 0;
-  groups.forEach((group) => {
-    const m = mailingRows.find((r) => str_(r['Филиал']) === group.mailingKey);
-    if (!m) return;
-    const to = parseEmailList(m['Кому']);
-    const cc = parseEmailList(m['Копия']);
-    if (!to.length || !group.rows.length) return;
+  const nonEmptySections = sections.filter((section) => section.rows.length);
+  if (!nonEmptySections.length) {
+    if (!silent) SpreadsheetApp.getActive().toast('Нет данных для отправки скидок', MENU_NAME, 5);
+    return;
+  }
 
-    const htmlBody = buildDiscountsHtmlBody_(group.intro, group.rows, group.columns);
-    MailApp.sendEmail({
-      to: to.join(','),
-      cc: cc.join(','),
-      subject: `${group.subject} на ${formatDateDDMMYYYY_(new Date())}`,
-      htmlBody,
-    });
-    sentCount += 1;
+  const htmlBody = buildDiscountsDigestHtmlBody_(nonEmptySections);
+  MailApp.sendEmail({
+    to: to.join(','),
+    cc: cc.join(','),
+    subject: `Сводка по скидкам на ${formatDateDDMMYYYY_(new Date())}`,
+    htmlBody,
   });
 
   if (!silent) {
-    SpreadsheetApp.getActive().toast(`Рассылка скидок отправлена: ${sentCount}`, MENU_NAME, 5);
+    SpreadsheetApp.getActive().toast('Рассылка скидок отправлена: 1', MENU_NAME, 5);
   }
+}
+
+function buildDiscountsDigestHtmlBody_(sections) {
+  const blocks = (sections || []).map((section) => {
+    const title = `<h3 style="font-family:Arial,sans-serif;margin:20px 0 8px;">${section.title}</h3>`;
+    const table = buildDiscountsHtmlBody_(section.intro, section.rows, section.columns);
+    return `${title}${table}`;
+  });
+
+  return [
+    '<div style="font-family:Arial,sans-serif;font-size:13px;line-height:1.4;">',
+    '<p>Коллеги, добрый день! Ниже актуальная сводка по скидкам, разбитая по логическим блокам.</p>',
+    ...blocks,
+    '</div>',
+  ].join('');
 }
 
 function hasNonZeroDiscountValue_(value) {
