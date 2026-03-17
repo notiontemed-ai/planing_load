@@ -2241,63 +2241,55 @@ function sendDiscountsEmails(options) {
   const siteRows = doctorRows.filter((r) => isTruthyCell_(r['Сайт'])
     && (hasNonZeroDiscountValue_(r['Скидка ПП']) || hasNonZeroDiscountValue_(r['Скидка Агрегаторы']) || isTruthyCell_(r['Бесплатный ПП с МРТ'])));
 
-  const channelColumns = {
-    aggregators: ['Врачи', 'Скидка Агрегаторы'],
-    smm: ['Врачи', 'Скидка ПП', 'Скидка Агрегаторы', 'Бесплатный ПП с МРТ'],
-    site: ['Врачи', 'Скидка ПП', 'Скидка Агрегаторы', 'Бесплатный ПП с МРТ'],
-  };
-
-  const currentState = {
-    aggregators: buildDiscountChannelState_(aggregatorsRows, channelColumns.aggregators),
-    smm: buildDiscountChannelState_(smmRows, channelColumns.smm),
-    site: buildDiscountChannelState_(siteRows, channelColumns.site),
-  };
-  const previousState = readDiscountsEmailState_(ss);
-  const changeDiff = diffDiscountDoctorsByChannel_(previousState, currentState);
-
   const sections = [
     {
+      key: 'pp_online',
       title: 'Скидки на ПП и Онлайн',
       intro: 'Врачи с ненулевыми значениями по скидкам ПП/Онлайн или Бесплатный ПП с МРТ.',
       rows: ppAndOnlineRows,
       columns: ['Врачи', 'Скидка ПП', 'Скидка Онлайн', 'Бесплатный ПП с МРТ'],
     },
     {
+      key: 'aggregators',
       title: 'Скидки для агрегаторов',
       intro: 'Врачи с ненулевыми значениями в колонке Скидка Агрегаторы.',
       rows: aggregatorsRows,
       columns: ['Врачи', 'Скидка Агрегаторы'],
-      channel: 'aggregators',
     },
     {
+      key: 'p_discount',
       title: 'Скидки на П',
       intro: 'Врачи с ненулевыми значениями в колонке Скидка П.',
       rows: pRows,
       columns: ['Врачи', 'Скидка П'],
     },
     {
+      key: 'smm',
       title: 'Скидки для SMM',
       intro: 'Врачи с включенным флагом SMM и ненулевыми значениями ПП/Агрегаторы/Бесплатный ПП с МРТ.',
       rows: smmRows,
       columns: ['Врачи', 'Скидка ПП', 'Скидка Агрегаторы', 'Бесплатный ПП с МРТ'],
-      channel: 'smm',
     },
     {
+      key: 'site',
       title: 'Скидки для Сайта',
       intro: 'Врачи с включенным флагом Сайт и ненулевыми значениями ПП/Агрегаторы/Бесплатный ПП с МРТ.',
       rows: siteRows,
       columns: ['Врачи', 'Скидка ПП', 'Скидка Агрегаторы', 'Бесплатный ПП с МРТ'],
-      channel: 'site',
     },
   ];
 
-  const sectionsForSend = sections.filter((section) => section.rows.length || sectionHasDiscountDiff_(section, changeDiff));
+  const currentState = buildDiscountSectionsState_(sections);
+  const previousState = readDiscountsEmailState_(ss);
+  const changeDiff = diffDiscountDoctorsBySection_(previousState, currentState);
+
+  const sectionsForSend = sections.filter((section) => sectionHasDiscountDiff_(section, changeDiff));
   if (!sectionsForSend.length) {
     if (!silent) SpreadsheetApp.getActive().toast('Нет данных для отправки скидок', MENU_NAME, 5);
     return;
   }
 
-  const htmlBody = buildDiscountsDigestHtmlBody_(sectionsForSend, changeDiff, previousState);
+  const htmlBody = buildDiscountsDigestHtmlBody_(sectionsForSend, changeDiff, previousState, currentState);
   MailApp.sendEmail({
     to: to.join(','),
     cc: cc.join(','),
@@ -2312,10 +2304,10 @@ function sendDiscountsEmails(options) {
   }
 }
 
-function buildDiscountsDigestHtmlBody_(sections, changeDiff, previousState) {
+function buildDiscountsDigestHtmlBody_(sections, changeDiff, previousState, currentState) {
   const blocks = (sections || []).map((section) => {
     const title = `<h3 style="font-family:Arial,sans-serif;margin:20px 0 8px;">${section.title}</h3>`;
-    const table = buildDiscountsHtmlBody_(section, changeDiff, previousState);
+    const table = buildDiscountsHtmlBody_(section, changeDiff, previousState, currentState);
     return `${title}${table}`;
   });
 
@@ -2327,36 +2319,27 @@ function buildDiscountsDigestHtmlBody_(sections, changeDiff, previousState) {
   ].filter((part) => str_(part)).join('');
 }
 
-function buildDiscountsChannelDiffHtml_(channel, changeDiff) {
-  if (!channel || !changeDiff) return '';
-  const channelDiff = changeDiff[channel] || {};
-  const added = Array.isArray(channelDiff.added) ? channelDiff.added : [];
-  const removed = Array.isArray(channelDiff.removed) ? channelDiff.removed : [];
-  if (!added.length && !removed.length) return '';
-
-  const labels = {
-    aggregators: 'Агрегаторы',
-    smm: 'SMM',
-    site: 'Сайт',
-  };
-  const label = labels[channel] || channel;
-
-  return [
-    `<p style="margin:0 0 8px 0;"><b>${label} — изменения относительно прошлой рассылки:</b></p>`,
-    added.length ? `<p style="margin:0 0 6px 0;color:#1b5e20;"><b>Добавить:</b> ${added.join(', ')}</p>` : '',
-    removed.length ? `<p style="margin:0 0 8px 0;color:#b71c1c;"><b>Убрать:</b> ${removed.join(', ')}</p>` : '',
-  ].join('');
-}
-
-
 function sectionHasDiscountDiff_(section, changeDiff) {
-  const channel = section && section.channel;
-  if (!channel || !changeDiff) return false;
-  const d = changeDiff[channel] || {};
-  return (Array.isArray(d.added) && d.added.length) || (Array.isArray(d.removed) && d.removed.length);
+  const key = section && section.key;
+  if (!key || !changeDiff) return false;
+  const d = changeDiff[key] || {};
+  return (Array.isArray(d.added) && d.added.length)
+    || (Array.isArray(d.changed) && d.changed.length)
+    || (Array.isArray(d.unchanged) && d.unchanged.length)
+    || (Array.isArray(d.removed) && d.removed.length);
 }
 
-function buildDiscountChannelState_(rows, columns) {
+function buildDiscountSectionsState_(sections) {
+  const out = {};
+  (sections || []).forEach((section) => {
+    const key = str_(section && section.key);
+    if (!key) return;
+    out[key] = buildDiscountSectionState_((section && section.rows) || [], (section && section.columns) || []);
+  });
+  return out;
+}
+
+function buildDiscountSectionState_(rows, columns) {
   const out = new Map();
   (rows || []).forEach((row) => {
     const doctor = str_(row && row['Врачи']);
@@ -2371,15 +2354,63 @@ function buildDiscountChannelState_(rows, columns) {
   return out;
 }
 
-function diffDiscountDoctorsByChannel_(previousState, currentState) {
-  const channels = ['aggregators', 'smm', 'site'];
+function diffDiscountDoctorsBySection_(previousState, currentState) {
+  const sectionKeys = Array.from(new Set([
+    ...Object.keys(previousState || {}),
+    ...Object.keys(currentState || {}),
+  ]));
   const diff = {};
-  channels.forEach((channel) => {
-    const prevMap = previousState && previousState[channel] instanceof Map ? previousState[channel] : new Map();
-    const curMap = currentState && currentState[channel] instanceof Map ? currentState[channel] : new Map();
-    diff[channel] = {
-      added: [...curMap.keys()].filter((doctor) => !prevMap.has(doctor)).sort((a, b) => a.localeCompare(b, 'ru')),
-      removed: [...prevMap.keys()].filter((doctor) => !curMap.has(doctor)).sort((a, b) => a.localeCompare(b, 'ru')),
+  sectionKeys.forEach((key) => {
+    const prevMap = previousState && previousState[key] instanceof Map ? previousState[key] : new Map();
+    const curMap = currentState && currentState[key] instanceof Map ? currentState[key] : new Map();
+    const doctors = Array.from(new Set([...curMap.keys(), ...prevMap.keys()]));
+    const byDoctor = {};
+    const added = [];
+    const changed = [];
+    const unchanged = [];
+    const removed = [];
+
+    doctors.forEach((doctor) => {
+      const hasPrev = prevMap.has(doctor);
+      const hasCur = curMap.has(doctor);
+      const prevPayload = hasPrev ? (prevMap.get(doctor) || {}) : {};
+      const curPayload = hasCur ? (curMap.get(doctor) || {}) : {};
+
+      if (hasCur && !hasPrev) {
+        byDoctor[doctor] = { status: 'added', changedColumns: [] };
+        added.push(doctor);
+        return;
+      }
+      if (!hasCur && hasPrev) {
+        byDoctor[doctor] = { status: 'removed', changedColumns: [] };
+        removed.push(doctor);
+        return;
+      }
+
+      const changedColumns = [];
+      const columns = Array.from(new Set([...Object.keys(prevPayload), ...Object.keys(curPayload)]));
+      columns.forEach((column) => {
+        if (str_(prevPayload[column]) !== str_(curPayload[column])) {
+          changedColumns.push(column);
+        }
+      });
+
+      if (changedColumns.length) {
+        byDoctor[doctor] = { status: 'changed', changedColumns };
+        changed.push(doctor);
+      } else {
+        byDoctor[doctor] = { status: 'unchanged', changedColumns: [] };
+        unchanged.push(doctor);
+      }
+    });
+
+    const sortRu = (a, b) => a.localeCompare(b, 'ru');
+    diff[key] = {
+      byDoctor,
+      added: added.sort(sortRu),
+      changed: changed.sort(sortRu),
+      unchanged: unchanged.sort(sortRu),
+      removed: removed.sort(sortRu),
     };
   });
   return diff;
@@ -2389,36 +2420,36 @@ function readDiscountsEmailState_(ss) {
   const sheet = getOrCreateSheet_(ss, FL2_SHEET_DISCOUNTS_EMAIL_STATE);
   const values = sheet.getDataRange().getValues();
   if (!values.length) {
-    sheet.getRange(1, 1, 1, 4).setValues([['Канал', 'Врач', 'Данные', 'Обновлено']]);
-    return { aggregators: new Map(), smm: new Map(), site: new Map() };
+    sheet.getRange(1, 1, 1, 4).setValues([['Блок', 'Врач', 'Данные', 'Обновлено']]);
+    return {};
   }
 
   const header = values[0].map((h) => str_(h));
-  const idxChannel = header.indexOf('Канал');
+  const idxSection = header.indexOf('Блок') >= 0 ? header.indexOf('Блок') : header.indexOf('Канал');
   const idxDoctor = header.indexOf('Врач');
   const idxPayload = header.indexOf('Данные');
-  if (idxChannel < 0 || idxDoctor < 0 || idxPayload < 0) {
+  if (idxSection < 0 || idxDoctor < 0 || idxPayload < 0) {
     sheet.clearContents();
-    sheet.getRange(1, 1, 1, 4).setValues([['Канал', 'Врач', 'Данные', 'Обновлено']]);
-    return { aggregators: new Map(), smm: new Map(), site: new Map() };
+    sheet.getRange(1, 1, 1, 4).setValues([['Блок', 'Врач', 'Данные', 'Обновлено']]);
+    return {};
   }
 
-  const out = { aggregators: new Map(), smm: new Map(), site: new Map() };
+  const out = {};
   for (let i = 1; i < values.length; i += 1) {
     const row = values[i];
-    const channel = str_(row[idxChannel]).toLowerCase();
+    const sectionKey = str_(row[idxSection]);
     const doctor = str_(row[idxDoctor]);
     const payloadRaw = str_(row[idxPayload]);
-    if (!doctor) continue;
-    if (channel === 'aggregators' || channel === 'smm' || channel === 'site') {
-      let payload = {};
-      try {
-        payload = payloadRaw ? JSON.parse(payloadRaw) : {};
-      } catch (e) {
-        payload = {};
-      }
-      out[channel].set(doctor, payload);
+    if (!sectionKey || !doctor) continue;
+    if (!(out[sectionKey] instanceof Map)) out[sectionKey] = new Map();
+
+    let payload = {};
+    try {
+      payload = payloadRaw ? JSON.parse(payloadRaw) : {};
+    } catch (e) {
+      payload = {};
     }
+    out[sectionKey].set(doctor, payload);
   }
   return out;
 }
@@ -2426,18 +2457,17 @@ function readDiscountsEmailState_(ss) {
 function saveDiscountsEmailState_(ss, state) {
   const sheet = getOrCreateSheet_(ss, FL2_SHEET_DISCOUNTS_EMAIL_STATE);
   sheet.clearContents();
-  const header = ['Канал', 'Врач', 'Данные', 'Обновлено'];
+  const header = ['Блок', 'Врач', 'Данные', 'Обновлено'];
   sheet.getRange(1, 1, 1, header.length).setValues([header]);
 
   const now = new Date();
-  const channels = ['aggregators', 'smm', 'site'];
+  const sectionKeys = Object.keys(state || {}).sort((a, b) => a.localeCompare(b, 'ru'));
   const rows = [];
-  channels.forEach((channel) => {
-    const doctors = state && state[channel] instanceof Map ? [...state[channel].keys()] : [];
-    doctors.sort((a, b) => a.localeCompare(b, 'ru'));
+  sectionKeys.forEach((key) => {
+    const doctorsMap = state[key] instanceof Map ? state[key] : new Map();
+    const doctors = [...doctorsMap.keys()].sort((a, b) => a.localeCompare(b, 'ru'));
     doctors.forEach((doctor) => {
-      const payload = state[channel].get(doctor) || {};
-      rows.push([channel, doctor, JSON.stringify(payload), now]);
+      rows.push([key, doctor, JSON.stringify(doctorsMap.get(doctor) || {}), now]);
     });
   });
 
@@ -2460,27 +2490,38 @@ function isTruthyCell_(value) {
   return text === 'true' || text === 'истина' || text === 'да' || text === '1' || text === '✓' || text === '✔';
 }
 
-function buildDiscountsHtmlBody_(section, changeDiff, previousState) {
+function buildDiscountsHtmlBody_(section, changeDiff, previousState, currentState) {
   const intro = section && section.intro;
-  const rows = section && section.rows;
   const columns = section && section.columns;
-  const channel = section && section.channel;
-  const previousChannelState = channel && previousState && previousState[channel] instanceof Map ? previousState[channel] : null;
+  const key = section && section.key;
+  const prevMap = key && previousState && previousState[key] instanceof Map ? previousState[key] : new Map();
+  const curMap = key && currentState && currentState[key] instanceof Map ? currentState[key] : new Map();
+  const sectionDiff = key && changeDiff ? (changeDiff[key] || {}) : {};
+
+  const sortedDoctors = []
+    .concat(sectionDiff.added || [])
+    .concat(sectionDiff.changed || [])
+    .concat(sectionDiff.unchanged || [])
+    .concat(sectionDiff.removed || []);
+
   const header = (columns || []).map((c) => `<th style="border:1px solid #cfd8dc;padding:6px 8px;background:#f3f3f3;">${escapeHtml_(c)}</th>`).join('');
-  const bodyRows = (rows || []).map((r) => {
-    const doctor = str_(r['Врачи']);
-    const previousRow = previousChannelState && doctor ? (previousChannelState.get(doctor) || null) : null;
-    const cells = (columns || []).map((c) => {
-      const currentValue = str_(r[c]);
-      const previousValue = previousRow ? str_(previousRow[c]) : '';
-      const cell = formatDiscountCellValue_(c, currentValue, previousValue, Boolean(previousRow));
+  const bodyRows = sortedDoctors.map((doctor) => {
+    const doctorDiff = sectionDiff.byDoctor && sectionDiff.byDoctor[doctor] ? sectionDiff.byDoctor[doctor] : { status: 'unchanged', changedColumns: [] };
+    const status = doctorDiff.status;
+    const changedColumns = doctorDiff.changedColumns || [];
+    const prevPayload = prevMap.get(doctor) || {};
+    const curPayload = curMap.get(doctor) || {};
+
+    const cells = (columns || []).map((column) => {
+      const currentValue = column === 'Врачи' ? doctor : str_(curPayload[column]);
+      const previousValue = column === 'Врачи' ? doctor : str_(prevPayload[column]);
+      const cell = formatDiscountCellValue_(column, currentValue, previousValue, status, changedColumns);
       return `<td style="border:1px solid #cfd8dc;padding:6px 8px;">${cell}</td>`;
     }).join('');
     return `<tr>${cells}</tr>`;
   }).join('');
   return [
     `<p>${escapeHtml_(intro)}</p>`,
-    buildDiscountsChannelDiffHtml_(channel, changeDiff),
     '<table style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:13px;line-height:1.35;">',
     `<tr>${header}</tr>`,
     bodyRows,
@@ -2488,20 +2529,36 @@ function buildDiscountsHtmlBody_(section, changeDiff, previousState) {
   ].join('');
 }
 
-function formatDiscountCellValue_(column, currentValue, previousValue, hasPreviousRow) {
+function formatDiscountCellValue_(column, currentValue, previousValue, status, changedColumns) {
   const current = str_(currentValue);
   const previous = str_(previousValue);
-  if (column === 'Врачи' || !hasPreviousRow || current === previous) {
-    return escapeHtml_(current);
+  const isChangedColumn = (changedColumns || []).indexOf(column) >= 0;
+
+  if (status === 'removed') {
+    return `<span style="color:#b71c1c;text-decoration:line-through;">${escapeHtml_(previous || current)}</span>`;
   }
-  if (!previous && current) {
+  if (status === 'added') {
     return `<span style="color:#1b5e20;font-weight:700;">${escapeHtml_(current)}</span>`;
   }
-  return [
-    `<span style="color:#b71c1c;text-decoration:line-through;">${escapeHtml_(previous)}</span>`,
-    '<br>',
-    `<span style="color:#1b5e20;">${escapeHtml_(current)}</span>`,
-  ].join('');
+  if (status === 'changed' && column !== 'Врачи' && isChangedColumn) {
+    if (!previous && current) {
+      return `<span style="color:#1b5e20;font-weight:700;">${escapeHtml_(current)}</span>`;
+    }
+    if (previous && !current) {
+      return [
+        '<span style="color:#1b5e20;font-weight:700;">—</span>',
+        ' ',
+        `<span style="color:#b71c1c;text-decoration:line-through;">${escapeHtml_(previous)}</span>`,
+      ].join('');
+    }
+    return [
+      `<span style="color:#1b5e20;font-weight:700;">${escapeHtml_(current)}</span>`,
+      ' ',
+      `<span style="color:#b71c1c;text-decoration:line-through;">${escapeHtml_(previous)}</span>`,
+    ].join('');
+  }
+
+  return escapeHtml_(current || previous);
 }
 
 function escapeHtml_(value) {
