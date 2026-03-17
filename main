@@ -2305,21 +2305,18 @@ function sendDiscountsEmails(options) {
 }
 
 function buildDiscountsDigestHtmlBody_(sections, changeDiff, previousState, currentState) {
-  const generatedAtMoscow = formatDateTimeMoscow_(new Date());
-  const blocks = (sections || []).map((section) => `<h3 style="font-family:Arial,sans-serif;margin:20px 0 8px;">${section.title}</h3>`);
+  const blocks = (sections || []).map((section) => {
+    const title = `<h3 style="font-family:Arial,sans-serif;margin:20px 0 8px;">${section.title}</h3>`;
+    const table = buildDiscountsHtmlBody_(section, changeDiff, previousState, currentState);
+    return `${title}${table}`;
+  });
 
   return [
     '<div style="font-family:Arial,sans-serif;font-size:13px;line-height:1.4;">',
-    `<p>Дата и московское время формирования информации: ${generatedAtMoscow}</p>`,
+    '<p>Коллеги, добрый день! Ниже актуальная сводка по скидкам, разбитая по логическим блокам.</p>',
     ...blocks,
     '</div>',
   ].filter((part) => str_(part)).join('');
-}
-
-function formatDateTimeMoscow_(value) {
-  const date = value instanceof Date ? value : toDate_(value);
-  if (!date) return '';
-  return Utilities.formatDate(date, 'Europe/Moscow', 'dd.MM.yyyy HH:mm:ss');
 }
 
 function sectionHasDiscountDiff_(section, changeDiff) {
