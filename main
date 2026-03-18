@@ -2057,17 +2057,17 @@ function updateDiscountsByPlan(options) {
     if (col[name] === undefined) throw new Error(`На листе "Скидки" не найдена колонка "${name}"`);
   });
 
-  const outputColPP = findFirstHeaderIndex_(col, ['Стоимость ПП', 'Скидка ПП']);
-  const outputColOnline = findFirstHeaderIndex_(col, ['Стоимость Онлайн ПП', 'Скидка Онлайн']);
-  const outputColP = findFirstHeaderIndex_(col, ['Стоимость П', 'Скидка П']);
-  const outputColAggregators = findFirstHeaderIndex_(col, ['Стоимость Агрегаторы', 'Скидка Агрегаторы']);
+  const outputColsPP = findHeaderIndexes_(col, ['Стоимость ПП', 'Скидка ПП']);
+  const outputColsOnline = findHeaderIndexes_(col, ['Стоимость Онлайн ПП', 'Скидка Онлайн']);
+  const outputColsP = findHeaderIndexes_(col, ['Стоимость П', 'Скидка П']);
+  const outputColsAggregators = findHeaderIndexes_(col, ['Стоимость Агрегаторы', 'Скидка Агрегаторы']);
   [
-    ['Стоимость ПП', outputColPP],
-    ['Стоимость Онлайн ПП', outputColOnline],
-    ['Стоимость П', outputColP],
-    ['Стоимость Агрегаторы', outputColAggregators],
-  ].forEach(([name, idx]) => {
-    if (idx === undefined) throw new Error(`На листе "Скидки" не найдена колонка "${name}"`);
+    ['Стоимость ПП', outputColsPP],
+    ['Стоимость Онлайн ПП', outputColsOnline],
+    ['Стоимость П', outputColsP],
+    ['Стоимость Агрегаторы', outputColsAggregators],
+  ].forEach(([name, indexes]) => {
+    if (!indexes.length) throw new Error(`На листе "Скидки" не найдена колонка "${name}"`);
   });
 
   const doctorMetrics = collectDoctorPlanMetricsByName_(ss);
@@ -2128,13 +2128,22 @@ function updateDiscountsByPlan(options) {
   }
 
   const outputColumns = [
-    outputColPP + 1,
-    outputColOnline + 1,
-    outputColP + 1,
-    outputColAggregators + 1,
+    ...outputColsPP.map((idx) => idx + 1),
+    ...outputColsOnline.map((idx) => idx + 1),
+    ...outputColsP.map((idx) => idx + 1),
+    ...outputColsAggregators.map((idx) => idx + 1),
     col['Бесплатный ПП с МРТ'] + 1,
   ];
-  writeColumnBatch_(discountsSheet, 2, outputColumns, updates);
+  const expandedUpdates = updates.map((row) => {
+    const values = [];
+    outputColsPP.forEach(() => values.push(row[0]));
+    outputColsOnline.forEach(() => values.push(row[1]));
+    outputColsP.forEach(() => values.push(row[2]));
+    outputColsAggregators.forEach(() => values.push(row[3]));
+    values.push(row[4]);
+    return values;
+  });
+  writeColumnBatch_(discountsSheet, 2, outputColumns, expandedUpdates);
 
   if (!silent) SpreadsheetApp.getActive().toast('Скидки обновлены по данным плана', MENU_NAME, 5);
 }
@@ -2172,12 +2181,22 @@ function buildHeaderIndexMap_(headers) {
 }
 
 function findFirstHeaderIndex_(colMap, names) {
+  const indexes = findHeaderIndexes_(colMap, names);
+  return indexes.length ? indexes[0] : undefined;
+}
+
+function findHeaderIndexes_(colMap, names) {
   const candidates = Array.isArray(names) ? names : [names];
+  const seen = new Set();
+  const indexes = [];
   for (let i = 0; i < candidates.length; i += 1) {
     const name = candidates[i];
-    if (colMap[name] !== undefined) return colMap[name];
+    const idx = colMap[name];
+    if (idx === undefined || seen.has(idx)) continue;
+    seen.add(idx);
+    indexes.push(idx);
   }
-  return undefined;
+  return indexes;
 }
 
 function normalizeDiscountMailRow_(row) {
