@@ -2046,32 +2046,44 @@ function updateDiscountsByPlan(options) {
 
   const headers = data[0].map((h) => str_(h));
   const col = buildHeaderIndexMap_(headers);
-  const required = requireDiscountSheetColumnIndexes_(col, [
+  const required = [
     'Врачи',
     'Мин окон ПП 3',
     'Мин окон ПП 7',
-    'Скидка ПП',
-    'Скидка Онлайн',
-    'Скидка П',
-    'Скидка Агрегаторы',
     'Бесплатный ПП с МРТ',
     'Условие Бесплатный с ПП МРТ',
-  ]);
+  ];
+  required.forEach((name) => {
+    if (col[name] === undefined) throw new Error(`На листе "Скидки" не найдена колонка "${name}"`);
+  });
+
+  const outputColPP = findFirstHeaderIndex_(col, ['Стоимость ПП', 'Скидка ПП']);
+  const outputColOnline = findFirstHeaderIndex_(col, ['Стоимость Онлайн ПП', 'Скидка Онлайн']);
+  const outputColP = findFirstHeaderIndex_(col, ['Стоимость П', 'Скидка П']);
+  const outputColAggregators = findFirstHeaderIndex_(col, ['Стоимость Агрегаторы', 'Скидка Агрегаторы']);
+  [
+    ['Стоимость ПП', outputColPP],
+    ['Стоимость Онлайн ПП', outputColOnline],
+    ['Стоимость П', outputColP],
+    ['Стоимость Агрегаторы', outputColAggregators],
+  ].forEach(([name, idx]) => {
+    if (idx === undefined) throw new Error(`На листе "Скидки" не найдена колонка "${name}"`);
+  });
 
   const doctorMetrics = collectDoctorPlanMetricsByName_(ss);
 
   const updates = [];
   for (let i = 1; i < data.length; i += 1) {
     const row = data[i].slice();
-    const doctor = str_(row[required['Врачи']]);
+    const doctor = str_(row[col['Врачи']]);
     if (!doctor) {
       updates.push(['', '', '', '', '']);
       continue;
     }
 
     const m = doctorMetrics.get(doctor) || { load3: null, load7: null, freePP3: 0, freePP7: 0 };
-    const minPP3 = parseLocaleNumber(row[required['Мин окон ПП 3']]);
-    const minPP7 = parseLocaleNumber(row[required['Мин окон ПП 7']]);
+    const minPP3 = parseLocaleNumber(row[col['Мин окон ПП 3']]);
+    const minPP7 = parseLocaleNumber(row[col['Мин окон ПП 7']]);
 
     const cond = {
       '3-25': m.load3 !== null && m.load3 < 25 && m.freePP3 >= minPP3,
@@ -2103,7 +2115,7 @@ function updateDiscountsByPlan(options) {
       '7-20': 'Скидка Агрегаторы 7-20',
     }, cond);
 
-    const mriCondition = str_(row[required['Условие Бесплатный с ПП МРТ']]);
+    const mriCondition = str_(row[col['Условие Бесплатный с ПП МРТ']]);
     const isMriFree = isMriConditionSatisfied_(mriCondition, cond);
 
     updates.push([
@@ -2116,11 +2128,11 @@ function updateDiscountsByPlan(options) {
   }
 
   const outputColumns = [
-    required['Скидка ПП'] + 1,
-    required['Скидка Онлайн'] + 1,
-    required['Скидка П'] + 1,
-    required['Скидка Агрегаторы'] + 1,
-    required['Бесплатный ПП с МРТ'] + 1,
+    outputColPP + 1,
+    outputColOnline + 1,
+    outputColP + 1,
+    outputColAggregators + 1,
+    col['Бесплатный ПП с МРТ'] + 1,
   ];
   writeColumnBatch_(discountsSheet, 2, outputColumns, updates);
 
@@ -2159,48 +2171,29 @@ function buildHeaderIndexMap_(headers) {
   return map;
 }
 
-function getDiscountSheetColumnAliases_() {
-  return {
-    'Скидка ПП': ['Скидка ПП', 'Стоимость ПП'],
-    'Скидка Онлайн': ['Скидка Онлайн', 'Стоимость Онлайн ПП'],
-    'Скидка П': ['Скидка П', 'Стоимость П'],
-    'Скидка Агрегаторы': ['Скидка Агрегаторы', 'Стоимость Агрегаторы'],
-  };
-}
-
-function resolveDiscountSheetColumnIndex_(colMap, columnName) {
-  const aliases = getDiscountSheetColumnAliases_()[columnName] || [columnName];
-  for (let i = 0; i < aliases.length; i += 1) {
-    const alias = aliases[i];
-    if (colMap[alias] !== undefined) return colMap[alias];
+function findFirstHeaderIndex_(colMap, names) {
+  const candidates = Array.isArray(names) ? names : [names];
+  for (let i = 0; i < candidates.length; i += 1) {
+    const name = candidates[i];
+    if (colMap[name] !== undefined) return colMap[name];
   }
   return undefined;
 }
 
-function requireDiscountSheetColumnIndexes_(colMap, columnNames) {
-  const out = {};
-  (columnNames || []).forEach((name) => {
-    const idx = resolveDiscountSheetColumnIndex_(colMap, name);
-    if (idx === undefined) throw new Error(`На листе "Скидки" не найдена колонка "${name}"`);
-    out[name] = idx;
-  });
-  return out;
+function normalizeDiscountMailRow_(row) {
+  const item = Object.assign({}, row || {});
+  if (item['Скидка ПП'] === undefined && item['Стоимость ПП'] !== undefined) item['Скидка ПП'] = item['Стоимость ПП'];
+  if (item['Скидка Онлайн'] === undefined && item['Стоимость Онлайн ПП'] !== undefined) item['Скидка Онлайн'] = item['Стоимость Онлайн ПП'];
+  if (item['Скидка П'] === undefined && item['Стоимость П'] !== undefined) item['Скидка П'] = item['Стоимость П'];
+  if (item['Скидка Агрегаторы'] === undefined && item['Стоимость Агрегаторы'] !== undefined) item['Скидка Агрегаторы'] = item['Стоимость Агрегаторы'];
+  return item;
 }
 
-function normalizeDiscountSheetRow_(row) {
-  const item = Object.assign({}, row || {});
-  const aliases = getDiscountSheetColumnAliases_();
-  Object.keys(aliases).forEach((canonicalName) => {
-    const names = aliases[canonicalName];
-    for (let i = 0; i < names.length; i += 1) {
-      const name = names[i];
-      if (Object.prototype.hasOwnProperty.call(item, name)) {
-        item[canonicalName] = item[name];
-        break;
-      }
-    }
-  });
-  return item;
+function getDiscountEmailColumnTitle_(column) {
+  if (column === 'Скидка ПП') return 'ПП';
+  if (column === 'Скидка Онлайн') return 'Онлайн ПП';
+  if (column === 'Скидка П') return 'П';
+  return column;
 }
 
 function pickMinimumDiscountByConditions_(row, colMap, ruleColumns, condMap) {
@@ -2263,7 +2256,7 @@ function sendDiscountsEmails(options) {
     throw new Error('Не найдены листы "Скидки" или "Отправка"');
   }
 
-  const discountRows = getSheetObjects_(discountsSheet).map((row) => normalizeDiscountSheetRow_(row));
+  const discountRows = getSheetObjects_(discountsSheet).map((row) => normalizeDiscountMailRow_(row));
   const mailingRows = getSheetObjects_(mailingSheet);
   const mailingTarget = mailingRows.find((r) => str_(r['Филиал']) === 'Скидки');
   if (!mailingTarget) {
@@ -2291,50 +2284,31 @@ function sendDiscountsEmails(options) {
       key: 'pp_discount',
       title: 'Скидки на ПП и Онлайн',
       rows: ppAndOnlineRows,
-      columns: [
-        { key: 'Врачи', title: 'Врачи' },
-        { key: 'Скидка ПП', title: 'ПП' },
-        { key: 'Скидка Онлайн', title: 'Онлайн ПП' },
-        { key: 'Бесплатный ПП с МРТ', title: 'Бесплатный ПП с МРТ' },
-      ],
+      columns: ['Врачи', 'Скидка ПП', 'Скидка Онлайн', 'Бесплатный ПП с МРТ'],
     },
     {
       key: 'aggregators',
       title: 'Скидки для агрегаторов',
       rows: aggregatorsRows,
-      columns: [
-        { key: 'Врачи', title: 'Врачи' },
-        { key: 'Скидка Агрегаторы', title: 'Стоимость Агрегаторы' },
-      ],
+      columns: ['Врачи', 'Скидка Агрегаторы'],
     },
     {
       key: 'p_discount',
       title: 'Скидки на П',
       rows: pRows,
-      columns: [
-        { key: 'Врачи', title: 'Врачи' },
-        { key: 'Скидка П', title: 'П' },
-      ],
+      columns: ['Врачи', 'Скидка П'],
     },
     {
       key: 'smm',
       title: 'Скидки для SMM',
       rows: smmRows,
-      columns: [
-        { key: 'Врачи', title: 'Врачи' },
-        { key: 'Скидка ПП', title: 'ПП' },
-        { key: 'Бесплатный ПП с МРТ', title: 'Бесплатный ПП с МРТ' },
-      ],
+      columns: ['Врачи', 'Скидка ПП', 'Бесплатный ПП с МРТ'],
     },
     {
       key: 'site',
       title: 'Скидки для Сайта',
       rows: siteRows,
-      columns: [
-        { key: 'Врачи', title: 'Врачи' },
-        { key: 'Скидка ПП', title: 'ПП' },
-        { key: 'Бесплатный ПП с МРТ', title: 'Бесплатный ПП с МРТ' },
-      ],
+      columns: ['Врачи', 'Скидка ПП', 'Бесплатный ПП с МРТ'],
     },
   ];
 
@@ -2395,16 +2369,6 @@ function sectionHasDiscountDiff_(section, changeDiff) {
     || (Array.isArray(d.removed) && d.removed.length);
 }
 
-function getDiscountColumnKey_(columnDef) {
-  if (columnDef && typeof columnDef === 'object') return str_(columnDef.key);
-  return str_(columnDef);
-}
-
-function getDiscountColumnTitle_(columnDef) {
-  if (columnDef && typeof columnDef === 'object') return str_(columnDef.title || columnDef.key);
-  return str_(columnDef);
-}
-
 function buildDiscountSectionsState_(sections) {
   const out = {};
   (sections || []).forEach((section) => {
@@ -2421,8 +2385,7 @@ function buildDiscountSectionState_(rows, columns) {
     const doctor = str_(row && row['Врачи']);
     if (!doctor) return;
     const payload = {};
-    (columns || []).forEach((columnDef) => {
-      const column = getDiscountColumnKey_(columnDef);
+    (columns || []).forEach((column) => {
       if (column === 'Врачи') return;
       payload[column] = str_(row[column]);
     });
@@ -2581,7 +2544,7 @@ function buildDiscountsHtmlBody_(section, changeDiff, previousState, currentStat
     .concat(sectionDiff.unchanged || [])
     .concat(sectionDiff.removed || []);
 
-  const header = (columns || []).map((columnDef) => `<th style="border:1px solid #cfd8dc;padding:6px 8px;background:#f3f3f3;">${escapeHtml_(getDiscountColumnTitle_(columnDef))}</th>`).join('');
+  const header = (columns || []).map((c) => `<th style="border:1px solid #cfd8dc;padding:6px 8px;background:#f3f3f3;">${escapeHtml_(getDiscountEmailColumnTitle_(c))}</th>`).join('');
   const bodyRows = sortedDoctors.map((doctor) => {
     const doctorDiff = sectionDiff.byDoctor && sectionDiff.byDoctor[doctor] ? sectionDiff.byDoctor[doctor] : { status: 'unchanged', changedColumns: [] };
     const status = doctorDiff.status;
@@ -2589,8 +2552,7 @@ function buildDiscountsHtmlBody_(section, changeDiff, previousState, currentStat
     const prevPayload = prevMap.get(doctor) || {};
     const curPayload = curMap.get(doctor) || {};
 
-    const cells = (columns || []).map((columnDef) => {
-      const column = getDiscountColumnKey_(columnDef);
+    const cells = (columns || []).map((column) => {
       const currentValue = column === 'Врачи' ? doctor : str_(curPayload[column]);
       const previousValue = column === 'Врачи' ? doctor : str_(prevPayload[column]);
       const cell = formatDiscountCellValue_(column, currentValue, previousValue, status, changedColumns);
