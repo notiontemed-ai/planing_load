@@ -2050,10 +2050,10 @@ function updateDiscountsByPlan(options) {
     'Врачи',
     'Мин окон ПП 3',
     'Мин окон ПП 7',
-    'Скидка ПП',
-    'Скидка Онлайн',
-    'Скидка П',
-    'Скидка Агрегаторы',
+    'Стоимость ПП',
+    'Стоимость Онлайн ПП',
+    'Стоимость П',
+    'Стоимость Агрегаторы',
     'Бесплатный ПП с МРТ',
     'Условие Бесплатный с ПП МРТ',
   ];
@@ -2119,10 +2119,10 @@ function updateDiscountsByPlan(options) {
   }
 
   const outputColumns = [
-    col['Скидка ПП'] + 1,
-    col['Скидка Онлайн'] + 1,
-    col['Скидка П'] + 1,
-    col['Скидка Агрегаторы'] + 1,
+    col['Стоимость ПП'] + 1,
+    col['Стоимость Онлайн ПП'] + 1,
+    col['Стоимость П'] + 1,
+    col['Стоимость Агрегаторы'] + 1,
     col['Бесплатный ПП с МРТ'] + 1,
   ];
   writeColumnBatch_(discountsSheet, 2, outputColumns, updates);
@@ -2237,49 +2237,63 @@ function sendDiscountsEmails(options) {
   }
 
   const doctorRows = discountRows.filter((r) => str_(r['Врачи']));
-  const ppAndOnlineRows = doctorRows.filter((r) => hasNonZeroDiscountValue_(r['Скидка ПП']) || hasNonZeroDiscountValue_(r['Скидка Онлайн']) || isTruthyCell_(r['Бесплатный ПП с МРТ']));
-  const aggregatorsRows = doctorRows.filter((r) => hasNonZeroDiscountValue_(r['Скидка Агрегаторы']));
-  const pRows = doctorRows.filter((r) => hasNonZeroDiscountValue_(r['Скидка П']));
+  const ppAndOnlineRows = doctorRows.filter((r) => hasNonZeroDiscountValue_(r['Стоимость ПП']) || hasNonZeroDiscountValue_(r['Стоимость Онлайн ПП']) || isTruthyCell_(r['Бесплатный ПП с МРТ']));
+  const aggregatorsRows = doctorRows.filter((r) => hasNonZeroDiscountValue_(r['Стоимость Агрегаторы']));
+  const pRows = doctorRows.filter((r) => hasNonZeroDiscountValue_(r['Стоимость П']));
   const smmRows = doctorRows.filter((r) => isTruthyCell_(r['SMM'])
-    && (hasNonZeroDiscountValue_(r['Скидка ПП']) || hasNonZeroDiscountValue_(r['Скидка Агрегаторы']) || isTruthyCell_(r['Бесплатный ПП с МРТ'])));
+    && (hasNonZeroDiscountValue_(r['Стоимость ПП']) || isTruthyCell_(r['Бесплатный ПП с МРТ'])));
   const siteRows = doctorRows.filter((r) => isTruthyCell_(r['Сайт'])
-    && (hasNonZeroDiscountValue_(r['Скидка ПП']) || hasNonZeroDiscountValue_(r['Скидка Агрегаторы']) || isTruthyCell_(r['Бесплатный ПП с МРТ'])));
+    && (hasNonZeroDiscountValue_(r['Стоимость ПП']) || isTruthyCell_(r['Бесплатный ПП с МРТ'])));
 
   const sections = [
     {
       key: 'pp_discount',
       title: 'Скидки на ПП и Онлайн',
-      intro: 'Врачи с ненулевыми значениями по скидкам ПП/Онлайн или Бесплатный ПП с МРТ.',
       rows: ppAndOnlineRows,
-      columns: ['Врачи', 'Скидка ПП', 'Скидка Онлайн', 'Бесплатный ПП с МРТ'],
+      columns: [
+        { key: 'Врачи', title: 'Врачи' },
+        { key: 'Стоимость ПП', title: 'ПП' },
+        { key: 'Стоимость Онлайн ПП', title: 'Онлайн ПП' },
+        { key: 'Бесплатный ПП с МРТ', title: 'Бесплатный ПП с МРТ' },
+      ],
     },
     {
       key: 'aggregators',
       title: 'Скидки для агрегаторов',
-      intro: 'Врачи с ненулевыми значениями в колонке Скидка Агрегаторы.',
       rows: aggregatorsRows,
-      columns: ['Врачи', 'Скидка Агрегаторы'],
+      columns: [
+        { key: 'Врачи', title: 'Врачи' },
+        { key: 'Стоимость Агрегаторы', title: 'Стоимость Агрегаторы' },
+      ],
     },
     {
       key: 'p_discount',
       title: 'Скидки на П',
-      intro: 'Врачи с ненулевыми значениями в колонке Скидка П.',
       rows: pRows,
-      columns: ['Врачи', 'Скидка П'],
+      columns: [
+        { key: 'Врачи', title: 'Врачи' },
+        { key: 'Стоимость П', title: 'П' },
+      ],
     },
     {
       key: 'smm',
       title: 'Скидки для SMM',
-      intro: 'Врачи с включенным флагом SMM и ненулевыми значениями ПП/Агрегаторы/Бесплатный ПП с МРТ.',
       rows: smmRows,
-      columns: ['Врачи', 'Скидка ПП', 'Скидка Агрегаторы', 'Бесплатный ПП с МРТ'],
+      columns: [
+        { key: 'Врачи', title: 'Врачи' },
+        { key: 'Стоимость ПП', title: 'ПП' },
+        { key: 'Бесплатный ПП с МРТ', title: 'Бесплатный ПП с МРТ' },
+      ],
     },
     {
       key: 'site',
       title: 'Скидки для Сайта',
-      intro: 'Врачи с включенным флагом Сайт и ненулевыми значениями ПП/Агрегаторы/Бесплатный ПП с МРТ.',
       rows: siteRows,
-      columns: ['Врачи', 'Скидка ПП', 'Скидка Агрегаторы', 'Бесплатный ПП с МРТ'],
+      columns: [
+        { key: 'Врачи', title: 'Врачи' },
+        { key: 'Стоимость ПП', title: 'ПП' },
+        { key: 'Бесплатный ПП с МРТ', title: 'Бесплатный ПП с МРТ' },
+      ],
     },
   ];
 
@@ -2340,6 +2354,16 @@ function sectionHasDiscountDiff_(section, changeDiff) {
     || (Array.isArray(d.removed) && d.removed.length);
 }
 
+function getDiscountColumnKey_(columnDef) {
+  if (columnDef && typeof columnDef === 'object') return str_(columnDef.key);
+  return str_(columnDef);
+}
+
+function getDiscountColumnTitle_(columnDef) {
+  if (columnDef && typeof columnDef === 'object') return str_(columnDef.title || columnDef.key);
+  return str_(columnDef);
+}
+
 function buildDiscountSectionsState_(sections) {
   const out = {};
   (sections || []).forEach((section) => {
@@ -2356,7 +2380,8 @@ function buildDiscountSectionState_(rows, columns) {
     const doctor = str_(row && row['Врачи']);
     if (!doctor) return;
     const payload = {};
-    (columns || []).forEach((column) => {
+    (columns || []).forEach((columnDef) => {
+      const column = getDiscountColumnKey_(columnDef);
       if (column === 'Врачи') return;
       payload[column] = str_(row[column]);
     });
@@ -2515,7 +2540,7 @@ function buildDiscountsHtmlBody_(section, changeDiff, previousState, currentStat
     .concat(sectionDiff.unchanged || [])
     .concat(sectionDiff.removed || []);
 
-  const header = (columns || []).map((c) => `<th style="border:1px solid #cfd8dc;padding:6px 8px;background:#f3f3f3;">${escapeHtml_(c)}</th>`).join('');
+  const header = (columns || []).map((columnDef) => `<th style="border:1px solid #cfd8dc;padding:6px 8px;background:#f3f3f3;">${escapeHtml_(getDiscountColumnTitle_(columnDef))}</th>`).join('');
   const bodyRows = sortedDoctors.map((doctor) => {
     const doctorDiff = sectionDiff.byDoctor && sectionDiff.byDoctor[doctor] ? sectionDiff.byDoctor[doctor] : { status: 'unchanged', changedColumns: [] };
     const status = doctorDiff.status;
@@ -2523,7 +2548,8 @@ function buildDiscountsHtmlBody_(section, changeDiff, previousState, currentStat
     const prevPayload = prevMap.get(doctor) || {};
     const curPayload = curMap.get(doctor) || {};
 
-    const cells = (columns || []).map((column) => {
+    const cells = (columns || []).map((columnDef) => {
+      const column = getDiscountColumnKey_(columnDef);
       const currentValue = column === 'Врачи' ? doctor : str_(curPayload[column]);
       const previousValue = column === 'Врачи' ? doctor : str_(prevPayload[column]);
       const cell = formatDiscountCellValue_(column, currentValue, previousValue, status, changedColumns);
@@ -2532,12 +2558,12 @@ function buildDiscountsHtmlBody_(section, changeDiff, previousState, currentStat
     return `<tr>${cells}</tr>`;
   }).join('');
   return [
-    `<p>${escapeHtml_(intro)}</p>`,
+    intro ? `<p>${escapeHtml_(intro)}</p>` : '',
     '<table style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:13px;line-height:1.35;">',
     `<tr>${header}</tr>`,
     bodyRows,
     '</table>',
-  ].join('');
+  ].filter((part) => str_(part)).join('');
 }
 
 function formatDiscountCellValue_(column, currentValue, previousValue, status, changedColumns) {
