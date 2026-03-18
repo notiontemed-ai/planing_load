@@ -2093,26 +2093,26 @@ function updateDiscountsByPlan(options) {
     };
 
     const discountPP = pickMinimumDiscountByConditions_(row, col, {
-      '3-25': 'Скидка ПП 3-25',
-      '3-40': 'Скидка ПП 3-40',
-      '7-20': 'Скидка ПП 7-20',
-      '7-35': 'Скидка  ПП 7-35',
+      '3-25': ['Стоимость ПП 3-25', 'Скидка ПП 3-25'],
+      '3-40': ['Стоимость ПП 3-40', 'Скидка ПП 3-40'],
+      '7-20': ['Стоимость ПП 7-20', 'Скидка ПП 7-20'],
+      '7-35': ['Стоимость  ПП 7-35', 'Стоимость ПП 7-35', 'Скидка  ПП 7-35', 'Скидка ПП 7-35'],
     }, cond);
 
     const discountOnline = pickMinimumDiscountByConditions_(row, col, {
-      '3-25': 'Скидка Онлайн 3-25',
-      '3-40': 'Скидка Онлайн 3-40',
+      '3-25': ['Стоимость Онлайн 3-25', 'Стоимость Онлайн ПП 3-25', 'Скидка Онлайн 3-25'],
+      '3-40': ['Стоимость Онлайн 3-40', 'Стоимость Онлайн ПП 3-40', 'Скидка Онлайн 3-40'],
     }, cond);
 
     const discountP = pickMinimumDiscountByConditions_(row, col, {
-      '3-25': 'Скидка П 3-25',
-      '3-40': 'Скидка П 3-40',
-      '7-20': 'Скидка П 7-20',
-      '7-35': 'Скидка  П 7-35',
+      '3-25': ['Стоимость П 3-25', 'Скидка П 3-25'],
+      '3-40': ['Стоимость П 3-40', 'Скидка П 3-40'],
+      '7-20': ['Стоимость П 7-20', 'Скидка П 7-20'],
+      '7-35': ['Стоимость  П 7-35', 'Стоимость П 7-35', 'Скидка  П 7-35', 'Скидка П 7-35'],
     }, cond);
 
     const discountAggregators = pickMinimumDiscountByConditions_(row, col, {
-      '7-20': 'Скидка Агрегаторы 7-20',
+      '7-20': ['Стоимость Агрегаторы 7-20', 'Скидка Агрегаторы 7-20'],
     }, cond);
 
     const mriCondition = str_(row[col['Условие Бесплатный с ПП МРТ']]);
@@ -2219,8 +2219,8 @@ function pickMinimumDiscountByConditions_(row, colMap, ruleColumns, condMap) {
   const candidates = [];
   Object.keys(ruleColumns || {}).forEach((rule) => {
     if (!condMap[rule]) return;
-    const columnName = ruleColumns[rule];
-    const idx = colMap[columnName];
+    const columnNames = Array.isArray(ruleColumns[rule]) ? ruleColumns[rule] : [ruleColumns[rule]];
+    const idx = findFirstHeaderIndex_(colMap, columnNames);
     if (idx === undefined) return;
     const value = str_(row[idx]);
     if (!value) return;
