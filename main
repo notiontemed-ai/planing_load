@@ -7,6 +7,7 @@ const SHEET_REPORT_LOG = 'Лог';
 const SHEET_EXCLUSIONS = 'Исключения';
 const SHEET_DISCOUNTS = 'Скидки';
 const MENU_NAME = 'TEMED';
+const REPORT_PERIOD_ROLLOVER_HOUR = 16;
 
 const TIME_TYPE_MAP = {
   'Рабочее время': 'Приемные часы',
@@ -467,7 +468,7 @@ function computeReportPeriodFromReferenceMoment_(referenceMoment) {
   const referenceDate = normalizeDateToTimezoneStart_(timestamp);
   if (!referenceDate) return null;
   const referenceHour = Number(Utilities.formatDate(timestamp, FL2_TIMEZONE, 'H'));
-  const startDate = referenceHour >= 19 ? addDays(referenceDate, 1) : referenceDate;
+  const startDate = referenceHour >= REPORT_PERIOD_ROLLOVER_HOUR ? addDays(referenceDate, 1) : referenceDate;
   const endDate = addDays(startDate, 6);
   return {
     referenceMoment: timestamp,
@@ -1800,9 +1801,10 @@ function renderForwardLoadSheet(ss, currentDay, reportPeriod, selectedBranch, br
   const sheet = getOrCreateSheet_(ss, selectedBranch);
   resetSheetForRender_(sheet);
   let row = 1;
+  const fallbackPeriod = computeReportPeriodFromReferenceMoment_(currentDay);
   const periodLabel = reportPeriod && reportPeriod.label
     ? reportPeriod.label
-    : formatReportPeriodLabel_(addDays(currentDay, 1), addDays(currentDay, 7));
+    : (fallbackPeriod && fallbackPeriod.label) || formatReportPeriodLabel_(addDays(currentDay, 1), addDays(currentDay, 7));
   sheet.getRange(row, 1, 1, 8)
     .merge()
     .setValue(`План загрузки. Отчетный период: ${periodLabel}`)
@@ -2052,9 +2054,10 @@ function sendForwardReportEmail(ss, selectedBranch, currentDay) {
   const cc = parseEmailList(target['Копия']);
   if (!to.length) throw new Error(`Для филиала "${selectedBranch}" не заполнено поле Кому`);
   const prep = prepareForwardLoadInput_(ss, { selectedBranch, persistUnassigned: false, currentDay });
+  const fallbackPeriod = computeReportPeriodFromReferenceMoment_(currentDay);
   const periodLabel = prep.reportPeriod && prep.reportPeriod.label
     ? prep.reportPeriod.label
-    : formatReportPeriodLabel_(addDays(currentDay, 1), addDays(currentDay, 7));
+    : (fallbackPeriod && fallbackPeriod.label) || formatReportPeriodLabel_(addDays(currentDay, 1), addDays(currentDay, 7));
   const subject = `План загрузки. Отчетный период: ${periodLabel}`;
   const body = [
     `<p><b>Отчетный период:</b> ${periodLabel}</p>`,
