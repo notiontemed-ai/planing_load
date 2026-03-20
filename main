@@ -461,22 +461,26 @@ function formatReportPeriodLabel_(startDate, endDate) {
   return `${formatDateDDMMYYYY_(start)} (${getWeekdayNameRu_(start)}) - ${formatDateDDMMYYYY_(end)} (${getWeekdayNameRu_(end)})`;
 }
 
-function computeReportPeriodFromScheduleTimestamp_(builtAt) {
-  const timestamp = toDate_(builtAt);
+function computeReportPeriodFromReferenceMoment_(referenceMoment) {
+  const timestamp = toDate_(referenceMoment);
   if (!timestamp) return null;
-  const builtDate = normalizeDateToTimezoneStart_(timestamp);
-  if (!builtDate) return null;
-  const builtHour = Number(Utilities.formatDate(timestamp, FL2_TIMEZONE, 'H'));
-  const startDate = builtHour >= 19 ? addDays(builtDate, 1) : builtDate;
+  const referenceDate = normalizeDateToTimezoneStart_(timestamp);
+  if (!referenceDate) return null;
+  const referenceHour = Number(Utilities.formatDate(timestamp, FL2_TIMEZONE, 'H'));
+  const startDate = referenceHour >= 19 ? addDays(referenceDate, 1) : referenceDate;
   const endDate = addDays(startDate, 6);
   return {
-    builtAt: timestamp,
-    builtHour,
+    referenceMoment: timestamp,
+    referenceHour,
     startDate,
     endDate,
     anchorDate: addDays(startDate, -1),
     label: formatReportPeriodLabel_(startDate, endDate),
   };
+}
+
+function computeReportPeriodFromScheduleTimestamp_(builtAt) {
+  return computeReportPeriodFromReferenceMoment_(builtAt);
 }
 
 function formatDateTimeDDMMYYYY_(value) {
@@ -1142,25 +1146,31 @@ function prepareForwardLoadInput_(ss, options) {
   const employeeRegistry = opts.employeeRegistry ? opts.employeeRegistry : getEmployeeRegistry_(ss);
   const selectedBranch = str_(opts.selectedBranch);
   const scheduleBuiltAt = detectDoctorScheduleBuiltAtFallback(scheduleSheet);
-  const reportPeriod = computeReportPeriodFromScheduleTimestamp_(scheduleBuiltAt);
 
   let currentDay = opts.currentDay ? new Date(Number(opts.currentDay)) : null;
   let requestRowsRawAll = null;
-  if (!currentDay || Number.isNaN(currentDay.getTime())) {
-    currentDay = reportPeriod && reportPeriod.anchorDate ? new Date(reportPeriod.anchorDate.getTime()) : null;
-  }
+  let reportPeriod = currentDay ? computeReportPeriodFromReferenceMoment_(currentDay) : null;
   if (!currentDay || Number.isNaN(currentDay.getTime())) {
     const detectDayTimer = fl2StageTimer_();
     requestRowsRawAll = getSheetObjectsDisplay_(requestsSheet);
     stage('prepare: loaded processed requests for currentDay detect', `rows=${requestRowsRawAll.length}`, detectDayTimer);
     tick();
     const latestRequestsAllBranches = buildLatestRequests(requestRowsRawAll, excludedEmployees, employeeRegistry.allowed, employeeRegistry.unassignedFound);
-    currentDay = detectCurrentDay(latestRequestsAllBranches);
+    currentDay = detectLatestCompletedRequestMoment_(latestRequestsAllBranches);
+    reportPeriod = computeReportPeriodFromReferenceMoment_(currentDay);
+  }
+  if ((!currentDay || Number.isNaN(currentDay.getTime())) && scheduleBuiltAt) {
+    reportPeriod = computeReportPeriodFromScheduleTimestamp_(scheduleBuiltAt);
+    currentDay = reportPeriod && reportPeriod.startDate ? new Date(reportPeriod.startDate.getTime()) : null;
+    stage('prepare: fallback currentDay from schedule timestamp', `startDate=${formatDateDDMMYYYY_(currentDay)}`);
   }
   if (!currentDay) throw new Error('Не найдены выполненные заявки для определения текущего дня');
 
-  const rangeStart = addDays(currentDay, -42);
-  const rangeEnd = reportPeriod && reportPeriod.endDate ? new Date(reportPeriod.endDate.getTime()) : addDays(currentDay, 7);
+  const anchorDay = reportPeriod && reportPeriod.anchorDate
+    ? new Date(reportPeriod.anchorDate.getTime())
+    : new Date(currentDay.getFullYear(), currentDay.getMonth(), currentDay.getDate() - 1);
+  const rangeStart = addDays(anchorDay, -42);
+  const rangeEnd = reportPeriod && reportPeriod.endDate ? new Date(reportPeriod.endDate.getTime()) : addDays(anchorDay, 7);
 
   const readScheduleTimer = fl2StageTimer_();
   const scheduleSourceRows = selectedBranch
@@ -1233,6 +1243,7 @@ function prepareForwardLoadInput_(ss, options) {
     branches,
     excludedEmployees,
     currentDay,
+    anchorDay,
     rangeStart,
     rangeEnd,
     reportPeriod,
@@ -1259,6 +1270,8 @@ function buildForwardLoadReportForBranch_(ss, selectedBranch, prep) {
   };
   const tick = () => { if (hb) hb(); };
 
+  const anchorDay = prep.anchorDay ? new Date(prep.anchorDay.getTime()) : new Date(prep.currentDay.getFullYear(), prep.currentDay.getMonth(), prep.currentDay.getDate() - 1);
+
   const filterTimer = fl2StageTimer_();
   const filteredScheduleRows = prep.scheduleRows.filter((r) => str_(r['Филиал']) === branchName);
   const filteredRequestRows = prep.requestRowsRaw.filter((r) => str_(r['Филиал']) === branchName);
@@ -1268,7 +1281,7 @@ function buildForwardLoadReportForBranch_(ss, selectedBranch, prep) {
   const scheduleIndexTimer = fl2StageTimer_();
   const scheduleByDoctorDay = buildReceptionScheduleIndex(filteredScheduleRows, prep.excludedEmployees, prep.allowedEmployees);
   stage('branch: buildReceptionScheduleIndex done', `keys=${scheduleByDoctorDay.size}`, scheduleIndexTimer);
-  logDoctorForwardDebug_(ss, branchName, 'Долинский Павел Максимович', prep.currentDay, scheduleByDoctorDay);
+  logDoctorForwardDebug_(ss, branchName, 'Долинский Павел Максимович', anchorDay, scheduleByDoctorDay);
   tick();
 
   const doctorsSet = prep.doctorsSet || getDoctorsSetFromEmployeesSheet_(ss);
@@ -1289,42 +1302,42 @@ function buildForwardLoadReportForBranch_(ss, selectedBranch, prep) {
   tick();
 
   const h3Timer = fl2StageTimer_();
-  const horizon3 = computeWindowMetrics(prep.currentDay, 3, doctorScheduleByDoctorDay, latestRequests);
+  const horizon3 = computeWindowMetrics(anchorDay, 3, doctorScheduleByDoctorDay, latestRequests);
   stage('branch: computeWindowMetrics(3) done', `byBranch=${horizon3.byBranch.size}, byDoctor=${horizon3.byDoctor.size}`, h3Timer);
   tick();
 
   const h7Timer = fl2StageTimer_();
-  const horizon7 = computeWindowMetrics(prep.currentDay, 7, doctorScheduleByDoctorDay, latestRequests);
+  const horizon7 = computeWindowMetrics(anchorDay, 7, doctorScheduleByDoctorDay, latestRequests);
   stage('branch: computeWindowMetrics(7) done', `byBranch=${horizon7.byBranch.size}, byDoctor=${horizon7.byDoctor.size}`, h7Timer);
   tick();
 
   const b3Timer = fl2StageTimer_();
-  const baseline3 = computeBaselineMetrics(prep.currentDay, 3, doctorScheduleByDoctorDay, latestRequests);
+  const baseline3 = computeBaselineMetrics(anchorDay, 3, doctorScheduleByDoctorDay, latestRequests);
   stage('branch: computeBaselineMetrics(3) done', `byBranch=${baseline3.byBranch.size}, byDoctor=${baseline3.byDoctor.size}`, b3Timer);
   tick();
 
   const b7Timer = fl2StageTimer_();
-  const baseline7 = computeBaselineMetrics(prep.currentDay, 7, doctorScheduleByDoctorDay, latestRequests);
+  const baseline7 = computeBaselineMetrics(anchorDay, 7, doctorScheduleByDoctorDay, latestRequests);
   stage('branch: computeBaselineMetrics(7) done', `byBranch=${baseline7.byBranch.size}, byDoctor=${baseline7.byDoctor.size}`, b7Timer);
   tick();
 
   const h3AllTimer = fl2StageTimer_();
-  const horizon3All = computeWindowMetrics(prep.currentDay, 3, scheduleByDoctorDay, latestRequests, { includeAllNomenclature: true });
+  const horizon3All = computeWindowMetrics(anchorDay, 3, scheduleByDoctorDay, latestRequests, { includeAllNomenclature: true });
   stage('branch: computeWindowMetrics(3, all nomenclature) done', `byBranch=${horizon3All.byBranch.size}, byDoctor=${horizon3All.byDoctor.size}`, h3AllTimer);
   tick();
 
   const h7AllTimer = fl2StageTimer_();
-  const horizon7All = computeWindowMetrics(prep.currentDay, 7, scheduleByDoctorDay, latestRequests, { includeAllNomenclature: true });
+  const horizon7All = computeWindowMetrics(anchorDay, 7, scheduleByDoctorDay, latestRequests, { includeAllNomenclature: true });
   stage('branch: computeWindowMetrics(7, all nomenclature) done', `byBranch=${horizon7All.byBranch.size}, byDoctor=${horizon7All.byDoctor.size}`, h7AllTimer);
   tick();
 
   const b3AllTimer = fl2StageTimer_();
-  const baseline3All = computeBaselineMetrics(prep.currentDay, 3, scheduleByDoctorDay, latestRequests, { includeAllNomenclature: true });
+  const baseline3All = computeBaselineMetrics(anchorDay, 3, scheduleByDoctorDay, latestRequests, { includeAllNomenclature: true });
   stage('branch: computeBaselineMetrics(3, all nomenclature) done', `byBranch=${baseline3All.byBranch.size}, byDoctor=${baseline3All.byDoctor.size}`, b3AllTimer);
   tick();
 
   const b7AllTimer = fl2StageTimer_();
-  const baseline7All = computeBaselineMetrics(prep.currentDay, 7, scheduleByDoctorDay, latestRequests, { includeAllNomenclature: true });
+  const baseline7All = computeBaselineMetrics(anchorDay, 7, scheduleByDoctorDay, latestRequests, { includeAllNomenclature: true });
   stage('branch: computeBaselineMetrics(7, all nomenclature) done', `byBranch=${baseline7All.byBranch.size}, byDoctor=${baseline7All.byDoctor.size}`, b7AllTimer);
   tick();
 
@@ -1342,13 +1355,13 @@ function buildForwardLoadReportForBranch_(ss, selectedBranch, prep) {
 
   const massageSummary = aggregateForwardCategorySummary_(rowsAllNomenclature, massageSet);
   const ftSummary = aggregateForwardCategorySummary_(rowsAllNomenclature, ftSet);
-  const cabinetSummary = buildCabinetTypeSummary_(prep.currentDay, filteredScheduleRows, latestRequests);
+  const cabinetSummary = buildCabinetTypeSummary_(anchorDay, filteredScheduleRows, latestRequests);
   const massageRows = rowsAllNomenclature.filter((r) => massageSet.has(str_(r.doctor)));
   const ftRows = rowsAllNomenclature.filter((r) => ftSet.has(str_(r.doctor)));
-  const cabinetRows = buildCabinetRowsByName_(prep.currentDay, filteredScheduleRows, latestRequests);
+  const cabinetRows = buildCabinetRowsByName_(anchorDay, filteredScheduleRows, latestRequests);
 
   const renderTimer = fl2StageTimer_();
-  renderForwardLoadSheet(ss, prep.currentDay, prep.reportPeriod, branchName, rowsBranch, rowsDoctor, massageSummary, ftSummary, cabinetSummary, massageRows, ftRows, cabinetRows);
+  renderForwardLoadSheet(ss, anchorDay, prep.reportPeriod, branchName, rowsBranch, rowsDoctor, massageSummary, ftSummary, cabinetSummary, massageRows, ftRows, cabinetRows);
   stage('branch: renderForwardLoadSheet done', `rowsBranch=${rowsBranch.length}, rowsDoctor=${rowsDoctor.length}`, renderTimer);
   tick();
 
@@ -1589,12 +1602,17 @@ function detectCurrentDayFromRawRequests_(rows, allowedEmployees, excludedEmploy
   return new Date(maxDate.getFullYear(), maxDate.getMonth(), maxDate.getDate());
 }
 
-function detectCurrentDay(requests) {
+function detectLatestCompletedRequestMoment_(requests) {
   const completed = requests.filter((r) => isCompletedStatus(r.status) && r.startDate);
   if (!completed.length) return null;
   completed.sort((a, b) => a.startDate - b.startDate);
-  const max = completed[completed.length - 1].startDate;
-  return new Date(max.getFullYear(), max.getMonth(), max.getDate());
+  return new Date(completed[completed.length - 1].startDate.getTime());
+}
+
+function detectCurrentDay(requests) {
+  const latestMoment = detectLatestCompletedRequestMoment_(requests);
+  if (!latestMoment) return null;
+  return new Date(latestMoment.getFullYear(), latestMoment.getMonth(), latestMoment.getDate());
 }
 function buildReceptionScheduleIndex(scheduleRows, excludedEmployees, allowedEmployees) {
   const map = new Map();
