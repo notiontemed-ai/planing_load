@@ -441,6 +441,44 @@ function formatDateDDMMYYYY_(value) {
   return Utilities.formatDate(date, FL2_TIMEZONE, 'dd.MM.yyyy');
 }
 
+function normalizeDateToTimezoneStart_(value) {
+  const date = toDate_(value);
+  if (!date) return null;
+  const parts = Utilities.formatDate(date, FL2_TIMEZONE, 'yyyy-MM-dd').split('-').map((v) => Number(v));
+  return new Date(parts[0], parts[1] - 1, parts[2]);
+}
+
+function getWeekdayNameRu_(value) {
+  const date = toDate_(value);
+  if (!date) return '';
+  return ['воскресенье', 'понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота'][date.getDay()] || '';
+}
+
+function formatReportPeriodLabel_(startDate, endDate) {
+  const start = toDate_(startDate);
+  const end = toDate_(endDate);
+  if (!start || !end) return '';
+  return `${formatDateDDMMYYYY_(start)} (${getWeekdayNameRu_(start)}) - ${formatDateDDMMYYYY_(end)} (${getWeekdayNameRu_(end)})`;
+}
+
+function computeReportPeriodFromScheduleTimestamp_(builtAt) {
+  const timestamp = toDate_(builtAt);
+  if (!timestamp) return null;
+  const builtDate = normalizeDateToTimezoneStart_(timestamp);
+  if (!builtDate) return null;
+  const builtHour = Number(Utilities.formatDate(timestamp, FL2_TIMEZONE, 'H'));
+  const startDate = builtHour >= 19 ? addDays(builtDate, 1) : builtDate;
+  const endDate = addDays(startDate, 6);
+  return {
+    builtAt: timestamp,
+    builtHour,
+    startDate,
+    endDate,
+    anchorDate: addDays(startDate, -1),
+    label: formatReportPeriodLabel_(startDate, endDate),
+  };
+}
+
 function formatDateTimeDDMMYYYY_(value) {
   const date = toDate_(value);
   if (!date) return '';
@@ -1103,9 +1141,14 @@ function prepareForwardLoadInput_(ss, options) {
   const excludedEmployees = opts.excludedEmployees ? opts.excludedEmployees : getExcludedEmployeesSet_(ss);
   const employeeRegistry = opts.employeeRegistry ? opts.employeeRegistry : getEmployeeRegistry_(ss);
   const selectedBranch = str_(opts.selectedBranch);
+  const scheduleBuiltAt = detectDoctorScheduleBuiltAtFallback(scheduleSheet);
+  const reportPeriod = computeReportPeriodFromScheduleTimestamp_(scheduleBuiltAt);
 
   let currentDay = opts.currentDay ? new Date(Number(opts.currentDay)) : null;
   let requestRowsRawAll = null;
+  if (!currentDay || Number.isNaN(currentDay.getTime())) {
+    currentDay = reportPeriod && reportPeriod.anchorDate ? new Date(reportPeriod.anchorDate.getTime()) : null;
+  }
   if (!currentDay || Number.isNaN(currentDay.getTime())) {
     const detectDayTimer = fl2StageTimer_();
     requestRowsRawAll = getSheetObjectsDisplay_(requestsSheet);
@@ -1117,7 +1160,7 @@ function prepareForwardLoadInput_(ss, options) {
   if (!currentDay) throw new Error('Не найдены выполненные заявки для определения текущего дня');
 
   const rangeStart = addDays(currentDay, -42);
-  const rangeEnd = addDays(currentDay, 7);
+  const rangeEnd = reportPeriod && reportPeriod.endDate ? new Date(reportPeriod.endDate.getTime()) : addDays(currentDay, 7);
 
   const readScheduleTimer = fl2StageTimer_();
   const scheduleSourceRows = selectedBranch
@@ -1192,6 +1235,7 @@ function prepareForwardLoadInput_(ss, options) {
     currentDay,
     rangeStart,
     rangeEnd,
+    reportPeriod,
     allowedEmployees: employeeRegistry.allowed,
     unassignedEmployees: employeeRegistry.unassignedFound,
     doctorsSet: opts && opts.doctorsSet ? opts.doctorsSet : getDoctorsSetFromEmployeesSheet_(ss),
@@ -1304,7 +1348,7 @@ function buildForwardLoadReportForBranch_(ss, selectedBranch, prep) {
   const cabinetRows = buildCabinetRowsByName_(prep.currentDay, filteredScheduleRows, latestRequests);
 
   const renderTimer = fl2StageTimer_();
-  renderForwardLoadSheet(ss, prep.currentDay, branchName, rowsBranch, rowsDoctor, massageSummary, ftSummary, cabinetSummary, massageRows, ftRows, cabinetRows);
+  renderForwardLoadSheet(ss, prep.currentDay, prep.reportPeriod, branchName, rowsBranch, rowsDoctor, massageSummary, ftSummary, cabinetSummary, massageRows, ftRows, cabinetRows);
   stage('branch: renderForwardLoadSheet done', `rowsBranch=${rowsBranch.length}, rowsDoctor=${rowsDoctor.length}`, renderTimer);
   tick();
 
@@ -1734,13 +1778,16 @@ function mergeForwardRows(current3, current7, base3, base7) {
   });
   return rows;
 }
-function renderForwardLoadSheet(ss, currentDay, selectedBranch, branchRows, doctorRows, massageSummary, ftSummary, cabinetSummary, massageRows, ftRows, cabinetRows) {
+function renderForwardLoadSheet(ss, currentDay, reportPeriod, selectedBranch, branchRows, doctorRows, massageSummary, ftSummary, cabinetSummary, massageRows, ftRows, cabinetRows) {
   const sheet = getOrCreateSheet_(ss, selectedBranch);
   resetSheetForRender_(sheet);
   let row = 1;
+  const periodLabel = reportPeriod && reportPeriod.label
+    ? reportPeriod.label
+    : formatReportPeriodLabel_(addDays(currentDay, 1), addDays(currentDay, 7));
   sheet.getRange(row, 1, 1, 8)
     .merge()
-    .setValue(`План загрузки на дату ${formatDateDDMMYYYY_(currentDay)} (без текущего дня)`)
+    .setValue(`План загрузки. Отчетный период: ${periodLabel}`)
     .setFontWeight('bold')
     .setFontSize(13)
     .setBackground('#d9ead3');
@@ -1986,8 +2033,13 @@ function sendForwardReportEmail(ss, selectedBranch, currentDay) {
   const to = parseEmailList(target['Кому']);
   const cc = parseEmailList(target['Копия']);
   if (!to.length) throw new Error(`Для филиала "${selectedBranch}" не заполнено поле Кому`);
-  const subject = `План загрузки на дату ${formatDateDDMMYYYY_(currentDay)}`;
+  const prep = prepareForwardLoadInput_(ss, { selectedBranch, persistUnassigned: false, currentDay });
+  const periodLabel = prep.reportPeriod && prep.reportPeriod.label
+    ? prep.reportPeriod.label
+    : formatReportPeriodLabel_(addDays(currentDay, 1), addDays(currentDay, 7));
+  const subject = `План загрузки. Отчетный период: ${periodLabel}`;
   const body = [
+    `<p><b>Отчетный период:</b> ${periodLabel}</p>`,
     sheetToHtmlTable(sheet),
     '<p><b>Цветовая интерпретация загрузки:</b> для горизонта 3 дня: <span style="background:#ff0000;padding:2px 6px;">красный</span> &lt; 25%, <span style="background:#fff2cc;padding:2px 6px;">желтый</span> 25–40%, белый 40–60%, <span style="background:#d9ead3;padding:2px 6px;">зеленый</span> 60–75%, <span style="background:#f4cccc;padding:2px 6px;">бледно-розовый</span> > 75%. Для горизонта 7 дней: <span style="background:#ff0000;padding:2px 6px;">красный</span> &lt; 20%, <span style="background:#fff2cc;padding:2px 6px;">желтый</span> 20–35%, белый 35–50%, <span style="background:#d9ead3;padding:2px 6px;">зеленый</span> 50–60%, <span style="background:#f4cccc;padding:2px 6px;">бледно-розовый</span> > 60%.</p>',
     '<p><b>Пояснение:</b> значения в скобках — это обычный уровень (среднее за последние 6 недель по тому же дню недели).</p>',
@@ -2008,6 +2060,7 @@ function buildOverallForecastReport() {
   const sheets = ss.getSheets();
   const clinicRows = [];
   let reportDate = '';
+  let reportPeriodLabel = '';
   sheets.forEach((sheet) => {
     const data = sheet.getDataRange().getDisplayValues();
     if (!data.length) return;
@@ -2015,15 +2068,17 @@ function buildOverallForecastReport() {
     const parsed = parseClinicForecastSheet(data);
     if (!parsed) return;
     if (!reportDate && parsed.reportDate) reportDate = parsed.reportDate;
+    if (!reportPeriodLabel && parsed.reportPeriodLabel) reportPeriodLabel = parsed.reportPeriodLabel;
     clinicRows.push(...parsed.rows);
   });
   if (!clinicRows.length) {
     throw new Error('Не найдены листы филиалов с планом для сборки общего отчета');
   }
-  renderOverallForecastSheet(ss, reportDate || formatDateDDMMYYYY_(new Date()), clinicRows);
+  const effectivePeriodLabel = reportPeriodLabel || formatReportPeriodLabel_(new Date(), addDays(new Date(), 6));
+  renderOverallForecastSheet(ss, effectivePeriodLabel, clinicRows);
   const sendAnswer = ui.alert('Общий план', 'Сделать рассылку общего плана?', ui.ButtonSet.YES_NO);
   if (sendAnswer === ui.Button.YES) {
-    sendOverallForecastEmail(ss, reportDate || formatDateDDMMYYYY_(new Date()));
+    sendOverallForecastEmail(ss, effectivePeriodLabel);
   }
   refreshDiscountsAfterPlanUpdate_();
   SpreadsheetApp.getActive().toast('Общий план собран', MENU_NAME, 5);
@@ -2632,16 +2687,17 @@ function escapeHtml_(value) {
 function isBranchPlanSheetData_(data) {
   if (!data || !data.length) return false;
   const firstCol = data.map((r) => str_(r && r[0]));
-  const hasPlanHeader = firstCol.some((v) => v.startsWith('План загрузки на дату'));
+  const hasPlanHeader = firstCol.some((v) => v.startsWith('План загрузки. Отчетный период:'));
   const hasBranchHeader = firstCol.some((v) => v.startsWith('Филиал:'));
   return hasPlanHeader && hasBranchHeader;
 }
 
 function parseClinicForecastSheet(data) {
   const firstCol = (data || []).map((r) => str_(r && r[0]));
-  const planHeader = firstCol.find((v) => v.startsWith('План загрузки на дату')) || '';
+  const planHeader = firstCol.find((v) => v.startsWith('План загрузки. Отчетный период:')) || '';
   const dateMatch = planHeader.match(/(\d{2}\.\d{2}\.\d{4})/);
   const reportDate = dateMatch ? dateMatch[1] : '';
+  const reportPeriodLabel = planHeader.replace(/^План загрузки\. Отчетный период:\s*/i, '').trim();
   const branchLine = firstCol.find((v) => v.startsWith('Филиал:')) || '';
   const branch = branchLine.replace(/^Филиал:\s*/i, '').trim();
   if (!branch) return null;
@@ -2748,7 +2804,7 @@ function parseClinicForecastSheet(data) {
     pushRow(currentCategory, horizon, row[1], row[2], row[3], row[4], row[5], '', row[6], row[7]);
   });
 
-  return rows.length ? { reportDate, rows } : null;
+  return rows.length ? { reportDate, reportPeriodLabel, rows } : null;
 }
 
 function parseCombinedMetric(value) {
@@ -2776,12 +2832,12 @@ function resetSheetForRender_(sheet) {
   }
 }
 
-function renderOverallForecastSheet(ss, reportDate, clinicRows) {
+function renderOverallForecastSheet(ss, reportPeriodLabel, clinicRows) {
   const sheet = getOrCreateSheet_(ss, FL2_SHEET_OVERALL_FORECAST);
   resetSheetForRender_(sheet);
   let row = 1;
   const columns = 7;
-  sheet.getRange(row, 1, 1, columns).merge().setValue(`Общий план по клиникам на ${reportDate}`).setFontWeight('bold').setBackground('#d9ead3');
+  sheet.getRange(row, 1, 1, columns).merge().setValue(`Общий план по клиникам. Отчетный период: ${reportPeriodLabel}`).setFontWeight('bold').setBackground('#d9ead3');
   row += 1;
   sheet.getRange(row, 1, 1, columns).merge().setValue(`Сформировано: ${formatDateTimeDDMMYYYY_(new Date())}`).setFontSize(10).setBackground('#f3f8ff');
   row += 2;
@@ -3503,7 +3559,7 @@ function detectDoctorScheduleBuiltAtFallback(doctorScheduleSheet) {
   if (markerKey !== '__SYSTEM_TIMESTAMP__' || !markerDate) return null;
   return markerDate;
 }
-function sendOverallForecastEmail(ss, reportDate) {
+function sendOverallForecastEmail(ss, reportPeriodLabel) {
   const sheet = ss.getSheetByName(FL2_SHEET_OVERALL_FORECAST);
   const mailingSheet = ss.getSheetByName(FL2_SHEET_MAILING);
   if (!sheet || !mailingSheet) {
@@ -3515,8 +3571,9 @@ function sendOverallForecastEmail(ss, reportDate) {
   const to = parseEmailList(target['Кому']);
   const cc = parseEmailList(target['Копия']);
   if (!to.length) throw new Error('Для "Общий план" не заполнено поле Кому');
-  const subject = `План загрузки на дату ${reportDate}`;
+  const subject = `Общий план по клиникам. Отчетный период: ${reportPeriodLabel}`;
   const body = [
+    `<p><b>Отчетный период:</b> ${reportPeriodLabel}</p>`,
     sheetToHtmlTable(sheet, { clinicLinkMap: buildClinicSheetLinkMap_(ss) }),
     '<p><b>Цветовая интерпретация загрузки:</b> для горизонта 3 дня: <span style="background:#ff0000;padding:2px 6px;">красный</span> &lt; 25%, <span style="background:#fff2cc;padding:2px 6px;">желтый</span> 25–40%, белый 40–60%, <span style="background:#d9ead3;padding:2px 6px;">зеленый</span> 60–75%, <span style="background:#f4cccc;padding:2px 6px;">бледно-розовый</span> > 75%. Для горизонта 7 дней: <span style="background:#ff0000;padding:2px 6px;">красный</span> &lt; 20%, <span style="background:#fff2cc;padding:2px 6px;">желтый</span> 20–35%, белый 35–50%, <span style="background:#d9ead3;padding:2px 6px;">зеленый</span> 50–60%, <span style="background:#f4cccc;padding:2px 6px;">бледно-розовый</span> > 60%.</p>',
   ].join('');
@@ -3539,7 +3596,7 @@ function buildClinicSheetLinkMap_(ss) {
     if (name === FL2_SHEET_MAILING) return;
     if (name === FL2_SHEET_BATCH_SERVICE) return;
     const a1 = str_(sheet.getRange(1, 1).getDisplayValue());
-    if (!a1.startsWith('План загрузки на дату')) return;
+    if (!a1.startsWith('План загрузки. Отчетный период:')) return;
     map[name] = `${spreadsheetUrl}#gid=${sheet.getSheetId()}`;
   });
   return map;
@@ -3616,7 +3673,7 @@ function detectPlanBuiltAtFromReportSheet_(sheet) {
 function isPlanReportSheet_(sheet) {
   if (!sheet) return false;
   const a1 = str_(sheet.getRange(1, 1).getDisplayValue());
-  return a1.startsWith('План загрузки на дату') || a1.startsWith('Общий план по клиникам на');
+  return a1.startsWith('План загрузки. Отчетный период:') || a1.startsWith('Общий план по клиникам. Отчетный период:');
 }
 
 function extractPlanReportDate_(sheet) {
