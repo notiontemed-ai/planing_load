@@ -1802,12 +1802,17 @@ function renderForwardLoadSheet(ss, currentDay, reportPeriod, selectedBranch, br
   resetSheetForRender_(sheet);
   let row = 1;
   const fallbackPeriod = computeReportPeriodFromReferenceMoment_(currentDay);
-  const periodLabel = reportPeriod && reportPeriod.label
-    ? reportPeriod.label
-    : (fallbackPeriod && fallbackPeriod.label) || formatReportPeriodLabel_(addDays(currentDay, 1), addDays(currentDay, 7));
+  const startDate = reportPeriod && reportPeriod.startDate
+    ? reportPeriod.startDate
+    : (fallbackPeriod && fallbackPeriod.startDate) || addDays(currentDay, 1);
+  const endDate = reportPeriod && reportPeriod.endDate
+    ? reportPeriod.endDate
+    : (fallbackPeriod && fallbackPeriod.endDate) || addDays(currentDay, 7);
+  const period3dLabel = formatReportPeriodLabel_(startDate, addDays(startDate, 2));
+  const period7dLabel = formatReportPeriodLabel_(startDate, endDate);
   sheet.getRange(row, 1, 1, 8)
     .merge()
-    .setValue(`План загрузки. Отчетный период: ${periodLabel}`)
+    .setValue('План загрузки')
     .setFontWeight('bold')
     .setFontSize(13)
     .setBackground('#d9ead3');
@@ -1828,7 +1833,7 @@ function renderForwardLoadSheet(ss, currentDay, reportPeriod, selectedBranch, br
   const branchRow = branchRows.length ? branchRows[0] : { branch: selectedBranch, c3: emptyForwardMetric(), c7: emptyForwardMetric(), b3: emptyForwardMetric(), b7: emptyForwardMetric() };
   const physioSummary = mergeCabinetTypeSummary_(cabinetSummary);
 
-  row = renderPlanBlockByHorizon_(sheet, row, '3 дня', {
+  row = renderPlanBlockByHorizon_(sheet, row, '3 дня', period3dLabel, {
     doctorsSummary: { current: branchRow.c3, baseline: branchRow.b3 },
     massageSummary: { current: massageSummary && massageSummary.c3 ? massageSummary.c3 : emptyForwardMetric(), baseline: massageSummary && massageSummary.b3 ? massageSummary.b3 : emptyForwardMetric() },
     ftSummary: { current: ftSummary && ftSummary.c3 ? ftSummary.c3 : emptyForwardMetric(), baseline: ftSummary && ftSummary.b3 ? ftSummary.b3 : emptyForwardMetric() },
@@ -1842,7 +1847,7 @@ function renderForwardLoadSheet(ss, currentDay, reportPeriod, selectedBranch, br
   });
 
   row += 1;
-  row = renderPlanBlockByHorizon_(sheet, row, '7 дней', {
+  row = renderPlanBlockByHorizon_(sheet, row, '7 дней', period7dLabel, {
     doctorsSummary: { current: branchRow.c7, baseline: branchRow.b7 },
     massageSummary: { current: massageSummary && massageSummary.c7 ? massageSummary.c7 : emptyForwardMetric(), baseline: massageSummary && massageSummary.b7 ? massageSummary.b7 : emptyForwardMetric() },
     ftSummary: { current: ftSummary && ftSummary.c7 ? ftSummary.c7 : emptyForwardMetric(), baseline: ftSummary && ftSummary.b7 ? ftSummary.b7 : emptyForwardMetric() },
@@ -1858,18 +1863,23 @@ function renderForwardLoadSheet(ss, currentDay, reportPeriod, selectedBranch, br
   sheet.autoResizeColumns(1, 8);
 }
 
-function renderPlanBlockByHorizon_(sheet, row, horizonLabel, ctx) {
+function renderPlanBlockByHorizon_(sheet, row, horizonLabel, periodLabel, ctx) {
   const h = ctx.horizon;
   const summaryHeader = ['Категория', 'Приемные (ч)', 'Занятые (ч)', 'Загрузка (%)', 'Свободные (ч)', 'Заявки (шт)', 'Заявки на ПП (шт)', 'Свободные слоты под ПП'];
-  const titleRange = sheet.getRange(row, 1, 1, summaryHeader.length);
-  titleRange.breakApart();
+  const titleRowRange = sheet.getRange(row, 1, 1, summaryHeader.length);
+  const titleRange = sheet.getRange(row, 1, 1, 4);
+  const titleTailRange = sheet.getRange(row, 5, 1, summaryHeader.length - 4);
+  titleRowRange.breakApart().clearContent();
   titleRange
     .merge()
-    .setValue(`Сводный план на ${horizonLabel}`)
+    .setValue(`Сводный план на ${horizonLabel}. Отчетный период: ${periodLabel}`)
     .setFontWeight('bold')
     .setFontSize(16)
     .setHorizontalAlignment('center')
     .setBackground('#6fa8dc');
+  titleTailRange
+    .setBackground('#6fa8dc')
+    .setBorder(false, false, false, false, false, false);
   row += 1;
   sheet.getRange(row, 1, 1, summaryHeader.length).setValues([summaryHeader]);
   styleForecastHeaderRow(sheet, row, summaryHeader.length);
@@ -2055,12 +2065,12 @@ function sendForwardReportEmail(ss, selectedBranch, currentDay) {
   if (!to.length) throw new Error(`Для филиала "${selectedBranch}" не заполнено поле Кому`);
   const prep = prepareForwardLoadInput_(ss, { selectedBranch, persistUnassigned: false, currentDay });
   const fallbackPeriod = computeReportPeriodFromReferenceMoment_(currentDay);
-  const periodLabel = prep.reportPeriod && prep.reportPeriod.label
-    ? prep.reportPeriod.label
-    : (fallbackPeriod && fallbackPeriod.label) || formatReportPeriodLabel_(addDays(currentDay, 1), addDays(currentDay, 7));
-  const subject = `План загрузки. Отчетный период: ${periodLabel}`;
+  const startDate = prep.reportPeriod && prep.reportPeriod.startDate
+    ? prep.reportPeriod.startDate
+    : (fallbackPeriod && fallbackPeriod.startDate) || addDays(currentDay, 1);
+  const reportStartLabel = formatDateDDMMYYYY_(startDate);
+  const subject = `План загрузки. ${selectedBranch}. ${reportStartLabel}`;
   const body = [
-    `<p><b>Отчетный период:</b> ${periodLabel}</p>`,
     sheetToHtmlTable(sheet),
     '<p><b>Цветовая интерпретация загрузки:</b> для горизонта 3 дня: <span style="background:#ff0000;padding:2px 6px;">красный</span> &lt; 25%, <span style="background:#fff2cc;padding:2px 6px;">желтый</span> 25–40%, белый 40–60%, <span style="background:#d9ead3;padding:2px 6px;">зеленый</span> 60–75%, <span style="background:#f4cccc;padding:2px 6px;">бледно-розовый</span> > 75%. Для горизонта 7 дней: <span style="background:#ff0000;padding:2px 6px;">красный</span> &lt; 20%, <span style="background:#fff2cc;padding:2px 6px;">желтый</span> 20–35%, белый 35–50%, <span style="background:#d9ead3;padding:2px 6px;">зеленый</span> 50–60%, <span style="background:#f4cccc;padding:2px 6px;">бледно-розовый</span> > 60%.</p>',
     '<p><b>Пояснение:</b> значения в скобках — это обычный уровень (среднее за последние 6 недель по тому же дню недели).</p>',
@@ -2708,17 +2718,23 @@ function escapeHtml_(value) {
 function isBranchPlanSheetData_(data) {
   if (!data || !data.length) return false;
   const firstCol = data.map((r) => str_(r && r[0]));
-  const hasPlanHeader = firstCol.some((v) => v.startsWith('План загрузки. Отчетный период:'));
+  const hasPlanHeader = firstCol.some((v) => v === 'План загрузки' || v.startsWith('План загрузки. Отчетный период:'));
   const hasBranchHeader = firstCol.some((v) => v.startsWith('Филиал:'));
   return hasPlanHeader && hasBranchHeader;
 }
 
 function parseClinicForecastSheet(data) {
   const firstCol = (data || []).map((r) => str_(r && r[0]));
-  const planHeader = firstCol.find((v) => v.startsWith('План загрузки. Отчетный период:')) || '';
-  const dateMatch = planHeader.match(/(\d{2}\.\d{2}\.\d{4})/);
+  const legacyPlanHeader = firstCol.find((v) => v.startsWith('План загрузки. Отчетный период:')) || '';
+  const plan7dHeader = firstCol.find((v) => v.startsWith('Сводный план на 7 дней. Отчетный период:')) || '';
+  const plan3dHeader = firstCol.find((v) => v.startsWith('Сводный план на 3 дня. Отчетный период:')) || '';
+  const periodSource = plan7dHeader || legacyPlanHeader || plan3dHeader;
+  const dateMatch = periodSource.match(/(\d{2}\.\d{2}\.\d{4})/);
   const reportDate = dateMatch ? dateMatch[1] : '';
-  const reportPeriodLabel = planHeader.replace(/^План загрузки\. Отчетный период:\s*/i, '').trim();
+  const reportPeriodLabel = periodSource
+    .replace(/^План загрузки\. Отчетный период:\s*/i, '')
+    .replace(/^Сводный план на (3 дня|7 дней)\. Отчетный период:\s*/i, '')
+    .trim();
   const branchLine = firstCol.find((v) => v.startsWith('Филиал:')) || '';
   const branch = branchLine.replace(/^Филиал:\s*/i, '').trim();
   if (!branch) return null;
@@ -3617,7 +3633,7 @@ function buildClinicSheetLinkMap_(ss) {
     if (name === FL2_SHEET_MAILING) return;
     if (name === FL2_SHEET_BATCH_SERVICE) return;
     const a1 = str_(sheet.getRange(1, 1).getDisplayValue());
-    if (!a1.startsWith('План загрузки. Отчетный период:')) return;
+    if (!(a1 === 'План загрузки' || a1.startsWith('План загрузки. Отчетный период:'))) return;
     map[name] = `${spreadsheetUrl}#gid=${sheet.getSheetId()}`;
   });
   return map;
@@ -3694,12 +3710,19 @@ function detectPlanBuiltAtFromReportSheet_(sheet) {
 function isPlanReportSheet_(sheet) {
   if (!sheet) return false;
   const a1 = str_(sheet.getRange(1, 1).getDisplayValue());
-  return a1.startsWith('План загрузки. Отчетный период:') || a1.startsWith('Общий план по клиникам. Отчетный период:');
+  return a1 === 'План загрузки' || a1.startsWith('План загрузки. Отчетный период:') || a1.startsWith('Общий план по клиникам. Отчетный период:');
 }
 
 function extractPlanReportDate_(sheet) {
-  const a1 = str_(sheet.getRange(1, 1).getDisplayValue());
-  const m = a1.match(/(\d{2}\.\d{2}\.\d{4})/);
+  if (!sheet) return '';
+  const maxRows = Math.min(sheet.getLastRow(), 20);
+  if (maxRows < 1) return '';
+  const firstCol = sheet.getRange(1, 1, maxRows, 1).getDisplayValues().map((row) => str_(row && row[0]));
+  const periodSource = firstCol.find((v) => v.startsWith('Сводный план на 7 дней. Отчетный период:'))
+    || firstCol.find((v) => v.startsWith('План загрузки. Отчетный период:'))
+    || firstCol.find((v) => v.startsWith('Сводный план на 3 дня. Отчетный период:'))
+    || str_(sheet.getRange(1, 1).getDisplayValue());
+  const m = periodSource.match(/(\d{2}\.\d{2}\.\d{4})/);
   return m ? m[1] : '';
 }
 
@@ -3973,53 +3996,78 @@ function sheetToHtmlTable(sheet, options) {
   const values = range.getDisplayValues();
   const backgrounds = range.getBackgrounds();
   const fontWeights = range.getFontWeights();
+  const mergedMeta = new Map();
+  const mergedSkip = new Set();
+
+  range.getMergedRanges().forEach((mergedRange) => {
+    const startRow = mergedRange.getRow() - range.getRow();
+    const startCol = mergedRange.getColumn() - range.getColumn();
+    const rowSpan = mergedRange.getNumRows();
+    const colSpan = mergedRange.getNumColumns();
+    mergedMeta.set(`${startRow}:${startCol}`, { rowSpan, colSpan });
+    for (let r = startRow; r < startRow + rowSpan; r += 1) {
+      for (let c = startCol; c < startCol + colSpan; c += 1) {
+        if (r === startRow && c === startCol) continue;
+        mergedSkip.add(`${r}:${c}`);
+      }
+    }
+  });
+
   let currentHorizon = '3d';
   let loadColumnIdx = 4;
   const htmlRows = values
     .map((row, rowIndex) => ({ row, rowIndex }))
     .filter((item) => item.row.some((cell) => str_(cell) !== ''))
     .map((item) => {
-    const row = item.row;
-    const sourceRowIndex = item.rowIndex;
-    const first = str_(row[0]);
-    if (first.includes('Таблица 2')) currentHorizon = '3d';
-    if (first.includes('Таблица 3')) currentHorizon = '7d';
-    if (first === '3 дня') currentHorizon = '3d';
-    if (first === '7 дней') currentHorizon = '7d';
+      const row = item.row;
+      const sourceRowIndex = item.rowIndex;
+      const first = str_(row[0]);
+      if (first.includes('Таблица 2')) currentHorizon = '3d';
+      if (first.includes('Таблица 3')) currentHorizon = '7d';
+      if (first === '3 дня') currentHorizon = '3d';
+      if (first === '7 дней') currentHorizon = '7d';
 
-    const headerLoadIdx = row.findIndex((cell) => /^Загрузка\s*\(%\)/i.test(str_(cell)) || /^Загрузка/i.test(str_(cell)));
-    if (headerLoadIdx >= 0) {
-      loadColumnIdx = headerLoadIdx;
-    }
+      const headerLoadIdx = row.findIndex((cell) => /^Загрузка\s*\(%\)/i.test(str_(cell)) || /^Загрузка/i.test(str_(cell)));
+      if (headerLoadIdx >= 0) {
+        loadColumnIdx = headerLoadIdx;
+      }
 
-    const cells = row.map((cell, idx) => {
-      const cellText = str_(cell);
-      const sourceBg = backgrounds[sourceRowIndex][idx] || '#ffffff';
-      const sourceWeight = fontWeights[sourceRowIndex][idx] || 'normal';
-      let background = sourceBg;
-      if (idx === loadColumnIdx && isLoadMetricCellForEmail_(first, cellText)) {
-        const parsed = parseCombinedMetric(cellText);
-        background = forecastLoadColorByHorizon(parsed.current, currentHorizon);
-      }
-      const tag = sourceWeight === 'bold' ? 'th' : 'td';
-      const align = idx === 0 ? 'left' : 'center';
-      const style = [
-        'border:1px solid #cfd8dc',
-        'padding:6px 8px',
-        `background:${background}`,
-        `font-weight:${sourceWeight}`,
-        `text-align:${align}`,
-        'vertical-align:middle',
-      ].join(';');
-      let textHtml = cellText || '';
-      if (clinicLinkMap && idx === 0 && shouldLinkClinicCellForEmail_(first, cellText, clinicLinkMap)) {
-        const href = clinicLinkMap[cellText];
-        textHtml = `<a href="${href}" target="_blank" style="color:inherit;text-decoration:none;">${cellText}</a>`;
-      }
-      return `<${tag} style="${style}">${textHtml}</${tag}>`;
+      const cells = row.map((cell, idx) => {
+        const mergeKey = `${sourceRowIndex}:${idx}`;
+        if (mergedSkip.has(mergeKey)) return '';
+
+        const cellText = str_(cell);
+        const sourceBg = backgrounds[sourceRowIndex][idx] || '#ffffff';
+        const sourceWeight = fontWeights[sourceRowIndex][idx] || 'normal';
+        const mergeInfo = mergedMeta.get(mergeKey) || { rowSpan: 1, colSpan: 1 };
+        let background = sourceBg;
+        if (idx === loadColumnIdx && isLoadMetricCellForEmail_(first, cellText)) {
+          const parsed = parseCombinedMetric(cellText);
+          background = forecastLoadColorByHorizon(parsed.current, currentHorizon);
+        }
+        const tag = sourceWeight === 'bold' ? 'th' : 'td';
+        const align = idx === 0 ? 'left' : 'center';
+        const style = [
+          'border:1px solid #cfd8dc',
+          'padding:6px 8px',
+          `background:${background}`,
+          `font-weight:${sourceWeight}`,
+          `text-align:${align}`,
+          'vertical-align:middle',
+        ].join(';');
+        let textHtml = cellText || '';
+        if (clinicLinkMap && idx === 0 && shouldLinkClinicCellForEmail_(first, cellText, clinicLinkMap)) {
+          const href = clinicLinkMap[cellText];
+          textHtml = `<a href="${href}" target="_blank" style="color:inherit;text-decoration:none;">${cellText}</a>`;
+        }
+        const spanAttrs = [
+          mergeInfo.colSpan > 1 ? ` colspan="${mergeInfo.colSpan}"` : '',
+          mergeInfo.rowSpan > 1 ? ` rowspan="${mergeInfo.rowSpan}"` : '',
+        ].join('');
+        return `<${tag}${spanAttrs} style="${style}">${textHtml}</${tag}>`;
+      }).join('');
+      return `<tr>${cells}</tr>`;
     }).join('');
-    return `<tr>${cells}</tr>`;
-  }).join('');
   return `<table style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:13px;line-height:1.35;">${htmlRows}</table>`;
 }
 
