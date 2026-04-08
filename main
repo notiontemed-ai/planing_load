@@ -8,6 +8,12 @@ const SHEET_EXCLUSIONS = 'Исключения';
 const SHEET_DISCOUNTS = 'Скидки';
 const MENU_NAME = 'TEMED';
 const REPORT_PERIOD_ROLLOVER_HOUR = 16;
+const SOURCE_EMAIL_ADDRESS = 'mnogobotoff@gmail.com';
+const SOURCE_EMAIL_SUBJECT_PREFIX = 'Выгрузка графика и заявок клиника "Темед" ';
+const SOURCE_SCHEDULE_ATTACHMENT_PREFIX = 'Графики ';
+const SOURCE_REQUESTS_ATTACHMENT_PREFIX = 'Заявки ';
+const SOURCE_ATTACHMENT_EXT = '.XLSX';
+const SOURCE_EMAIL_SUBJECT_REGEX = /^Выгрузка графика и заявок клиника "Темед" (\d{2}\.\d{2}\.\d{4})-(\d{2}\.\d{2}\.\d{4})$/;
 
 const TIME_TYPE_MAP = {
   'Рабочее время': 'Приемные часы',
@@ -19,6 +25,8 @@ const TIME_TYPE_MAP = {
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu(MENU_NAME)
+    .addItem('Загрузить график и заявки из почты', 'loadSourceDataFromEmail')
+    .addItem('Загрузить из почты и обработать', 'loadAndProcessSourceDataFromEmail')
     .addItem('Обработать исходные данные', 'processSourceData')
     .addSeparator()
     .addItem('Сформировать план загрузки 3/7 дней', 'buildForwardLoadReport')
@@ -41,6 +49,174 @@ function onOpen() {
 function processSourceData() {
   buildDoctorSchedule();
   SpreadsheetApp.getActive().toast('Исходные данные (график + заявки) обработаны', MENU_NAME, 5);
+}
+
+function loadAndProcessSourceDataFromEmail() {
+  loadSourceDataFromEmail();
+  processSourceData();
+  SpreadsheetApp.getActive().toast('Исходные данные загружены из почты и обработаны', MENU_NAME, 5);
+}
+
+function loadSourceDataFromEmail() {
+  const ss = SpreadsheetApp.getActive();
+  try {
+    const sourceMessage = findSingleSourceMessageForToday_();
+    const subject = str_(sourceMessage.getSubject());
+    const subjectPeriod = parseSourcePeriodFromSubject_(subject);
+    fl2Log_('INFO', 'Импорт исходников из почты: найдено письмо', `Тема: ${subject}`);
+    fl2Log_('INFO', 'Импорт исходников из почты: дата письма', formatDateTimeDDMMYYYY_(sourceMessage.getDate()));
+
+    const sourceAttachments = pickSourceAttachments_(sourceMessage.getAttachments(), subjectPeriod);
+    fl2Log_('INFO', 'Импорт исходников из почты: найденные вложения', `${sourceAttachments.schedule.getName()} | ${sourceAttachments.requests.getName()}`);
+
+    importXlsxAttachmentToSheet_(sourceAttachments.schedule.copyBlob(), SHEET_SCHEDULE_SOURCE);
+    fl2Log_('INFO', 'Импорт исходников из почты: лист обновлен', SHEET_SCHEDULE_SOURCE);
+
+    importXlsxAttachmentToSheet_(sourceAttachments.requests.copyBlob(), SHEET_REQUESTS);
+    fl2Log_('INFO', 'Импорт исходников из почты: лист обновлен', SHEET_REQUESTS);
+
+    fl2Log_('INFO', 'Импорт исходников из почты: успех', '');
+    ss.toast('Исходные данные загружены из почты', MENU_NAME, 5);
+  } catch (e) {
+    const message = e && e.message ? e.message : String(e);
+    fl2Log_('ERROR', 'Импорт исходников из почты: ошибка', message);
+    ss.toast(message, MENU_NAME, 8);
+    throw e;
+  }
+}
+
+function findSingleSourceMessageForToday_() {
+  const query = `from:${SOURCE_EMAIL_ADDRESS} subject:"${SOURCE_EMAIL_SUBJECT_PREFIX}" has:attachment`;
+  const threads = GmailApp.search(query, 0, 20);
+  const messages = [];
+  threads.forEach((thread) => {
+    messages.push(...thread.getMessages());
+  });
+
+  const strictMatches = [];
+  const todayMatches = [];
+  const todayLabel = Utilities.formatDate(new Date(), FL2_TIMEZONE, 'dd.MM.yyyy');
+
+  messages.forEach((message) => {
+    const subject = str_(message.getSubject());
+    if (!SOURCE_EMAIL_SUBJECT_REGEX.test(subject)) return;
+    if (!isMessageFromSourceEmail_(message, SOURCE_EMAIL_ADDRESS)) return;
+    if (!message.getAttachments() || !message.getAttachments().length) return;
+    strictMatches.push(message);
+    const messageDateLabel = Utilities.formatDate(message.getDate(), FL2_TIMEZONE, 'dd.MM.yyyy');
+    if (messageDateLabel === todayLabel) todayMatches.push(message);
+  });
+
+  if (!strictMatches.length) {
+    throw new Error(`Не найдено письмо за текущую дату от ${SOURCE_EMAIL_ADDRESS} с нужной темой`);
+  }
+  if (!todayMatches.length) {
+    throw new Error(`Не найдено письмо за текущую дату от ${SOURCE_EMAIL_ADDRESS} с нужной темой`);
+  }
+  if (todayMatches.length > 1) {
+    throw new Error('Найдено несколько писем за текущую дату, невозможно однозначно выбрать письмо');
+  }
+
+  return todayMatches[0];
+}
+
+function parseSourcePeriodFromSubject_(subject) {
+  const match = str_(subject).match(SOURCE_EMAIL_SUBJECT_REGEX);
+  if (!match) throw new Error('Тема письма не соответствует ожидаемому шаблону');
+  return {
+    periodStart: match[1],
+    periodEnd: match[2],
+  };
+}
+
+function pickSourceAttachments_(attachments, period) {
+  const list = Array.isArray(attachments) ? attachments : [];
+  const expectedScheduleName = `${SOURCE_SCHEDULE_ATTACHMENT_PREFIX}${period.periodStart}-${period.periodEnd}${SOURCE_ATTACHMENT_EXT}`;
+  const expectedRequestsName = `${SOURCE_REQUESTS_ATTACHMENT_PREFIX}${period.periodStart}-${period.periodEnd}${SOURCE_ATTACHMENT_EXT}`;
+  const scheduleMatches = list.filter((attachment) => str_(attachment.getName()) === expectedScheduleName);
+  const requestsMatches = list.filter((attachment) => str_(attachment.getName()) === expectedRequestsName);
+  const schedulePeriodMatches = list.filter((attachment) => {
+    const fileName = str_(attachment.getName());
+    return fileName.startsWith(SOURCE_SCHEDULE_ATTACHMENT_PREFIX) && fileName.endsWith(SOURCE_ATTACHMENT_EXT);
+  });
+  const requestsPeriodMatches = list.filter((attachment) => {
+    const fileName = str_(attachment.getName());
+    return fileName.startsWith(SOURCE_REQUESTS_ATTACHMENT_PREFIX) && fileName.endsWith(SOURCE_ATTACHMENT_EXT);
+  });
+
+  if (scheduleMatches.length !== 1) {
+    if (schedulePeriodMatches.length > 0) throw new Error('Имя вложения не совпадает с периодом из темы письма');
+    if (scheduleMatches.length === 0) throw new Error(`В письме не найдено вложение "${expectedScheduleName}"`);
+    throw new Error('Имя вложения не совпадает с периодом из темы письма');
+  }
+  if (requestsMatches.length !== 1) {
+    if (requestsPeriodMatches.length > 0) throw new Error('Имя вложения не совпадает с периодом из темы письма');
+    if (requestsMatches.length === 0) throw new Error(`В письме не найдено вложение "${expectedRequestsName}"`);
+    throw new Error('Имя вложения не совпадает с периодом из темы письма');
+  }
+  return {
+    schedule: scheduleMatches[0],
+    requests: requestsMatches[0],
+  };
+}
+
+function isMessageFromSourceEmail_(message, expectedEmail) {
+  const from = str_(message.getFrom());
+  if (!from) return false;
+  const match = from.match(/<([^>]+)>/);
+  const normalizedEmail = (match ? match[1] : from).trim().toLowerCase();
+  return normalizedEmail === str_(expectedEmail).toLowerCase();
+}
+
+function importXlsxAttachmentToSheet_(attachmentBlob, targetSheetName) {
+  const ss = SpreadsheetApp.getActive();
+  const target = getOrCreateSheet_(ss, targetSheetName);
+  let tempFileId = '';
+  let tempSpreadsheetId = '';
+  try {
+    const resource = {
+      title: `tmp_import_${targetSheetName}_${Date.now()}`,
+      mimeType: MimeType.GOOGLE_SHEETS,
+    };
+    const tempFile = Drive.Files.insert(resource, attachmentBlob, { convert: true });
+    if (!tempFile || !tempFile.id) throw new Error('Не удалось конвертировать XLSX во временную Google-таблицу');
+    tempFileId = tempFile.id;
+    tempSpreadsheetId = tempFile.id;
+
+    const tempSpreadsheet = SpreadsheetApp.openById(tempSpreadsheetId);
+    const firstSheet = tempSpreadsheet.getSheets()[0];
+    if (!firstSheet) throw new Error('Импортированный файл пустой');
+
+    const dataRange = firstSheet.getDataRange();
+    const values = dataRange.getValues();
+    if (!hasAnyNonEmptyCell_(values)) throw new Error('Импортированный файл пустой');
+
+    target.clear();
+    target.getRange(1, 1, values.length, values[0].length).setValues(values);
+  } catch (e) {
+    if (e && e.message === 'Импортированный файл пустой') throw e;
+    if (e && e.message === 'Не удалось конвертировать XLSX во временную Google-таблицу') throw e;
+    throw new Error('Не удалось конвертировать XLSX во временную Google-таблицу');
+  } finally {
+    if (tempFileId) {
+      try {
+        Drive.Files.trash(tempFileId);
+      } catch (cleanupError) {
+        fl2Log_('WARN', 'Импорт исходников из почты: не удалось удалить временный файл', String(cleanupError));
+      }
+    } else if (tempSpreadsheetId) {
+      try {
+        DriveApp.getFileById(tempSpreadsheetId).setTrashed(true);
+      } catch (cleanupError) {
+        fl2Log_('WARN', 'Импорт исходников из почты: не удалось удалить временный файл', String(cleanupError));
+      }
+    }
+  }
+}
+
+function hasAnyNonEmptyCell_(values) {
+  if (!Array.isArray(values) || !values.length) return false;
+  return values.some((row) => Array.isArray(row) && row.some((cell) => cell !== '' && cell !== null));
 }
 
 function buildDoctorSchedule() {
