@@ -69,6 +69,10 @@ function loadSourceDataFromEmail() {
     const sourceAttachments = pickSourceAttachments_(sourceMessage.getAttachments(), subjectPeriod);
     fl2Log_('INFO', 'Импорт исходников из почты: найденные вложения', `${sourceAttachments.schedule.getName()} | ${sourceAttachments.requests.getName()}`);
 
+    deleteSheetIfExists_(ss, SHEET_SCHEDULE_SOURCE);
+    deleteSheetIfExists_(ss, SHEET_REQUESTS);
+    fl2Log_('INFO', 'Импорт исходников из почты: исходные листы удалены', `${SHEET_SCHEDULE_SOURCE} | ${SHEET_REQUESTS}`);
+
     importXlsxAttachmentToSheet_(sourceAttachments.schedule.copyBlob(), SHEET_SCHEDULE_SOURCE);
     fl2Log_('INFO', 'Импорт исходников из почты: лист обновлен', SHEET_SCHEDULE_SOURCE);
 
@@ -778,6 +782,11 @@ function formatTimeCell_(value) {
 
 function getOrCreateSheet_(ss, name) {
   return ss.getSheetByName(name) || ss.insertSheet(name);
+}
+
+function deleteSheetIfExists_(ss, name) {
+  const sheet = ss.getSheetByName(name);
+  if (sheet) ss.deleteSheet(sheet);
 }
 
 function parseTimeToMinutes_(value) {
