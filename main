@@ -185,7 +185,7 @@ function importXlsxAttachmentToSheet_(attachmentBlob, targetSheetName) {
       title: `tmp_import_${targetSheetName}_${Date.now()}`,
       mimeType: MimeType.GOOGLE_SHEETS,
     };
-    const tempFile = Drive.Files.insert(resource, importBlob, { convert: true });
+    const tempFile = Drive.Files.create(resource, importBlob);
     if (!tempFile || !tempFile.id) throw new Error('Не удалось конвертировать XLSX во временную Google-таблицу');
     tempFileId = tempFile.id;
 
@@ -206,7 +206,7 @@ function importXlsxAttachmentToSheet_(attachmentBlob, targetSheetName) {
   } finally {
     if (tempFileId) {
       try {
-        Drive.Files.remove(tempFileId);
+        Drive.Files.delete(tempFileId);
       } catch (cleanupError) {
         try {
           DriveApp.getFileById(tempFileId).setTrashed(true);
