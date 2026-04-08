@@ -172,18 +172,24 @@ function importXlsxAttachmentToSheet_(attachmentBlob, targetSheetName) {
   const ss = SpreadsheetApp.getActive();
   const target = getOrCreateSheet_(ss, targetSheetName);
   let tempFileId = '';
-  let tempSpreadsheetId = '';
   try {
+    const importBlob = attachmentBlob.copyBlob();
+    if (!str_(importBlob.getName()).toLowerCase().endsWith('.xlsx')) {
+      importBlob.setName(`tmp_import_${targetSheetName}_${Date.now()}.xlsx`);
+    }
+    if (!str_(importBlob.getContentType())) {
+      importBlob.setContentType('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    }
+
     const resource = {
       title: `tmp_import_${targetSheetName}_${Date.now()}`,
       mimeType: MimeType.GOOGLE_SHEETS,
     };
-    const tempFile = Drive.Files.insert(resource, attachmentBlob, { convert: true });
+    const tempFile = Drive.Files.insert(resource, importBlob, { convert: true });
     if (!tempFile || !tempFile.id) throw new Error('Не удалось конвертировать XLSX во временную Google-таблицу');
     tempFileId = tempFile.id;
-    tempSpreadsheetId = tempFile.id;
 
-    const tempSpreadsheet = SpreadsheetApp.openById(tempSpreadsheetId);
+    const tempSpreadsheet = SpreadsheetApp.openById(tempFileId);
     const firstSheet = tempSpreadsheet.getSheets()[0];
     if (!firstSheet) throw new Error('Импортированный файл пустой');
 
@@ -194,21 +200,23 @@ function importXlsxAttachmentToSheet_(attachmentBlob, targetSheetName) {
     target.clear();
     target.getRange(1, 1, values.length, values[0].length).setValues(values);
   } catch (e) {
-    if (e && e.message === 'Импортированный файл пустой') throw e;
-    if (e && e.message === 'Не удалось конвертировать XLSX во временную Google-таблицу') throw e;
-    throw new Error('Не удалось конвертировать XLSX во временную Google-таблицу');
+    const rootCause = e && e.message ? e.message : String(e);
+    fl2Log_('ERROR', 'Импорт исходников из почты: ошибка импорта XLSX', rootCause);
+    throw new Error(`Не удалось импортировать XLSX в лист "${targetSheetName}": ${rootCause}`);
   } finally {
     if (tempFileId) {
       try {
-        Drive.Files.trash(tempFileId);
+        Drive.Files.remove(tempFileId);
       } catch (cleanupError) {
-        fl2Log_('WARN', 'Импорт исходников из почты: не удалось удалить временный файл', String(cleanupError));
-      }
-    } else if (tempSpreadsheetId) {
-      try {
-        DriveApp.getFileById(tempSpreadsheetId).setTrashed(true);
-      } catch (cleanupError) {
-        fl2Log_('WARN', 'Импорт исходников из почты: не удалось удалить временный файл', String(cleanupError));
+        try {
+          DriveApp.getFileById(tempFileId).setTrashed(true);
+        } catch (fallbackCleanupError) {
+          fl2Log_(
+            'WARN',
+            'Импорт исходников из почты: не удалось удалить временный файл',
+            `${String(cleanupError)} | fallback: ${String(fallbackCleanupError)}`
+          );
+        }
       }
     }
   }
