@@ -12,6 +12,10 @@ const SOURCE_EMAIL_SUBJECT_PREFIX = 'Выгрузка графика и заяв
 const SOURCE_SCHEDULE_ATTACHMENT_PREFIX = 'Графики ';
 const SOURCE_REQUESTS_ATTACHMENT_PREFIX = 'Заявки ';
 const SOURCE_ATTACHMENT_EXT = '.XLSX';
+const FL2_SYSTEM_MARKER = '__SYSTEM_TIMESTAMP__';
+const FL2_PROCESSED_REQUESTS_META_HEADER = 'Служебная метка';
+const FL2_PROCESSED_REQUESTS_BUILT_AT_HEADER = 'Системный timestamp';
+const FL2_PROCESSED_REQUESTS_CURRENT_DAY_HEADER = 'CurrentDate';
 
 const TIME_TYPE_MAP = {
   'Рабочее время': 'Приемные часы',
@@ -241,7 +245,7 @@ function buildDoctorSchedule() {
   const requestRows = requestsSheet ? getSheetObjects_(requestsSheet) : [];
   const excludedEmployees = getExcludedEmployeesSet_(ss);
   const employeeRegistry = getEmployeeRegistry_(ss);
-  const currentDayKey = detectCurrentDayFromRawRequests_(requestRows, employeeRegistry.allowed, excludedEmployees, employeeRegistry.unassignedFound);
+  const currentDayKey = detectCurrentDayFromSourceRequestsRows_(requestRows);
   if (!currentDayKey) throw new Error('Не найдены выполненные заявки для определения актуальной даты');
   const rangeStartKey = addDaysToDayKey_(currentDayKey, -42);
   const rangeEndKey = addDaysToDayKey_(currentDayKey, 7);
@@ -369,7 +373,7 @@ function buildDoctorSchedule() {
   const now = new Date();
   const minMarkerTime = sourceGraphMaxCreatedAt.getTime() > 0 ? sourceGraphMaxCreatedAt.getTime() + 1000 : 0;
   const markerDate = new Date(Math.max(now.getTime(), minMarkerTime));
-  const markerRow = ['__SYSTEM_TIMESTAMP__', '', '', '', '', '', '', '', formatDateTimeDDMMYYYY_(markerDate), '__SYSTEM_TIMESTAMP__'];
+  const markerRow = [FL2_SYSTEM_MARKER, '', '', '', '', '', '', '', formatDateTimeDDMMYYYY_(markerDate), FL2_SYSTEM_MARKER];
 
   if (compacted.length) {
     const values = compacted.map((r) => [
@@ -411,7 +415,14 @@ function buildProcessedRequestsSheet_(ss, requestsSheet, allowedEmployees, exclu
     sourceColumns.push({ idx, outHeader });
     outHeaders.push(outHeader);
   });
-  const extraHeaders = ['Дата', 'Время начала', 'Время окончания'];
+  const extraHeaders = [
+    'Дата',
+    'Время начала',
+    'Время окончания',
+    FL2_PROCESSED_REQUESTS_META_HEADER,
+    FL2_PROCESSED_REQUESTS_BUILT_AT_HEADER,
+    FL2_PROCESSED_REQUESTS_CURRENT_DAY_HEADER,
+  ];
   extraHeaders.forEach((h) => {
     if (outHeaders.indexOf(h) < 0) outHeaders.push(h);
   });
@@ -497,6 +508,9 @@ function buildProcessedRequestsSheet_(ss, requestsSheet, allowedEmployees, exclu
   const idxDateOut = outHeaders.indexOf('Дата');
   const idxStartTimeOut = outHeaders.indexOf('Время начала');
   const idxEndTimeOut = outHeaders.indexOf('Время окончания');
+  const idxMetaOut = outHeaders.indexOf(FL2_PROCESSED_REQUESTS_META_HEADER);
+  const idxBuiltAtMetaOut = outHeaders.indexOf(FL2_PROCESSED_REQUESTS_BUILT_AT_HEADER);
+  const idxCurrentDayMetaOut = outHeaders.indexOf(FL2_PROCESSED_REQUESTS_CURRENT_DAY_HEADER);
 
   const outRows = rows.map((row) => {
     const sourceRowIdx = values.indexOf(row);
@@ -513,6 +527,14 @@ function buildProcessedRequestsSheet_(ss, requestsSheet, allowedEmployees, exclu
     if (idxEndTimeOut >= 0) item[idxEndTimeOut] = parts.endTime || '';
     return item;
   });
+
+  const builtAt = new Date();
+  const markerRow = new Array(outHeaders.length).fill('');
+  if (idxMetaOut >= 0) markerRow[idxMetaOut] = FL2_SYSTEM_MARKER;
+  if (idxBuiltAtMetaOut >= 0) markerRow[idxBuiltAtMetaOut] = formatDateTimeDDMMYYYY_(builtAt);
+  if (idxCurrentDayMetaOut >= 0) markerRow[idxCurrentDayMetaOut] = dayKeyToDateText_(currentDayKey);
+
+  outRows.push(markerRow);
 
   const target = getOrCreateSheet_(ss, SHEET_PROCESSED_REQUESTS);
   target.clearContents();
@@ -1570,6 +1592,52 @@ function tryGetUi_() {
   }
 }
 
+function detectProcessedRequestsMeta_(sheet) {
+  if (!sheet) return null;
+
+  const lastRow = sheet.getLastRow();
+  const lastCol = sheet.getLastColumn();
+  if (lastRow < 2 || lastCol < 1) return null;
+
+  const headers = sheet.getRange(1, 1, 1, lastCol).getDisplayValues()[0].map((h) => str_(h));
+  const idxMeta = headers.indexOf(FL2_PROCESSED_REQUESTS_META_HEADER);
+  const idxBuiltAt = headers.indexOf(FL2_PROCESSED_REQUESTS_BUILT_AT_HEADER);
+  const idxCurrentDay = headers.indexOf(FL2_PROCESSED_REQUESTS_CURRENT_DAY_HEADER);
+
+  if (idxMeta < 0 || idxBuiltAt < 0 || idxCurrentDay < 0) return null;
+
+  const lastRowValues = sheet.getRange(lastRow, 1, 1, lastCol).getDisplayValues()[0];
+  if (str_(lastRowValues[idxMeta]) !== FL2_SYSTEM_MARKER) return null;
+
+  const builtAt = toDate_(lastRowValues[idxBuiltAt]);
+  const currentDayKey = parseLocalDayKey_(lastRowValues[idxCurrentDay]);
+
+  if (!builtAt || !currentDayKey) return null;
+
+  return {
+    builtAt,
+    currentDayKey,
+  };
+}
+
+function ensureProcessedRequestsMeta_(ss) {
+  ensureDoctorScheduleFresh(ss);
+
+  let sheet = ss.getSheetByName(SHEET_PROCESSED_REQUESTS);
+  let meta = detectProcessedRequestsMeta_(sheet);
+  if (meta) return meta;
+
+  buildDoctorSchedule();
+
+  sheet = ss.getSheetByName(SHEET_PROCESSED_REQUESTS);
+  meta = detectProcessedRequestsMeta_(sheet);
+  if (!meta) {
+    throw new Error('Не удалось определить CurrentDate из листа "Обработанные заявки"');
+  }
+
+  return meta;
+}
+
 function prepareForwardLoadInput_(ss, options) {
   const opts = options || {};
   const logCtx = opts.logCtx || null;
@@ -1594,18 +1662,28 @@ function prepareForwardLoadInput_(ss, options) {
   const selectedBranch = str_(opts.selectedBranch);
 
   let requestRowsRawAll = null;
-  let currentDayKey = str_(opts.currentDayKey);
-  if (!currentDayKey && opts.currentDay) {
-    if (opts.currentDay instanceof Date) currentDayKey = parseLocalDayKey_(opts.currentDay);
-    else currentDayKey = parseLocalDayKey_(opts.currentDay) || parseLocalDayKey_(new Date(Number(opts.currentDay)));
+
+  const processedRequestsMeta = ensureProcessedRequestsMeta_(ss);
+  const storedCurrentDayKey = processedRequestsMeta.currentDayKey;
+
+  let incomingCurrentDayKey = str_(opts.currentDayKey);
+  if (!incomingCurrentDayKey && opts.currentDay) {
+    if (opts.currentDay instanceof Date) {
+      incomingCurrentDayKey = parseLocalDayKey_(opts.currentDay);
+    } else {
+      incomingCurrentDayKey = parseLocalDayKey_(opts.currentDay) || parseLocalDayKey_(new Date(Number(opts.currentDay)));
+    }
   }
-  if (!currentDayKey) {
-    const detectDayTimer = fl2StageTimer_();
-    const sourceRequestRows = getSheetObjects_(sourceRequestsSheet);
-    stage('prepare: loaded source requests for CurrentDate detect', `rows=${sourceRequestRows.length}`, detectDayTimer);
-    tick();
-    currentDayKey = detectCurrentDayFromSourceRequestsRows_(sourceRequestRows);
+
+  if (incomingCurrentDayKey && incomingCurrentDayKey !== storedCurrentDayKey) {
+    fl2Log_(
+      'WARN',
+      'Переданный CurrentDate проигнорирован',
+      `incoming=${incomingCurrentDayKey}, stored=${storedCurrentDayKey}`
+    );
   }
+
+  const currentDayKey = storedCurrentDayKey;
   const currentDay = dayKeyToDate_(currentDayKey);
   if (!currentDayKey || !currentDay || Number.isNaN(currentDay.getTime())) {
     throw new Error('Не найдены выполненные заявки для определения CurrentDate');
@@ -2183,23 +2261,6 @@ function collectBranches(scheduleRows, requestRows) {
   });
   return [...set].sort((a, b) => a.localeCompare(b, 'ru'));
 }
-function detectCurrentDayFromRawRequests_(rows, allowedEmployees, excludedEmployees, unassignedSet) {
-  let maxDayKey = '';
-  rows.forEach((row) => {
-    if (!isCompletedStatus(str_(row['Состояние']))) return;
-    const doctor = str_(row['Сотрудник']);
-    if (!doctor || (excludedEmployees && excludedEmployees.has(doctor)) || hasStandaloneTestWord_(doctor)) return;
-    if (allowedEmployees && !allowedEmployees.has(doctor)) {
-      if (unassignedSet) unassignedSet.add(doctor);
-      return;
-    }
-    const dKey = parseLocalDayKey_(row['ДатаНачала']);
-    if (!dKey) return;
-    if (!maxDayKey || dKey > maxDayKey) maxDayKey = dKey;
-  });
-  return maxDayKey || null;
-}
-
 function detectCurrentDayFromSourceRequestsRows_(rows) {
   let maxDayKey = '';
   const list = Array.isArray(rows) ? rows : [];
@@ -2211,19 +2272,6 @@ function detectCurrentDayFromSourceRequestsRows_(rows) {
     if (!maxDayKey || dKey > maxDayKey) maxDayKey = dKey;
   });
   return maxDayKey || null;
-}
-
-function detectLatestCompletedRequestMoment_(requests) {
-  const completed = requests.filter((r) => isCompletedStatus(r.status) && r.startDate);
-  if (!completed.length) return null;
-  completed.sort((a, b) => a.startDate - b.startDate);
-  return new Date(completed[completed.length - 1].startDate.getTime());
-}
-
-function detectCurrentDay(requests) {
-  const latestMoment = detectLatestCompletedRequestMoment_(requests);
-  if (!latestMoment) return null;
-  return parseLocalDayKey_(latestMoment) || null;
 }
 function buildReceptionScheduleIndex(scheduleRows, excludedEmployees, allowedEmployees) {
   const map = new Map();
@@ -4570,7 +4618,7 @@ function detectDoctorScheduleBuiltAtFallback(doctorScheduleSheet) {
   const marker = doctorScheduleSheet.getRange(lastRow, 1, 1, 10).getDisplayValues()[0];
   const markerKey = str_(marker[0]);
   const markerDate = toDate_(marker[8]);
-  if (markerKey !== '__SYSTEM_TIMESTAMP__' || !markerDate) return null;
+  if (markerKey !== FL2_SYSTEM_MARKER || !markerDate) return null;
   return markerDate;
 }
 function sendOverallForecastEmail(ss, reportPeriodLabel) {
