@@ -7,7 +7,6 @@ const SHEET_REPORT_LOG = 'Лог';
 const SHEET_EXCLUSIONS = 'Исключения';
 const SHEET_DISCOUNTS = 'Скидки';
 const MENU_NAME = 'TEMED';
-const REPORT_PERIOD_ROLLOVER_HOUR = 16;
 const SOURCE_EMAIL_SUBJECT_PREFIX = 'Выгрузка графика и заявок клиника "Темед"';
 const SOURCE_SCHEDULE_ATTACHMENT_PREFIX = 'Графики ';
 const SOURCE_REQUESTS_ATTACHMENT_PREFIX = 'Заявки ';
@@ -772,7 +771,7 @@ function computeReportPeriodFromReferenceMoment_(referenceMoment, baseDayDate) {
   const referenceDate = normalizeDateToTimezoneStart_(baseDayDate || timestamp);
   if (!referenceDate) return null;
   const referenceHour = Number(Utilities.formatDate(timestamp, FL2_TIMEZONE, 'H'));
-  const startDate = referenceHour > REPORT_PERIOD_ROLLOVER_HOUR ? addDays(referenceDate, 1) : referenceDate;
+  const startDate = addDays(referenceDate, 1);
   const endDate = addDays(startDate, 6);
   return {
     referenceMoment: timestamp,
