@@ -81,41 +81,12 @@ function loadSourceDataFromEmail() {
 }
 
 function findSingleSourceMessageForToday_() {
-  const query = 'has:attachment newer_than:2d';
-  const threads = GmailApp.search(query, 0, 100);
-  const messages = [];
-  threads.forEach((thread) => {
-    messages.push(...thread.getMessages());
-  });
-
-  const subjectMatches = [];
-
-  messages.forEach((message) => {
-    const subject = str_(message.getSubject()).replace(/\s+/g, ' ').trim();
-    if (!subject.startsWith(SOURCE_EMAIL_SUBJECT_PREFIX)) return;
-    if (!message.getAttachments() || !message.getAttachments().length) return;
-    subjectMatches.push(message);
-  });
-
-  if (!subjectMatches.length) {
-    const checkedCount = messages.length;
-    const examples = messages
-      .slice()
-      .sort((a, b) => b.getDate().getTime() - a.getDate().getTime())
-      .slice(0, 5)
-      .map((message) => {
-        const date = Utilities.formatDate(message.getDate(), FL2_TIMEZONE, 'dd.MM.yyyy HH:mm:ss');
-        const from = str_(message.getFrom());
-        const subject = str_(message.getSubject());
-        return `${date} | ${from} | ${subject}`;
-      });
-    const examplesText = examples.length ? examples.join(' ; ') : 'нет писем';
-    throw new Error(
-      `Не найдено письмо с темой, начинающейся на "${SOURCE_EMAIL_SUBJECT_PREFIX}". ` +
-      `Проверено сообщений: ${checkedCount}. Примеры найденных писем: ${examplesText}`
-    );
+  const query = 'label:графики-и-заявки-из-1с newer_than:2d';
+  const thread = GmailApp.search(query, 0, 1)[0];
+  if (!thread) {
+    throw new Error('Не найдено ни одного письма с меткой "графики-и-заявки-из-1с"');
   }
-  return pickLatestMessageByDate_(subjectMatches);
+  return pickLatestMessageByDate_(thread.getMessages());
 }
 
 function pickLatestMessageByDate_(messages) {
