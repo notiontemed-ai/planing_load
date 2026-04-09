@@ -360,7 +360,7 @@ function buildProcessedRequestsSheet_(ss, requestsSheet, allowedEmployees, exclu
   const idxEnd = headers.indexOf('ДатаОкончания');
   const idxBranch = headers.indexOf('Филиал');
 
-  const excludedOutputHeaders = new Set(['Номер', 'Клиент', 'Примечание']);
+  const excludedOutputHeaders = new Set(['Клиент', 'Примечание']);
   const sourceColumnIndexes = [];
   const outHeaders = [];
   headers.forEach((header, idx) => {
