@@ -7,13 +7,12 @@ const SHEET_REPORT_LOG = 'Лог';
 const SHEET_EXCLUSIONS = 'Исключения';
 const SHEET_DISCOUNTS = 'Скидки';
 const MENU_NAME = 'TEMED';
-const REPORT_PERIOD_ROLLOVER_HOUR = 16;
-const SOURCE_EMAIL_ADDRESS = 'mnogobotoff@gmail.com';
-const SOURCE_EMAIL_SUBJECT_PREFIX = 'Выгрузка графика и заявок клиника "Темед" ';
+const SOURCE_EMAIL_SUBJECT_PREFIX = 'Выгрузка графика и заявок клиника "Темед"';
 const SOURCE_SCHEDULE_ATTACHMENT_PREFIX = 'Графики ';
 const SOURCE_REQUESTS_ATTACHMENT_PREFIX = 'Заявки ';
 const SOURCE_ATTACHMENT_EXT = '.XLSX';
-const SOURCE_EMAIL_SUBJECT_REGEX = /^Выгрузка графика и заявок клиника "Темед" (\d{2}\.\d{2}\.\d{4})-(\d{2}\.\d{2}\.\d{4})$/;
+const FL2_SYSTEM_MARKER = '__SYSTEM_TIMESTAMP__';
+const FL2_PROCESSED_REQUESTS_CURRENT_DAY_HEADER = 'CurrentDate';
 
 const TIME_TYPE_MAP = {
   'Рабочее время': 'Приемные часы',
@@ -37,6 +36,14 @@ function onOpen() {
     .addItem('Отправить скидки', 'sendDiscountsEmails')
     .addSeparator()
     .addItem('Собрать общий план', 'buildOverallForecastReport')
+    .addSeparator()
+    .addSubMenu(
+      SpreadsheetApp.getUi()
+        .createMenu('Триггеры')
+        .addItem('Агрегаторы: план без baseline + скидки + письмо', 'triggerBuildAggregatorDiscountsAndSend')
+        .addItem('Скидки без агрегаторов: план без baseline + письмо', 'triggerBuildNonAggregatorDiscountsAndSend')
+        .addItem('План с baseline + общий план + письма', 'triggerBuildBaselinePlansAndSend')
+    )
     .addSeparator()
     .addItem('Архивировать план (ежедневно)', 'archivePlanReportsDaily')
     .addToUi();
@@ -62,11 +69,10 @@ function loadSourceDataFromEmail() {
   try {
     const sourceMessage = findSingleSourceMessageForToday_();
     const subject = str_(sourceMessage.getSubject());
-    const subjectPeriod = parseSourcePeriodFromSubject_(subject);
     fl2Log_('INFO', 'Импорт исходников из почты: найдено письмо', `Тема: ${subject}`);
     fl2Log_('INFO', 'Импорт исходников из почты: дата письма', formatDateTimeDDMMYYYY_(sourceMessage.getDate()));
 
-    const sourceAttachments = pickSourceAttachments_(sourceMessage.getAttachments(), subjectPeriod);
+    const sourceAttachments = pickSourceAttachments_(sourceMessage.getAttachments());
     fl2Log_('INFO', 'Импорт исходников из почты: найденные вложения', `${sourceAttachments.schedule.getName()} | ${sourceAttachments.requests.getName()}`);
 
     deleteSheetIfExists_(ss, SHEET_SCHEDULE_SOURCE);
@@ -90,7 +96,7 @@ function loadSourceDataFromEmail() {
 }
 
 function findSingleSourceMessageForToday_() {
-  const query = `from:${SOURCE_EMAIL_ADDRESS} has:attachment newer_than:2d`;
+  const query = 'has:attachment newer_than:2d';
   const threads = GmailApp.search(query, 0, 100);
   const messages = [];
   threads.forEach((thread) => {
@@ -101,9 +107,8 @@ function findSingleSourceMessageForToday_() {
   const todayLabel = Utilities.formatDate(new Date(), FL2_TIMEZONE, 'dd.MM.yyyy');
 
   messages.forEach((message) => {
-    const subject = str_(message.getSubject());
-    if (!SOURCE_EMAIL_SUBJECT_REGEX.test(subject)) return;
-    if (!isMessageFromSourceEmail_(message, SOURCE_EMAIL_ADDRESS)) return;
+    const subject = str_(message.getSubject()).replace(/\s+/g, ' ').trim();
+    if (!subject.startsWith(SOURCE_EMAIL_SUBJECT_PREFIX)) return;
     if (!message.getAttachments() || !message.getAttachments().length) return;
     const messageDateLabel = Utilities.formatDate(message.getDate(), FL2_TIMEZONE, 'dd.MM.yyyy');
     if (messageDateLabel === todayLabel) todayMatches.push(message);
@@ -123,7 +128,7 @@ function findSingleSourceMessageForToday_() {
       });
     const examplesText = examples.length ? examples.join(' ; ') : 'нет писем';
     throw new Error(
-      `Не найдено письмо за текущую дату от ${SOURCE_EMAIL_ADDRESS} с нужной темой. ` +
+      `Не найдено письмо за текущую дату с темой, начинающейся на "${SOURCE_EMAIL_SUBJECT_PREFIX}". ` +
       `Проверено сообщений: ${checkedCount}. Примеры найденных писем: ${examplesText}`
     );
   }
@@ -141,52 +146,29 @@ function pickLatestMessageByDate_(messages) {
   return list[list.length - 1] || null;
 }
 
-function parseSourcePeriodFromSubject_(subject) {
-  const match = str_(subject).match(SOURCE_EMAIL_SUBJECT_REGEX);
-  if (!match) throw new Error('Тема письма не соответствует ожидаемому шаблону');
-  return {
-    periodStart: match[1],
-    periodEnd: match[2],
-  };
-}
-
-function pickSourceAttachments_(attachments, period) {
+function pickSourceAttachments_(attachments) {
   const list = Array.isArray(attachments) ? attachments : [];
-  const expectedScheduleName = `${SOURCE_SCHEDULE_ATTACHMENT_PREFIX}${period.periodStart}-${period.periodEnd}${SOURCE_ATTACHMENT_EXT}`;
-  const expectedRequestsName = `${SOURCE_REQUESTS_ATTACHMENT_PREFIX}${period.periodStart}-${period.periodEnd}${SOURCE_ATTACHMENT_EXT}`;
-  const scheduleMatches = list.filter((attachment) => str_(attachment.getName()) === expectedScheduleName);
-  const requestsMatches = list.filter((attachment) => str_(attachment.getName()) === expectedRequestsName);
-  const schedulePeriodMatches = list.filter((attachment) => {
+  const scheduleMatches = list.filter((attachment) => {
     const fileName = str_(attachment.getName());
     return fileName.startsWith(SOURCE_SCHEDULE_ATTACHMENT_PREFIX) && fileName.endsWith(SOURCE_ATTACHMENT_EXT);
   });
-  const requestsPeriodMatches = list.filter((attachment) => {
+  const requestsMatches = list.filter((attachment) => {
     const fileName = str_(attachment.getName());
     return fileName.startsWith(SOURCE_REQUESTS_ATTACHMENT_PREFIX) && fileName.endsWith(SOURCE_ATTACHMENT_EXT);
   });
 
   if (scheduleMatches.length !== 1) {
-    if (schedulePeriodMatches.length > 0) throw new Error('Имя вложения не совпадает с периодом из темы письма');
-    if (scheduleMatches.length === 0) throw new Error(`В письме не найдено вложение "${expectedScheduleName}"`);
-    throw new Error('Имя вложения не совпадает с периодом из темы письма');
+    if (scheduleMatches.length === 0) throw new Error('В письме не найдено вложение "Графики *.XLSX"');
+    throw new Error('В письме найдено больше одного вложения "Графики *.XLSX"');
   }
   if (requestsMatches.length !== 1) {
-    if (requestsPeriodMatches.length > 0) throw new Error('Имя вложения не совпадает с периодом из темы письма');
-    if (requestsMatches.length === 0) throw new Error(`В письме не найдено вложение "${expectedRequestsName}"`);
-    throw new Error('Имя вложения не совпадает с периодом из темы письма');
+    if (requestsMatches.length === 0) throw new Error('В письме не найдено вложение "Заявки *.XLSX"');
+    throw new Error('В письме найдено больше одного вложения "Заявки *.XLSX"');
   }
   return {
     schedule: scheduleMatches[0],
     requests: requestsMatches[0],
   };
-}
-
-function isMessageFromSourceEmail_(message, expectedEmail) {
-  const from = str_(message.getFrom());
-  if (!from) return false;
-  const match = from.match(/<([^>]+)>/);
-  const normalizedEmail = (match ? match[1] : from).trim().toLowerCase();
-  return normalizedEmail === str_(expectedEmail).toLowerCase();
 }
 
 function importXlsxAttachmentToSheet_(attachmentBlob, targetSheetName) {
@@ -255,16 +237,17 @@ function buildDoctorSchedule() {
     throw new Error(`Не найден лист "${SHEET_SCHEDULE_SOURCE}"`);
   }
 
-  const rows = getSheetObjects_(source);
+  const rows = getSheetObjectsDisplay_(source);
   const requestsSheet = ss.getSheetByName(SHEET_REQUESTS);
-  const requestRows = requestsSheet ? getSheetObjects_(requestsSheet) : [];
+  const requestRows = requestsSheet ? getSheetObjectsDisplay_(requestsSheet) : [];
   const excludedEmployees = getExcludedEmployeesSet_(ss);
   const employeeRegistry = getEmployeeRegistry_(ss);
-  const currentDay = detectCurrentDayFromRawRequests_(requestRows, employeeRegistry.allowed, excludedEmployees, employeeRegistry.unassignedFound);
-  if (!currentDay) throw new Error('Не найдены выполненные заявки для определения актуальной даты');
-  const rangeStart = addDays(currentDay, -42);
-  const rangeEnd = addDays(currentDay, 7);
-  const requestsRangeEnd = addDays(currentDay, 8);
+  const currentDayKey = detectCurrentDayFromSourceRequestsRows_(requestRows);
+  if (!currentDayKey) throw new Error('Не найдены выполненные заявки для определения актуальной даты');
+  fl2Log_('INFO', 'CurrentDate detected for processed requests build', `currentDay=${currentDayKey}, sourceRows=${requestRows.length}`);
+  const rangeStartKey = addDaysToDayKey_(currentDayKey, -42);
+  const rangeEndKey = addDaysToDayKey_(currentDayKey, 7);
+  const requestsRangeEndKey = addDaysToDayKey_(currentDayKey, 8);
 
   const grouped = new Map();
   let sourceGraphMaxCreatedAt = new Date(0);
@@ -274,23 +257,63 @@ function buildDoctorSchedule() {
     const cabinet = str_(row['Кабинет']);
     const cabinetType = detectCabinetType_(cabinet);
     const isCabinetRow = Boolean(cabinetType);
+    const rowBranch = str_(row['Филиал']);
+    const rowDate = toDate_(row['Дата']);
+    const rowStart = parseTimeToMinutes_(row['Время начала']);
+    const rowEnd = parseTimeToMinutes_(row['Время окончания']);
+    const rowTimeKind = str_(row['Вид времени']);
+    let scheduleDecision = 'included';
+    let scheduleReason = '';
     if (!isCabinetRow) {
-      if (!employee || excludedEmployees.has(employee) || hasStandaloneTestWord_(employee)) return;
-      if (!employeeRegistry.allowed.has(employee)) {
+      if (!employee || excludedEmployees.has(employee)) {
+        scheduleDecision = 'excluded';
+        scheduleReason = 'excluded_employee';
+      } else if (hasStandaloneTestWord_(employee)) {
+        scheduleDecision = 'excluded';
+        scheduleReason = 'test_name';
+      } else if (!employeeRegistry.allowed.has(employee)) {
+        scheduleDecision = 'excluded';
+        scheduleReason = 'employee_not_allowed';
         employeeRegistry.unassignedFound.add(employee);
-        return;
       }
-    } else if (employee && (excludedEmployees.has(employee) || hasStandaloneTestWord_(employee))) {
-      return;
+    } else if (employee && excludedEmployees.has(employee)) {
+      scheduleDecision = 'excluded';
+      scheduleReason = 'excluded_employee';
+    } else if (employee && hasStandaloneTestWord_(employee)) {
+      scheduleDecision = 'excluded';
+      scheduleReason = 'test_name';
     }
 
-    const date = toDate_(row['Дата']);
-    if (!isDateInRangeInclusive_(date, rangeStart, rangeEnd)) return;
+    if (scheduleDecision === 'included' && !isDayKeyInRangeInclusive_(parseLocalDayKey_(rowDate) || parseLocalDayKey_(row['Дата']), rangeStartKey, rangeEndKey)) {
+      scheduleDecision = 'excluded';
+      scheduleReason = 'date_out_of_range';
+    }
+    if (scheduleDecision === 'included' && (rowStart === null || rowEnd === null || rowEnd <= rowStart)) {
+      scheduleDecision = 'excluded';
+      scheduleReason = 'invalid_interval';
+    }
+
+    if (employee === FL2_DEBUG_TRACE_DOCTOR && rowBranch === FL2_DEBUG_TRACE_BRANCH) {
+      fl2DebugTrace_('DEBUG buildDoctorSchedule source row', {
+        branch: rowBranch,
+        doctor: employee,
+        date: rowDate ? dateKey_(rowDate) : str_(row['Дата']),
+        startTime: str_(row['Время начала']),
+        endTime: str_(row['Время окончания']),
+        timeKind: rowTimeKind,
+        timeType: mapTimeType_(rowTimeKind),
+        decision: scheduleDecision,
+        reason: scheduleReason || undefined,
+      });
+    }
+
+    if (scheduleDecision !== 'included') return;
+    const date = rowDate;
     const dateLabel = formatDateDDMMYYYY_(date || row['Дата']);
-    const branch = str_(row['Филиал']);
-    const start = parseTimeToMinutes_(row['Время начала']);
-    const end = parseTimeToMinutes_(row['Время окончания']);
-    const timeKind = str_(row['Вид времени']);
+    const branch = rowBranch;
+    const start = rowStart;
+    const end = rowEnd;
+    const timeKind = rowTimeKind;
     const sourceCreatedAt = toDate_(row['Дата создания']);
     if (sourceCreatedAt && sourceCreatedAt > sourceGraphMaxCreatedAt) sourceGraphMaxCreatedAt = sourceCreatedAt;
 
@@ -300,7 +323,6 @@ function buildDoctorSchedule() {
     const createdAtLabel = formatDateTimeDDMMYYYY_(createdAtRaw) || formatDateTimeDDMMYYYY_(createdAt);
 
     if (!date || !dateLabel || !branch || start === null || end === null || !timeKind) return;
-    if (end <= start) return;
 
     const key = [dateKey_(date), branch, employee, cabinet].join('|');
     if (!grouped.has(key)) grouped.set(key, []);
@@ -349,7 +371,7 @@ function buildDoctorSchedule() {
   const now = new Date();
   const minMarkerTime = sourceGraphMaxCreatedAt.getTime() > 0 ? sourceGraphMaxCreatedAt.getTime() + 1000 : 0;
   const markerDate = new Date(Math.max(now.getTime(), minMarkerTime));
-  const markerRow = ['__SYSTEM_TIMESTAMP__', '', '', '', '', '', '', '', formatDateTimeDDMMYYYY_(markerDate), '__SYSTEM_TIMESTAMP__'];
+  const markerRow = [FL2_SYSTEM_MARKER, '', '', '', '', '', '', '', formatDateTimeDDMMYYYY_(markerDate), FL2_SYSTEM_MARKER];
 
   if (compacted.length) {
     const values = compacted.map((r) => [
@@ -361,14 +383,16 @@ function buildDoctorSchedule() {
     target.getRange(2, 1, 1, header.length).setValues([markerRow]);
   }
 
-  buildProcessedRequestsSheet_(ss, requestsSheet, employeeRegistry.allowed, excludedEmployees, rangeStart, requestsRangeEnd, currentDay, employeeRegistry.unassignedFound);
+  buildProcessedRequestsSheet_(ss, requestsSheet, employeeRegistry.allowed, excludedEmployees, rangeStartKey, requestsRangeEndKey, currentDayKey, employeeRegistry.unassignedFound);
   saveUnassignedEmployees_(ss, employeeRegistry.unassignedFound);
   SpreadsheetApp.getActive().toast('Обработанные данные сформированы', MENU_NAME, 5);
 }
 
-function buildProcessedRequestsSheet_(ss, requestsSheet, allowedEmployees, excludedEmployees, rangeStart, rangeEnd, currentDay, unassignedSet) {
+function buildProcessedRequestsSheet_(ss, requestsSheet, allowedEmployees, excludedEmployees, rangeStartKey, rangeEndKey, currentDayKey, unassignedSet) {
   if (!requestsSheet) return;
-  const values = requestsSheet.getDataRange().getValues();
+  const dataRange = requestsSheet.getDataRange();
+  const values = dataRange.getValues();
+  const displayValues = dataRange.getDisplayValues();
   if (!values.length) return;
 
   const headers = values[0].map((h) => str_(h));
@@ -378,9 +402,23 @@ function buildProcessedRequestsSheet_(ss, requestsSheet, allowedEmployees, exclu
   const idxStart = headers.indexOf('ДатаНачала');
   const idxEnd = headers.indexOf('ДатаОкончания');
   const idxBranch = headers.indexOf('Филиал');
+  const idxCreatedAt = headers.indexOf('Дата');
 
-  const extraHeaders = ['НачалоМин', 'ОкончаниеМин', 'ДлительностьМин'];
-  const outHeaders = [...headers];
+  const excludedOutputHeaders = new Set(['Клиент', 'Примечание', 'ДатаНачала', 'ДатаОкончания']);
+  const sourceColumns = [];
+  const outHeaders = [];
+  headers.forEach((header, idx) => {
+    if (excludedOutputHeaders.has(header)) return;
+    const outHeader = header === 'Дата' ? 'Дата создания' : header;
+    sourceColumns.push({ idx, outHeader });
+    outHeaders.push(outHeader);
+  });
+  const extraHeaders = [
+    'Дата',
+    'Время начала',
+    'Время окончания',
+    FL2_PROCESSED_REQUESTS_CURRENT_DAY_HEADER,
+  ];
   extraHeaders.forEach((h) => {
     if (outHeaders.indexOf(h) < 0) outHeaders.push(h);
   });
@@ -391,23 +429,62 @@ function buildProcessedRequestsSheet_(ss, requestsSheet, allowedEmployees, exclu
     const employee = str_(row[idxEmployee]);
     const client = str_(row[idxClient]);
     const status = str_(row[idxStatus]);
-    const startDate = toDate_(row[idxStart]);
+    const startDayKey = parseLocalDayKey_(row[idxStart]) || parseLocalDayKey_(row[headers.indexOf('Дата')]);
+    const branch = str_(row[idxBranch]);
     const cabinetType = detectCabinetType_(idxCabinet >= 0 ? row[idxCabinet] : '');
     const isCabinetRequest = Boolean(cabinetType);
+    let decision = 'included';
+    let reason = '';
 
     if (!isCabinetRequest) {
-      if (!employee || (excludedEmployees && excludedEmployees.has(employee)) || hasStandaloneTestWord_(employee) || hasStandaloneTestWord_(client)) return false;
-      if (allowedEmployees && !allowedEmployees.has(employee)) {
+      if (!employee || (excludedEmployees && excludedEmployees.has(employee))) {
+        decision = 'excluded';
+        reason = 'excluded_employee';
+      } else if (hasStandaloneTestWord_(employee) || hasStandaloneTestWord_(client)) {
+        decision = 'excluded';
+        reason = 'test_name';
+      } else if (allowedEmployees && !allowedEmployees.has(employee)) {
+        decision = 'excluded';
+        reason = 'employee_not_allowed';
         if (unassignedSet) unassignedSet.add(employee);
-        return false;
       }
-    } else {
-      if (employee && ((excludedEmployees && excludedEmployees.has(employee)) || hasStandaloneTestWord_(employee))) return false;
-      if (hasStandaloneTestWord_(client)) return false;
+    } else if (employee && ((excludedEmployees && excludedEmployees.has(employee)))) {
+      decision = 'excluded';
+      reason = 'excluded_employee';
+    } else if ((employee && hasStandaloneTestWord_(employee)) || hasStandaloneTestWord_(client)) {
+      decision = 'excluded';
+      reason = 'test_name';
     }
-    if (!isAllowedProcessedRequestStatus(status)) return false;
-    if (isPlannedStatus(status) && startDate && currentDay && startDate < currentDay) return false;
-    if (!isDateInRangeInclusive_(startDate, rangeStart, rangeEnd)) return false;
+
+    if (decision === 'included' && !isAllowedProcessedRequestStatus(status)) {
+      decision = 'excluded';
+      reason = 'status_not_allowed';
+    }
+    if (decision === 'included' && isPlannedStatus(status) && startDayKey && currentDayKey && startDayKey < currentDayKey) {
+      decision = 'excluded';
+      reason = 'planned_before_current_day';
+    }
+    if (decision === 'included' && !isDayKeyInRangeInclusive_(startDayKey, rangeStartKey, rangeEndKey)) {
+      decision = 'excluded';
+      reason = 'out_of_range';
+    }
+
+    if (employee === FL2_DEBUG_TRACE_DOCTOR && branch === FL2_DEBUG_TRACE_BRANCH) {
+      fl2DebugTrace_('DEBUG buildProcessedRequestsSheet row', {
+        branch,
+        doctor: employee,
+        id: str_(row[headers.indexOf('Номер заявки')] || row[headers.indexOf('Номер')] || ''),
+        status,
+        date: startDayKey || '',
+        startTime: str_(row[idxStart]),
+        endTime: str_(row[idxEnd]),
+        nomenclature: str_(row[headers.indexOf('Номенклатура')]),
+        decision,
+        reason: reason || undefined,
+      });
+    }
+
+    if (decision !== 'included') return false;
     return true;
   });
 
@@ -415,21 +492,41 @@ function buildProcessedRequestsSheet_(ss, requestsSheet, allowedEmployees, exclu
     const ba = str_(a[idxBranch]);
     const bb = str_(b[idxBranch]);
     if (ba !== bb) return ba.localeCompare(bb, 'ru');
-    const da = toDate_(a[idxStart]);
-    const db = toDate_(b[idxStart]);
-    return (da ? da.getTime() : 0) - (db ? db.getTime() : 0);
+    const da = parseLocalDayKey_(a[idxStart]) || '';
+    const db = parseLocalDayKey_(b[idxStart]) || '';
+    if (da !== db) return da.localeCompare(db);
+    const ta = parseTimeToMinutes_(a[headers.indexOf('Время начала')]);
+    const tb = parseTimeToMinutes_(b[headers.indexOf('Время начала')]);
+    return (ta === null ? 0 : ta) - (tb === null ? 0 : tb);
   });
 
+  const idxCreatedAtOut = outHeaders.indexOf('Дата создания');
+  const idxDateOut = outHeaders.indexOf('Дата');
+  const idxStartTimeOut = outHeaders.indexOf('Время начала');
+  const idxEndTimeOut = outHeaders.indexOf('Время окончания');
+  const idxCurrentDayMetaOut = outHeaders.indexOf(FL2_PROCESSED_REQUESTS_CURRENT_DAY_HEADER);
+
   const outRows = rows.map((row) => {
-    const startDate = toDate_(row[idxStart]);
-    const endDate = toDate_(row[idxEnd]);
-    const timing = computeRequestTiming_(startDate, endDate);
-    const item = row.slice();
-    item[outHeaders.indexOf('НачалоМин')] = timing.startMin;
-    item[outHeaders.indexOf('ОкончаниеМин')] = timing.endMin;
-    item[outHeaders.indexOf('ДлительностьМин')] = timing.durationMin;
+    const sourceRowIdx = values.indexOf(row);
+    const displayRow = sourceRowIdx >= 0 ? displayValues[sourceRowIdx] : [];
+    const parts = splitRequestDateTimeParts_(displayRow[idxStart], displayRow[idxEnd], row[idxStart], row[idxEnd]);
+    const item = new Array(outHeaders.length).fill('');
+    sourceColumns.forEach((col) => {
+      const outIdx = outHeaders.indexOf(col.outHeader);
+      if (outIdx >= 0) item[outIdx] = row[col.idx];
+    });
+    if (idxCreatedAtOut >= 0) item[idxCreatedAtOut] = idxCreatedAt >= 0 ? row[idxCreatedAt] : '';
+    if (idxDateOut >= 0) item[idxDateOut] = parts.date || '';
+    if (idxStartTimeOut >= 0) item[idxStartTimeOut] = parts.startTime || '';
+    if (idxEndTimeOut >= 0) item[idxEndTimeOut] = parts.endTime || '';
     return item;
   });
+
+  const markerRow = new Array(outHeaders.length).fill('');
+  if (idxCurrentDayMetaOut >= 0) markerRow[idxCurrentDayMetaOut] = dayKeyToDateText_(currentDayKey);
+  fl2Log_('INFO', 'CurrentDate marker row prepared', `currentDay=${currentDayKey}, targetSheet=${SHEET_PROCESSED_REQUESTS}`);
+
+  outRows.push(markerRow);
 
   const target = getOrCreateSheet_(ss, SHEET_PROCESSED_REQUESTS);
   target.clearContents();
@@ -437,6 +534,7 @@ function buildProcessedRequestsSheet_(ss, requestsSheet, allowedEmployees, exclu
   if (outRows.length) {
     target.getRange(2, 1, outRows.length, outHeaders.length).setValues(outRows);
   }
+  applyProcessedRequestsIntervalColumnFormat_(target, outHeaders);
 }
 
 
@@ -667,13 +765,13 @@ function formatReportPeriodLabel_(startDate, endDate) {
   return `${formatDateDDMMYYYY_(start)} (${getWeekdayNameRu_(start)}) - ${formatDateDDMMYYYY_(end)} (${getWeekdayNameRu_(end)})`;
 }
 
-function computeReportPeriodFromReferenceMoment_(referenceMoment) {
+function computeReportPeriodFromReferenceMoment_(referenceMoment, baseDayDate) {
   const timestamp = toDate_(referenceMoment);
   if (!timestamp) return null;
-  const referenceDate = normalizeDateToTimezoneStart_(timestamp);
+  const referenceDate = normalizeDateToTimezoneStart_(baseDayDate || timestamp);
   if (!referenceDate) return null;
   const referenceHour = Number(Utilities.formatDate(timestamp, FL2_TIMEZONE, 'H'));
-  const startDate = referenceHour >= REPORT_PERIOD_ROLLOVER_HOUR ? addDays(referenceDate, 1) : referenceDate;
+  const startDate = addDays(referenceDate, 1);
   const endDate = addDays(startDate, 6);
   return {
     referenceMoment: timestamp,
@@ -876,6 +974,52 @@ function dateKey_(date) {
   return Utilities.formatDate(date, FL2_TIMEZONE, 'yyyy-MM-dd');
 }
 
+function parseLocalDayKey_(value) {
+  if (value === '' || value === null || value === undefined) return '';
+  const text = str_(value);
+  if (text) {
+    const ruMatch = text.match(/(\d{1,2})\.(\d{1,2})\.(\d{4})/);
+    if (ruMatch) {
+      const day = Number(ruMatch[1]);
+      const month = Number(ruMatch[2]);
+      const year = Number(ruMatch[3]);
+      if (day >= 1 && day <= 31 && month >= 1 && month <= 12) {
+        return `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+      }
+    }
+    const isoMatch = text.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (isoMatch) return `${isoMatch[1]}-${isoMatch[2]}-${isoMatch[3]}`;
+  }
+  const parsed = toDate_(value);
+  if (!parsed) return '';
+  return Utilities.formatDate(parsed, FL2_TIMEZONE, 'yyyy-MM-dd');
+}
+
+function dayKeyToDate_(dayKey) {
+  const m = str_(dayKey).match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return null;
+  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+}
+
+function dayKeyToDateText_(dayKey) {
+  const d = dayKeyToDate_(dayKey);
+  return d ? formatDateDDMMYYYY_(d) : '';
+}
+
+function addDaysToDayKey_(dayKey, days) {
+  const d = dayKeyToDate_(dayKey);
+  if (!d) return '';
+  return dateKey_(addDays(d, days));
+}
+
+function isDayKeyInRangeInclusive_(dayKey, startKey, endKey) {
+  const d = str_(dayKey);
+  const s = str_(startKey);
+  const e = str_(endKey);
+  if (!d || !s || !e) return false;
+  return d >= s && d <= e;
+}
+
 function monthKey_(date) {
   if (!date) return '';
   return Utilities.formatDate(date, FL2_TIMEZONE, 'yyyy-MM');
@@ -906,11 +1050,47 @@ var FL2_PROP_FORWARD_BATCH_LOCK_OWNER = 'FL2_PROP_FORWARD_BATCH_LOCK_OWNER';
 var FL2_BATCH_MAX_RUN_MS = 120000;
 var FL2_BATCH_MAX_BRANCHES_PER_RUN = 1;
 var FL2_ENABLE_LOG = false;
+var FL2_ENABLE_TRIGGER_LOG = true;
+var FL2_DEBUG_TRACE_ENABLED = true;
+var FL2_DEBUG_TRACE_BRANCH = 'Темед Пионерская';
+var FL2_DEBUG_TRACE_DOCTOR = 'Алибеков Эйлер Ровшанович';
 var FL2_PLAN_ARCHIVE_SPREADSHEET_ID = '1w9PLSlkxbJX6kigWtxYZElTyCLTM1ceDriA29yeFBgc';
 var FL2_TIMEZONE = 'Europe/Moscow';
+var FL2_ARCHIVE_CATEGORY_SHEET_MAP = {
+  doctor: 'Архив Врачи',
+  massage: 'Архив Массажисты',
+  ft: 'Архив ФТ',
+  physio: 'Архив Физиотерапия',
+};
+var FL2_ARCHIVE_BASELINE_CACHE = null;
 
 function fl2Log_(level, message, details) {
   if (!FL2_ENABLE_LOG) return;
+  fl2AppendLogRow_(level, message, details);
+}
+
+function fl2DebugTrace_(stage, payload) {
+  if (!FL2_DEBUG_TRACE_ENABLED) return;
+  const data = payload || {};
+  const branch = str_(data.branch || data.selectedBranch || data['Филиал']);
+  const doctor = str_(data.doctor || data.employee || data['Сотрудник']);
+  if (branch !== FL2_DEBUG_TRACE_BRANCH || doctor !== FL2_DEBUG_TRACE_DOCTOR) return;
+  const jsonDetails = fl2DebugStringify_(data);
+  fl2AppendLogRow_('DEBUG', str_(stage), jsonDetails);
+}
+
+function fl2DebugStringify_(payload) {
+  try {
+    return JSON.stringify(payload, (key, value) => {
+      if (value instanceof Date) return formatDateTimeDDMMYYYY_(value);
+      return value;
+    });
+  } catch (e) {
+    return JSON.stringify({ error: 'debug_payload_not_serializable', message: str_(e && e.message ? e.message : e) });
+  }
+}
+
+function fl2AppendLogRow_(level, message, details) {
   try {
     const ss = SpreadsheetApp.getActive();
     const sheet = getOrCreateSheet_(ss, SHEET_REPORT_LOG);
@@ -924,6 +1104,11 @@ function fl2Log_(level, message, details) {
   } catch (e) {
     // намеренно игнорируем ошибки логирования, чтобы не ломать основной сценарий
   }
+}
+
+function fl2TriggerLog_(level, message, details) {
+  if (!FL2_ENABLE_TRIGGER_LOG) return;
+  fl2AppendLogRow_(level || 'INFO', `[TRIGGER] ${message || ''}`, details || '');
 }
 
 function fl2StateSummary_(state) {
@@ -986,10 +1171,69 @@ function buildForwardLoadReportAllBranches() {
   runForwardLoadReportAllBranchesCore_({ sendEmails, currentDay: prep.currentDay });
 }
 
+function runForwardLoadReportsDirect_(options) {
+  const opts = options || {};
+  const ss = SpreadsheetApp.getActive();
+  const sendEmails = opts.sendEmails === true;
+  const includeBaseline = opts.includeBaseline !== false;
+
+  const doctorScheduleSheet = ss.getSheetByName(SHEET_DOCTOR_SCHEDULE);
+  const processedRequestsSheet = ss.getSheetByName(SHEET_PROCESSED_REQUESTS);
+  if (!doctorScheduleSheet || !processedRequestsSheet) {
+    throw new Error('Проверьте наличие листов: Обработанный график, Обработанные заявки');
+  }
+  ensureDoctorScheduleFresh(ss);
+
+  const prep = prepareForwardLoadInput_(ss, { persistUnassigned: false });
+  const currentDay = opts.currentDay || prep.currentDay;
+  const branches = prep.branches || [];
+  const errors = [];
+
+  const sharedExcluded = prep.excludedEmployees;
+  const sharedRegistry = { allowed: prep.allowedEmployees, unassignedFound: prep.unassignedEmployees };
+  const sharedDoctorsSet = prep.doctorsSet;
+  const sharedMassageSet = prep.massageSet;
+  const sharedFtSet = prep.ftSet;
+
+  branches.forEach((branchName) => {
+    const branch = str_(branchName);
+    try {
+      const branchPrep = prepareForwardLoadInput_(ss, {
+        selectedBranch: branch,
+        currentDay,
+        persistUnassigned: false,
+        excludedEmployees: sharedExcluded,
+        employeeRegistry: sharedRegistry,
+        doctorsSet: sharedDoctorsSet,
+        massageSet: sharedMassageSet,
+        ftSet: sharedFtSet,
+      });
+      buildForwardLoadReportForBranch_(ss, branch, branchPrep, {
+        includeBaseline,
+      });
+      if (sendEmails) {
+        sendForwardReportEmail(ss, branch, currentDay);
+      }
+    } catch (e) {
+      const err = `${branch || '(пусто)'}: ${e && e.message ? e.message : String(e)}`;
+      errors.push(err);
+    }
+  });
+
+  if (errors.length) {
+    throw new Error(`Построение планов по клиникам завершено с ошибками: ${errors.slice(0, 3).join(' | ')}`);
+  }
+  return {
+    branchCount: branches.length,
+  };
+}
+
 function runForwardLoadReportAllBranchesCore_(options) {
   const opts = options || {};
   const ss = SpreadsheetApp.getActive();
   const sendEmails = opts.sendEmails !== false;
+  const includeBaseline = opts.includeBaseline !== false;
+  const refreshDiscountsAfter = opts.refreshDiscountsAfter === true;
   const props = PropertiesService.getScriptProperties();
   const existing = props.getProperty(FL2_PROP_FORWARD_BATCH_STATE);
   if (existing) {
@@ -1008,19 +1252,8 @@ function runForwardLoadReportAllBranchesCore_(options) {
   }
   ensureDoctorScheduleFresh(ss);
 
-  const builtAt = detectDoctorScheduleBuiltAtFallback(doctorScheduleSheet);
-  const graphSheet = ss.getSheetByName(SHEET_SCHEDULE_SOURCE);
-  const sourceMaxGraphCreated = graphSheet ? getSourceGraphMaxCreatedAt_(graphSheet) : new Date(0);
-  if (!builtAt) {
-    throw new Error('Сначала сформируйте лист "Обработанный график" (в последней строке нет системного timestamp)');
-  }
-  if (sourceMaxGraphCreated > builtAt) {
-    throw new Error(`"Обработанный график" неактуален по timestamp (последняя сборка: ${formatDateTimeDDMMYYYY_(builtAt)}). Обновите его перед запуском.`);
-  }
-  fl2Log_('INFO', 'Пакетный план: проверка актуальности графика', `scheduleTimestamp=${formatDateTimeDDMMYYYY_(builtAt)}, sourceMaxCreated=${formatDateTimeDDMMYYYY_(sourceMaxGraphCreated)}`);
-
   const prep = prepareForwardLoadInput_(ss, { persistUnassigned: false });
-  const currentDay = opts.currentDay ? new Date(Number(opts.currentDay)) : prep.currentDay;
+  const currentDay = opts.currentDay || prep.currentDay;
   const runId = `${Date.now()}`;
   const branches = prep.branches || [];
   const errors = [];
@@ -1052,7 +1285,9 @@ function runForwardLoadReportAllBranchesCore_(options) {
         massageSet: sharedMassageSet,
         ftSet: sharedFtSet,
       });
-      buildForwardLoadReportForBranch_(ss, branch, branchPrep);
+      buildForwardLoadReportForBranch_(ss, branch, branchPrep, {
+        includeBaseline,
+      });
 
       if (sendEmails) {
         sendForwardReportEmail(ss, branch, currentDay);
@@ -1070,7 +1305,9 @@ function runForwardLoadReportAllBranchesCore_(options) {
     ? `Пакетный план завершён с ошибками: ${errors.slice(0, 3).join(' | ')}`
     : 'Пакетный план по клиникам завершён';
 
-  refreshDiscountsAfterPlanUpdate_();
+  if (refreshDiscountsAfter) {
+    refreshDiscountsAfterPlanUpdate_();
+  }
   SpreadsheetApp.getActive().toast(doneMsg, MENU_NAME, 8);
 }
 
@@ -1263,13 +1500,13 @@ function scheduleNextForwardLoadBatchStep_(stepFinishedAtMs) {
 
 function finishForwardLoadBatch_(state) {
   const ss = SpreadsheetApp.getActive();
-  const currentDay = state && state.currentDay ? new Date(Number(state.currentDay)) : new Date();
+  const currentDay = str_(state && state.currentDay) || dateKey_(new Date());
   const props = PropertiesService.getScriptProperties();
 
   props.setProperty(FL2_PROP_FORWARD_BATCH_PENDING_EMAIL, JSON.stringify({
     runId: str_(state && state.runId),
     branches: Array.isArray(state && state.branches) ? state.branches : [],
-    currentDay: currentDay.getTime(),
+    currentDay,
     errors: Array.isArray(state && state.errors) ? state.errors : [],
   }));
 
@@ -1301,7 +1538,7 @@ function confirmAndSendForwardBatchEmails() {
 
   const payload = JSON.parse(raw);
   const branches = Array.isArray(payload.branches) ? payload.branches : [];
-  const currentDay = payload.currentDay ? new Date(Number(payload.currentDay)) : new Date();
+  const currentDay = str_(payload.currentDay) || dateKey_(new Date());
   const errors = Array.isArray(payload.errors) ? payload.errors.slice() : [];
   const ss = SpreadsheetApp.getActive();
 
@@ -1314,14 +1551,6 @@ function confirmAndSendForwardBatchEmails() {
       fl2Log_('ERROR', 'Пакетный план: ошибка отправки письма', `${branch || '(пусто)'}: ${e && e.message ? e.message : String(e)}`);
     }
   });
-
-  try {
-    sendDiscountsEmails({ silent: true });
-    fl2Log_('INFO', 'Пакетный план: отправлены письма по скидкам', 'Рассылка по группам из листа "Отправка"');
-  } catch (e) {
-    errors.push(`Рассылка скидок: ${e && e.message ? e.message : String(e)}`);
-    fl2Log_('ERROR', 'Пакетный план: ошибка рассылки скидок', e && e.message ? e.message : String(e));
-  }
 
   props.deleteProperty(FL2_PROP_FORWARD_BATCH_PENDING_EMAIL);
   const doneMsg = errors.length
@@ -1355,6 +1584,44 @@ function tryGetUi_() {
   }
 }
 
+function detectProcessedRequestsMeta_(sheet) {
+  if (!sheet) return null;
+
+  const lastRow = sheet.getLastRow();
+  const lastCol = sheet.getLastColumn();
+  if (lastRow < 2 || lastCol < 1) return null;
+
+  const headers = sheet.getRange(1, 1, 1, lastCol).getDisplayValues()[0].map((h) => str_(h));
+  const idxCurrentDay = headers.indexOf(FL2_PROCESSED_REQUESTS_CURRENT_DAY_HEADER);
+  if (idxCurrentDay < 0) return null;
+
+  const lastRowValues = sheet.getRange(lastRow, 1, 1, lastCol).getDisplayValues()[0];
+  const currentDayKey = parseLocalDayKey_(lastRowValues[idxCurrentDay]);
+  if (!currentDayKey) return null;
+
+  return {
+    currentDayKey,
+  };
+}
+
+function ensureProcessedRequestsMeta_(ss) {
+  ensureDoctorScheduleFresh(ss);
+
+  let sheet = ss.getSheetByName(SHEET_PROCESSED_REQUESTS);
+  let meta = detectProcessedRequestsMeta_(sheet);
+  if (meta) return meta;
+
+  buildDoctorSchedule();
+
+  sheet = ss.getSheetByName(SHEET_PROCESSED_REQUESTS);
+  meta = detectProcessedRequestsMeta_(sheet);
+  if (!meta) {
+    throw new Error('Не удалось определить CurrentDate из листа "Обработанные заявки"');
+  }
+
+  return meta;
+}
+
 function prepareForwardLoadInput_(ss, options) {
   const opts = options || {};
   const logCtx = opts.logCtx || null;
@@ -1368,40 +1635,55 @@ function prepareForwardLoadInput_(ss, options) {
 
   const scheduleSheet = ss.getSheetByName(SHEET_DOCTOR_SCHEDULE);
   const requestsSheet = ss.getSheetByName(SHEET_PROCESSED_REQUESTS);
-  if (!scheduleSheet || !requestsSheet) {
-    throw new Error('Проверьте наличие листов: Обработанный график, Обработанные заявки');
+  const sourceRequestsSheet = ss.getSheetByName(SHEET_REQUESTS);
+  if (!scheduleSheet || !requestsSheet || !sourceRequestsSheet) {
+    throw new Error('Проверьте наличие листов: Обработанный график, Обработанные заявки, Заявки');
   }
   ensureDoctorScheduleFresh(ss);
 
   const excludedEmployees = opts.excludedEmployees ? opts.excludedEmployees : getExcludedEmployeesSet_(ss);
   const employeeRegistry = opts.employeeRegistry ? opts.employeeRegistry : getEmployeeRegistry_(ss);
   const selectedBranch = str_(opts.selectedBranch);
-  const scheduleBuiltAt = detectDoctorScheduleBuiltAtFallback(scheduleSheet);
 
-  let currentDay = opts.currentDay ? new Date(Number(opts.currentDay)) : null;
   let requestRowsRawAll = null;
-  let reportPeriod = currentDay ? computeReportPeriodFromReferenceMoment_(currentDay) : null;
-  if (!currentDay || Number.isNaN(currentDay.getTime())) {
-    const detectDayTimer = fl2StageTimer_();
-    requestRowsRawAll = getSheetObjectsDisplay_(requestsSheet);
-    stage('prepare: loaded processed requests for currentDay detect', `rows=${requestRowsRawAll.length}`, detectDayTimer);
-    tick();
-    const latestRequestsAllBranches = buildLatestRequests(requestRowsRawAll, excludedEmployees, employeeRegistry.allowed, employeeRegistry.unassignedFound);
-    currentDay = detectLatestCompletedRequestMoment_(latestRequestsAllBranches);
-    reportPeriod = computeReportPeriodFromReferenceMoment_(currentDay);
-  }
-  if ((!currentDay || Number.isNaN(currentDay.getTime())) && scheduleBuiltAt) {
-    reportPeriod = computeReportPeriodFromScheduleTimestamp_(scheduleBuiltAt);
-    currentDay = reportPeriod && reportPeriod.startDate ? new Date(reportPeriod.startDate.getTime()) : null;
-    stage('prepare: fallback currentDay from schedule timestamp', `startDate=${formatDateDDMMYYYY_(currentDay)}`);
-  }
-  if (!currentDay) throw new Error('Не найдены выполненные заявки для определения текущего дня');
 
-  const anchorDay = reportPeriod && reportPeriod.anchorDate
-    ? new Date(reportPeriod.anchorDate.getTime())
-    : new Date(currentDay.getFullYear(), currentDay.getMonth(), currentDay.getDate() - 1);
-  const rangeStart = addDays(anchorDay, -42);
-  const rangeEnd = reportPeriod && reportPeriod.endDate ? new Date(reportPeriod.endDate.getTime()) : addDays(anchorDay, 7);
+  const processedRequestsMeta = ensureProcessedRequestsMeta_(ss);
+  const storedCurrentDayKey = processedRequestsMeta.currentDayKey;
+
+  let incomingCurrentDayKey = str_(opts.currentDayKey);
+  if (!incomingCurrentDayKey && opts.currentDay) {
+    if (opts.currentDay instanceof Date) {
+      incomingCurrentDayKey = parseLocalDayKey_(opts.currentDay);
+    } else {
+      incomingCurrentDayKey = parseLocalDayKey_(opts.currentDay) || parseLocalDayKey_(new Date(Number(opts.currentDay)));
+    }
+  }
+
+  if (incomingCurrentDayKey && incomingCurrentDayKey !== storedCurrentDayKey) {
+    fl2Log_(
+      'WARN',
+      'Переданный CurrentDate проигнорирован',
+      `incoming=${incomingCurrentDayKey}, stored=${storedCurrentDayKey}`
+    );
+  }
+
+  const currentDayKey = storedCurrentDayKey;
+  const currentDay = dayKeyToDate_(currentDayKey);
+  if (!currentDayKey || !currentDay || Number.isNaN(currentDay.getTime())) {
+    throw new Error('Не найдены выполненные заявки для определения CurrentDate');
+  }
+  const reportPeriod = computeReportPeriodFromReferenceMoment_(new Date(), currentDay);
+
+  const anchorDayKey = reportPeriod && reportPeriod.anchorDate
+    ? parseLocalDayKey_(reportPeriod.anchorDate)
+    : addDaysToDayKey_(currentDayKey, -1);
+  const rangeStartKey = addDaysToDayKey_(anchorDayKey, -42);
+  const rangeEndKey = reportPeriod && reportPeriod.endDate
+    ? parseLocalDayKey_(reportPeriod.endDate)
+    : addDaysToDayKey_(anchorDayKey, 7);
+  const anchorDay = dayKeyToDate_(anchorDayKey);
+  const rangeStart = dayKeyToDate_(rangeStartKey);
+  const rangeEnd = dayKeyToDate_(rangeEndKey);
 
   const readScheduleTimer = fl2StageTimer_();
   const scheduleSourceRows = selectedBranch
@@ -1414,7 +1696,7 @@ function prepareForwardLoadInput_(ss, options) {
   const filterScheduleTimer = fl2StageTimer_();
   const scheduleRows = scheduleSourceRows
     .filter((r) => {
-      const d = toDate_(r['Дата']);
+      const dKey = parseLocalDayKey_(r['Дата']);
       const emp = str_(r['Сотрудник']);
       const branch = str_(r['Филиал']);
       const cabinetType = detectCabinetType_(r['Кабинет']);
@@ -1426,7 +1708,7 @@ function prepareForwardLoadInput_(ss, options) {
           return false;
         }
       }
-      return isDateInRangeInclusive_(d, rangeStart, rangeEnd);
+      return isDayKeyInRangeInclusive_(dKey, rangeStartKey, rangeEndKey);
     })
     .sort((a, b) => {
       const ba = str_(a['Филиал']);
@@ -1438,6 +1720,35 @@ function prepareForwardLoadInput_(ss, options) {
     });
   stage('prepare: filtered schedule rows', `rows=${scheduleRows.length}`, filterScheduleTimer);
   tick();
+  fl2DebugTrace_('DEBUG prepareForwardLoadInput overview', {
+    branch: selectedBranch || FL2_DEBUG_TRACE_BRANCH,
+    doctor: FL2_DEBUG_TRACE_DOCTOR,
+    selectedBranch,
+    currentDay: currentDayKey,
+    currentDayKey,
+    anchorDay,
+    anchorDayKey,
+    rangeStart,
+    rangeEnd,
+    rangeStartKey,
+    rangeEndKey,
+    scheduleRowsCount: scheduleRows.length,
+  });
+  scheduleRows.forEach((row, idx) => {
+    const doctor = str_(row['Сотрудник']);
+    const branch = str_(row['Филиал']);
+    if (doctor !== FL2_DEBUG_TRACE_DOCTOR || branch !== FL2_DEBUG_TRACE_BRANCH) return;
+    fl2DebugTrace_('DEBUG prepareForwardLoadInput doctor schedule row', {
+      branch,
+      doctor,
+      index: idx,
+      date: str_(row['Дата']),
+      startTime: str_(row['Время начала']),
+      endTime: str_(row['Время окончания']),
+      timeKind: str_(row['Вид времени']),
+      timeType: str_(row['Тип времени']),
+    });
+  });
 
   const readRequestsTimer = fl2StageTimer_();
   const requestSourceRows = selectedBranch
@@ -1449,14 +1760,45 @@ function prepareForwardLoadInput_(ss, options) {
 
   const filterRequestsTimer = fl2StageTimer_();
   const requestRowsRaw = requestSourceRows.filter((r) => {
-    const d = toDate_(r['ДатаНачала']);
+    const dKey = parseLocalDayKey_(r['Дата']) || parseLocalDayKey_(r['ДатаНачала']);
     const branch = str_(r['Филиал']);
     if (selectedBranch && branch !== selectedBranch) return false;
-    return isDateInRangeInclusive_(d, rangeStart, rangeEnd);
+    return isDayKeyInRangeInclusive_(dKey, rangeStartKey, rangeEndKey);
   });
 
   stage('prepare: filtered request rows', `rows=${requestRowsRaw.length}`, filterRequestsTimer);
   tick();
+  fl2DebugTrace_('DEBUG prepareForwardLoadInput request overview', {
+    branch: selectedBranch || FL2_DEBUG_TRACE_BRANCH,
+    doctor: FL2_DEBUG_TRACE_DOCTOR,
+    selectedBranch,
+    currentDay: currentDayKey,
+    currentDayKey,
+    anchorDay,
+    anchorDayKey,
+    rangeStart,
+    rangeEnd,
+    rangeStartKey,
+    rangeEndKey,
+    scheduleRowsCount: scheduleRows.length,
+    requestRowsRawCount: requestRowsRaw.length,
+  });
+  requestRowsRaw.forEach((row, idx) => {
+    const doctor = str_(row['Сотрудник']);
+    const branch = str_(row['Филиал']);
+    if (doctor !== FL2_DEBUG_TRACE_DOCTOR || branch !== FL2_DEBUG_TRACE_BRANCH) return;
+    fl2DebugTrace_('DEBUG prepareForwardLoadInput doctor request row', {
+      branch,
+      doctor,
+      index: idx,
+      id: str_(row['Номер заявки'] || row['Номер'] || row['ID']),
+      status: str_(row['Состояние']),
+      date: str_(row['Дата'] || row['ДатаНачала']),
+      startTime: str_(row['Время начала'] || row['ДатаНачала']),
+      endTime: str_(row['Время окончания'] || row['ДатаОкончания']),
+      nomenclature: str_(row['Номенклатура']),
+    });
+  });
 
   const branchesTimer = fl2StageTimer_();
   const branchesAll = getBranchesFromEmployeesSheet_(ss);
@@ -1473,10 +1815,14 @@ function prepareForwardLoadInput_(ss, options) {
     requestRowsRaw,
     branches,
     excludedEmployees,
-    currentDay,
+    currentDay: currentDayKey,
+    currentDayKey,
     anchorDay,
+    anchorDayKey,
     rangeStart,
     rangeEnd,
+    rangeStartKey,
+    rangeEndKey,
     reportPeriod,
     allowedEmployees: employeeRegistry.allowed,
     unassignedEmployees: employeeRegistry.unassignedFound,
@@ -1488,9 +1834,11 @@ function prepareForwardLoadInput_(ss, options) {
   };
 }
 
-function buildForwardLoadReportForBranch_(ss, selectedBranch, prep) {
+function buildForwardLoadReportForBranch_(ss, selectedBranch, prep, options) {
   const branchName = str_(selectedBranch);
   if (!branchName) throw new Error('Филиал не задан для пакетного расчета');
+  const opts = options || {};
+  const includeBaseline = opts.includeBaseline !== false;
 
   const logCtx = prep && prep.logCtx ? prep.logCtx : null;
   const hb = prep && typeof prep.onHeartbeat === 'function' ? prep.onHeartbeat : null;
@@ -1501,7 +1849,8 @@ function buildForwardLoadReportForBranch_(ss, selectedBranch, prep) {
   };
   const tick = () => { if (hb) hb(); };
 
-  const anchorDay = prep.anchorDay ? new Date(prep.anchorDay.getTime()) : new Date(prep.currentDay.getFullYear(), prep.currentDay.getMonth(), prep.currentDay.getDate() - 1);
+  const anchorDay = prep.anchorDay ? new Date(prep.anchorDay.getTime()) : addDays(dayKeyToDate_(prep.currentDayKey || prep.currentDay), -1);
+  const anchorDayKey = prep.anchorDayKey || parseLocalDayKey_(anchorDay);
 
   const filterTimer = fl2StageTimer_();
   const filteredScheduleRows = prep.scheduleRows.filter((r) => str_(r['Филиал']) === branchName);
@@ -1512,7 +1861,6 @@ function buildForwardLoadReportForBranch_(ss, selectedBranch, prep) {
   const scheduleIndexTimer = fl2StageTimer_();
   const scheduleByDoctorDay = buildReceptionScheduleIndex(filteredScheduleRows, prep.excludedEmployees, prep.allowedEmployees);
   stage('branch: buildReceptionScheduleIndex done', `keys=${scheduleByDoctorDay.size}`, scheduleIndexTimer);
-  logDoctorForwardDebug_(ss, branchName, 'Долинский Павел Максимович', anchorDay, scheduleByDoctorDay);
   tick();
 
   const doctorsSet = prep.doctorsSet || getDoctorsSetFromEmployeesSheet_(ss);
@@ -1528,49 +1876,101 @@ function buildForwardLoadReportForBranch_(ss, selectedBranch, prep) {
   tick();
 
   const latestReqTimer = fl2StageTimer_();
-  const latestRequests = buildLatestRequests(filteredRequestRows, prep.excludedEmployees, prep.allowedEmployees, prep.unassignedEmployees, prep.rangeStart, prep.rangeEnd);
+  const latestRequests = buildLatestRequests(filteredRequestRows, prep.excludedEmployees, prep.allowedEmployees, prep.unassignedEmployees, prep.rangeStartKey, prep.rangeEndKey);
   stage('branch: buildLatestRequests done', `rows=${latestRequests.length}`, latestReqTimer);
   tick();
 
+  const currentPlanDebug = buildCurrentPlanDebugStats_(latestRequests, scheduleByDoctorDay, doctorScheduleByDoctorDay);
+  fl2Log_(
+    'INFO',
+    'Диагностика текущего плана по филиалу',
+    [
+      `Филиал=${branchName}`,
+      `filteredScheduleRows=${filteredScheduleRows.length}`,
+      `filteredRequestRows=${filteredRequestRows.length}`,
+      `latestRequests=${latestRequests.length}`,
+      `scheduleByDoctorDay.keys=${scheduleByDoctorDay.size}`,
+      `doctorScheduleByDoctorDay.keys=${doctorScheduleByDoctorDay.size}`,
+      `matchedRequestScheduleKeys=${currentPlanDebug.matchedRequestScheduleKeys}`,
+    ].join(', ')
+  );
+
+  const currentDailyDoctorTimer = fl2StageTimer_();
+  const currentDailyDoctorBuckets = computeWindowDailyBuckets_(anchorDayKey, 7, doctorScheduleByDoctorDay, latestRequests);
+  stage('branch: computeWindowDailyBuckets_(7) done', `days=${currentDailyDoctorBuckets.size}`, currentDailyDoctorTimer);
+  tick();
+
   const h3Timer = fl2StageTimer_();
-  const horizon3 = computeWindowMetrics(anchorDay, 3, doctorScheduleByDoctorDay, latestRequests);
-  stage('branch: computeWindowMetrics(3) done', `byBranch=${horizon3.byBranch.size}, byDoctor=${horizon3.byDoctor.size}`, h3Timer);
+  const horizon3 = aggregateWindowMetricsFromDailyBuckets_(anchorDayKey, 3, currentDailyDoctorBuckets);
+  stage('branch: aggregateWindowMetricsFromDailyBuckets_(3) done', `byBranch=${horizon3.byBranch.size}, byDoctor=${horizon3.byDoctor.size}`, h3Timer);
   tick();
 
   const h7Timer = fl2StageTimer_();
-  const horizon7 = computeWindowMetrics(anchorDay, 7, doctorScheduleByDoctorDay, latestRequests);
-  stage('branch: computeWindowMetrics(7) done', `byBranch=${horizon7.byBranch.size}, byDoctor=${horizon7.byDoctor.size}`, h7Timer);
+  const horizon7 = aggregateWindowMetricsFromDailyBuckets_(anchorDayKey, 7, currentDailyDoctorBuckets);
+  stage('branch: aggregateWindowMetricsFromDailyBuckets_(7) done', `byBranch=${horizon7.byBranch.size}, byDoctor=${horizon7.byDoctor.size}`, h7Timer);
   tick();
 
-  const b3Timer = fl2StageTimer_();
-  const baseline3 = computeBaselineMetrics(anchorDay, 3, doctorScheduleByDoctorDay, latestRequests);
-  stage('branch: computeBaselineMetrics(3) done', `byBranch=${baseline3.byBranch.size}, byDoctor=${baseline3.byDoctor.size}`, b3Timer);
-  tick();
+  let baseline3;
+  let baseline7;
 
-  const b7Timer = fl2StageTimer_();
-  const baseline7 = computeBaselineMetrics(anchorDay, 7, doctorScheduleByDoctorDay, latestRequests);
-  stage('branch: computeBaselineMetrics(7) done', `byBranch=${baseline7.byBranch.size}, byDoctor=${baseline7.byDoctor.size}`, b7Timer);
+  const currentDailyAllTimer = fl2StageTimer_();
+  const currentDailyAllBuckets = computeWindowDailyBuckets_(anchorDayKey, 7, scheduleByDoctorDay, latestRequests, { includeAllNomenclature: true });
+  stage('branch: computeWindowDailyBuckets_(7, all nomenclature) done', `days=${currentDailyAllBuckets.size}`, currentDailyAllTimer);
   tick();
 
   const h3AllTimer = fl2StageTimer_();
-  const horizon3All = computeWindowMetrics(anchorDay, 3, scheduleByDoctorDay, latestRequests, { includeAllNomenclature: true });
-  stage('branch: computeWindowMetrics(3, all nomenclature) done', `byBranch=${horizon3All.byBranch.size}, byDoctor=${horizon3All.byDoctor.size}`, h3AllTimer);
+  const horizon3All = aggregateWindowMetricsFromDailyBuckets_(anchorDayKey, 3, currentDailyAllBuckets);
+  stage('branch: aggregateWindowMetricsFromDailyBuckets_(3, all nomenclature) done', `byBranch=${horizon3All.byBranch.size}, byDoctor=${horizon3All.byDoctor.size}`, h3AllTimer);
   tick();
 
   const h7AllTimer = fl2StageTimer_();
-  const horizon7All = computeWindowMetrics(anchorDay, 7, scheduleByDoctorDay, latestRequests, { includeAllNomenclature: true });
-  stage('branch: computeWindowMetrics(7, all nomenclature) done', `byBranch=${horizon7All.byBranch.size}, byDoctor=${horizon7All.byDoctor.size}`, h7AllTimer);
+  const horizon7All = aggregateWindowMetricsFromDailyBuckets_(anchorDayKey, 7, currentDailyAllBuckets);
+  stage('branch: aggregateWindowMetricsFromDailyBuckets_(7, all nomenclature) done', `byBranch=${horizon7All.byBranch.size}, byDoctor=${horizon7All.byDoctor.size}`, h7AllTimer);
   tick();
 
-  const b3AllTimer = fl2StageTimer_();
-  const baseline3All = computeBaselineMetrics(anchorDay, 3, scheduleByDoctorDay, latestRequests, { includeAllNomenclature: true });
-  stage('branch: computeBaselineMetrics(3, all nomenclature) done', `byBranch=${baseline3All.byBranch.size}, byDoctor=${baseline3All.byDoctor.size}`, b3AllTimer);
-  tick();
+  let baseline3All;
+  let baseline7All;
 
-  const b7AllTimer = fl2StageTimer_();
-  const baseline7All = computeBaselineMetrics(anchorDay, 7, scheduleByDoctorDay, latestRequests, { includeAllNomenclature: true });
-  stage('branch: computeBaselineMetrics(7, all nomenclature) done', `byBranch=${baseline7All.byBranch.size}, byDoctor=${baseline7All.byDoctor.size}`, b7AllTimer);
-  tick();
+  if (includeBaseline) {
+    const b3Timer = fl2StageTimer_();
+    baseline3 = computeBaselineMetrics(anchorDay, 3, doctorScheduleByDoctorDay, latestRequests, { category: 'doctor' });
+    stage('branch: computeBaselineMetrics(3) done', `byBranch=${baseline3.byBranch.size}, byDoctor=${baseline3.byDoctor.size}`, b3Timer);
+    tick();
+
+    const b7Timer = fl2StageTimer_();
+    baseline7 = computeBaselineMetrics(anchorDay, 7, doctorScheduleByDoctorDay, latestRequests, { category: 'doctor' });
+    stage('branch: computeBaselineMetrics(7) done', `byBranch=${baseline7.byBranch.size}, byDoctor=${baseline7.byDoctor.size}`, b7Timer);
+    tick();
+
+    const b3AllTimer = fl2StageTimer_();
+    baseline3All = computeBaselineMetrics(anchorDay, 3, scheduleByDoctorDay, latestRequests, {
+      includeAllNomenclature: true,
+      categoryResolver: (employee) => {
+        if (massageSet.has(str_(employee))) return 'massage';
+        if (ftSet.has(str_(employee))) return 'ft';
+        return 'doctor';
+      },
+    });
+    stage('branch: computeBaselineMetrics(3, all nomenclature) done', `byBranch=${baseline3All.byBranch.size}, byDoctor=${baseline3All.byDoctor.size}`, b3AllTimer);
+    tick();
+
+    const b7AllTimer = fl2StageTimer_();
+    baseline7All = computeBaselineMetrics(anchorDay, 7, scheduleByDoctorDay, latestRequests, {
+      includeAllNomenclature: true,
+      categoryResolver: (employee) => {
+        if (massageSet.has(str_(employee))) return 'massage';
+        if (ftSet.has(str_(employee))) return 'ft';
+        return 'doctor';
+      },
+    });
+    stage('branch: computeBaselineMetrics(7, all nomenclature) done', `byBranch=${baseline7All.byBranch.size}, byDoctor=${baseline7All.byDoctor.size}`, b7AllTimer);
+    tick();
+  } else {
+    baseline3 = { byBranch: new Map(), byDoctor: new Map() };
+    baseline7 = { byBranch: new Map(), byDoctor: new Map() };
+    baseline3All = { byBranch: new Map(), byDoctor: new Map() };
+    baseline7All = { byBranch: new Map(), byDoctor: new Map() };
+  }
 
   const mergeTimer = fl2StageTimer_();
   const rowsBranch = mergeForwardRows(horizon3.byBranch, horizon7.byBranch, baseline3.byBranch, baseline7.byBranch);
@@ -1584,50 +1984,90 @@ function buildForwardLoadReportForBranch_(ss, selectedBranch, prep) {
   stage('branch: filtered doctors rows', `rowsDoctor=${rowsDoctor.length}`, doctorFilterTimer);
   tick();
 
+  rowsDoctorAll.forEach((row) => {
+    if (str_(row.branch) !== FL2_DEBUG_TRACE_BRANCH || str_(row.doctor) !== FL2_DEBUG_TRACE_DOCTOR) return;
+    fl2DebugTrace_('DEBUG buildForwardLoadReportForBranch doctor row all', {
+      branch: row.branch,
+      doctor: row.doctor,
+      c3: row.c3,
+      c7: row.c7,
+      b3: row.b3,
+      b7: row.b7,
+    });
+  });
+  rowsDoctor.forEach((row) => {
+    if (str_(row.branch) !== FL2_DEBUG_TRACE_BRANCH || str_(row.doctor) !== FL2_DEBUG_TRACE_DOCTOR) return;
+    fl2DebugTrace_('DEBUG buildForwardLoadReportForBranch final doctor row', {
+      branch: row.branch,
+      doctor: row.doctor,
+      c3: row.c3,
+      c7: row.c7,
+      b3: row.b3,
+      b7: row.b7,
+    });
+  });
+
+  const occupiedDoctorsCount = rowsDoctor.filter((r) => (numOrZero_(r && r.c3 && r.c3.occupiedMin) > 0) || (numOrZero_(r && r.c7 && r.c7.occupiedMin) > 0)).length;
+  const zeroDoctorsCount = rowsDoctor.filter((r) => numOrZero_(r && r.c3 && r.c3.occupiedMin) === 0 && numOrZero_(r && r.c7 && r.c7.occupiedMin) === 0).length;
+  fl2Log_(
+    'INFO',
+    'Диагностика занятости врачей по филиалу',
+    `Филиал=${branchName}, doctorsOccupiedPositive=${occupiedDoctorsCount}, doctorsOccupiedZeroBoth=${zeroDoctorsCount}`
+  );
+
+  if (currentPlanDebug.participatingRequests > 0 && rowsDoctor.length > 0 && zeroDoctorsCount === rowsDoctor.length) {
+    fl2Log_(
+      'ERROR',
+      'План рассчитан аномально: заявки есть, но занятость по всем врачам = 0',
+      `Филиал=${branchName}, participatingRequests=${currentPlanDebug.participatingRequests}, rowsDoctor=${rowsDoctor.length}`
+    );
+  }
+
   const massageSummary = aggregateForwardCategorySummary_(rowsAllNomenclature, massageSet);
   const ftSummary = aggregateForwardCategorySummary_(rowsAllNomenclature, ftSet);
-  const cabinetSummary = buildCabinetTypeSummary_(anchorDay, filteredScheduleRows, latestRequests);
+  const cabinetSummary = buildCabinetTypeSummary_(anchorDay, filteredScheduleRows, latestRequests, {
+    includeBaseline,
+  });
   const massageRows = rowsAllNomenclature.filter((r) => massageSet.has(str_(r.doctor)));
   const ftRows = rowsAllNomenclature.filter((r) => ftSet.has(str_(r.doctor)));
-  const cabinetRows = buildCabinetRowsByName_(anchorDay, filteredScheduleRows, latestRequests);
+  const cabinetRows = buildCabinetRowsByName_(anchorDay, filteredScheduleRows, latestRequests, {
+    includeBaseline,
+  });
 
   const renderTimer = fl2StageTimer_();
-  renderForwardLoadSheet(ss, anchorDay, prep.reportPeriod, branchName, rowsBranch, rowsDoctor, massageSummary, ftSummary, cabinetSummary, massageRows, ftRows, cabinetRows);
+  renderForwardLoadSheet(ss, anchorDay, prep.reportPeriod, branchName, rowsBranch, rowsDoctor, massageSummary, ftSummary, cabinetSummary, massageRows, ftRows, cabinetRows, {
+    includeBaseline,
+  });
   stage('branch: renderForwardLoadSheet done', `rowsBranch=${rowsBranch.length}, rowsDoctor=${rowsDoctor.length}`, renderTimer);
   tick();
 
   return prep.currentDay;
 }
 
-function logDoctorForwardDebug_(ss, branchName, doctorName, anchorDate, scheduleByDoctorDay) {
-  try {
-    const startDate = addDays(anchorDate, 1);
-    const endDate = addDays(anchorDate, 3);
-    const parts = [];
-    let totalReceptionMin = 0;
+function buildCurrentPlanDebugStats_(latestRequests, scheduleByDoctorDay, doctorScheduleByDoctorDay) {
+  const scheduleKeys = new Set(doctorScheduleByDoctorDay ? doctorScheduleByDoctorDay.keys() : []);
+  let matchedRequestScheduleKeys = 0;
+  let participatingRequests = 0;
+  const uniqueRequestKeys = new Set();
 
-    for (let d = new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate()); d <= endDate; d = addDays(d, 1)) {
-      const key = `${dateKey_(d)}|${branchName}|${doctorName}`;
-      const intervals = scheduleByDoctorDay.get(key) || [];
-      const reception = mergeIntervals_(intervals.filter((i) => i.type === 'Приемные часы'));
-      const receptionMin = sumIntervalsMin(reception);
-      totalReceptionMin += receptionMin;
-      parts.push(`${formatDateDDMMYYYY_(d)}=${round1_(receptionMin / 60)}ч`);
-    }
+  (latestRequests || []).forEach((r) => {
+    if (!r || !r.dayKey) return;
+    if (!isActivePlannedStatus(r.status) || !r.isDoctorVisit) return;
+    participatingRequests += 1;
+    const key = `${str_(r.dayKey)}|${str_(r.branch)}|${str_(r.doctor)}`;
+    if (uniqueRequestKeys.has(key)) return;
+    uniqueRequestKeys.add(key);
+    if (scheduleKeys.has(key)) matchedRequestScheduleKeys += 1;
+  });
 
-    const details = `Окно3д(${formatDateDDMMYYYY_(startDate)}..${formatDateDDMMYYYY_(endDate)}), ${doctorName}, ${parts.join('; ')}, Итого=${round1_(totalReceptionMin / 60)}ч`;
-    const sheet = getOrCreateSheet_(ss, SHEET_REPORT_LOG);
-    const header = ['Время', 'Уровень', 'Сообщение', 'Детали'];
-    const needHeader = sheet.getLastRow() < 1 || str_(sheet.getRange(1, 1).getDisplayValue()) !== 'Время';
-    if (needHeader) {
-      sheet.clearContents();
-      sheet.getRange(1, 1, 1, header.length).setValues([header]);
-    }
-    sheet.appendRow([new Date(), 'DEBUG', 'Forward debug doctor', details]);
-  } catch (e) {
-    // не ломаем основной расчет из-за диагностического лога
-  }
+  return {
+    matchedRequestScheduleKeys,
+    participatingRequests,
+    scheduleKeys: scheduleByDoctorDay ? scheduleByDoctorDay.size : 0,
+    doctorScheduleKeys: doctorScheduleByDoctorDay ? doctorScheduleByDoctorDay.size : 0,
+  };
 }
+
 function clearForwardLoadBatchTriggers_() {
   ScriptApp.getProjectTriggers()
     .filter((t) => t.getHandlerFunction && t.getHandlerFunction() === FL2_FORWARD_BATCH_HANDLER)
@@ -1815,40 +2255,36 @@ function collectBranches(scheduleRows, requestRows) {
   });
   return [...set].sort((a, b) => a.localeCompare(b, 'ru'));
 }
-function detectCurrentDayFromRawRequests_(rows, allowedEmployees, excludedEmployees, unassignedSet) {
-  let maxDate = null;
-  rows.forEach((row) => {
-    if (!isCompletedStatus(str_(row['Состояние']))) return;
-    const doctor = str_(row['Сотрудник']);
-    if (!doctor || (excludedEmployees && excludedEmployees.has(doctor)) || hasStandaloneTestWord_(doctor)) return;
-    if (allowedEmployees && !allowedEmployees.has(doctor)) {
-      if (unassignedSet) unassignedSet.add(doctor);
-      return;
+function detectCurrentDayFromSourceRequestsRows_(rows) {
+  let maxDayKey = '';
+  let maxRow = null;
+  const list = Array.isArray(rows) ? rows : [];
+  list.forEach((row) => {
+    const status = str_(row['Состояние']);
+    if (!isCompletedStatus(status)) return;
+    const dKey = parseLocalDayKey_(row['ДатаНачала']);
+    if (!dKey) return;
+    if (!maxDayKey || dKey > maxDayKey) {
+      maxDayKey = dKey;
+      maxRow = row;
     }
-    const d = toDate_(row['ДатаНачала']);
-    if (!d) return;
-    if (!maxDate || d > maxDate) maxDate = d;
   });
-  if (!maxDate) return null;
-  return new Date(maxDate.getFullYear(), maxDate.getMonth(), maxDate.getDate());
-}
-
-function detectLatestCompletedRequestMoment_(requests) {
-  const completed = requests.filter((r) => isCompletedStatus(r.status) && r.startDate);
-  if (!completed.length) return null;
-  completed.sort((a, b) => a.startDate - b.startDate);
-  return new Date(completed[completed.length - 1].startDate.getTime());
-}
-
-function detectCurrentDay(requests) {
-  const latestMoment = detectLatestCompletedRequestMoment_(requests);
-  if (!latestMoment) return null;
-  return new Date(latestMoment.getFullYear(), latestMoment.getMonth(), latestMoment.getDate());
+  if (maxDayKey && maxRow) {
+    fl2Log_(
+      'INFO',
+      'CurrentDate detect: max completed source request',
+      `currentDay=${maxDayKey}, status=${str_(maxRow['Состояние'])}, request=${str_(maxRow['Номер заявки'] || maxRow['Номер'])}, start=${formatDateTimeDDMMYYYY_(maxRow['ДатаНачала'])}, employee=${str_(maxRow['Сотрудник'])}, branch=${str_(maxRow['Филиал'])}`
+    );
+  } else {
+    fl2Log_('WARN', 'CurrentDate detect: no completed source requests found', `rows=${list.length}`);
+  }
+  return maxDayKey || null;
 }
 function buildReceptionScheduleIndex(scheduleRows, excludedEmployees, allowedEmployees) {
   const map = new Map();
+  const rawByKey = new Map();
   scheduleRows.forEach((row) => {
-    const date = toDate_(row['Дата']);
+    const dayKey = parseLocalDayKey_(row['Дата']);
     const doctor = str_(row['Сотрудник']);
     if (!doctor || (excludedEmployees && excludedEmployees.has(doctor)) || hasStandaloneTestWord_(doctor)) return;
     if (allowedEmployees && !allowedEmployees.has(doctor)) return;
@@ -1856,43 +2292,113 @@ function buildReceptionScheduleIndex(scheduleRows, excludedEmployees, allowedEmp
     const type = str_(row['Тип времени']);
     const start = parseTimeToMinutes_(row['Время начала']);
     const end = parseTimeToMinutes_(row['Время окончания']);
-    if (!date || !doctor || !branch || !type || start === null || end === null || end <= start) return;
-    const key = `${dateKey_(date)}|${branch}|${doctor}`;
+    if (!dayKey || !doctor || !branch || !type || start === null || end === null || end <= start) return;
+    const key = `${dayKey}|${branch}|${doctor}`;
     if (!map.has(key)) map.set(key, []);
-    map.get(key).push({ type, start, end });
+    const interval = { type, start, end };
+    map.get(key).push(interval);
+    if (doctor === FL2_DEBUG_TRACE_DOCTOR && branch === FL2_DEBUG_TRACE_BRANCH) {
+      if (!rawByKey.has(key)) rawByKey.set(key, []);
+      rawByKey.get(key).push(interval);
+    }
   });
-  map.forEach((arr) => arr.sort((a, b) => a.start - b.start));
+  map.forEach((arr, key) => {
+    arr.sort((a, b) => a.start - b.start);
+    const parts = key.split('|');
+    const branch = str_(parts[1]);
+    const doctor = str_(parts[2]);
+    if (doctor !== FL2_DEBUG_TRACE_DOCTOR || branch !== FL2_DEBUG_TRACE_BRANCH) return;
+    const beforeMerge = rawByKey.get(key) || [];
+    const receptionOnly = arr.filter((i) => i.type === 'Приемные часы');
+    const excluded = arr.filter((i) => i.type !== 'Приемные часы');
+    fl2DebugTrace_('DEBUG buildReceptionScheduleIndex doctor day', {
+      branch,
+      doctor,
+      key,
+      rawIntervalsBeforeMerge: beforeMerge,
+      intervalsAfterMerge: arr,
+      receptionIntervals: receptionOnly,
+      nonReceptionIntervals: excluded,
+    });
+  });
   return map;
 }
-function buildLatestRequests(rows, excludedEmployees, allowedEmployees, unassignedSet, rangeStart, rangeEnd) {
+function buildLatestRequests(rows, excludedEmployees, allowedEmployees, unassignedSet, rangeStartKey, rangeEndKey) {
   const latest = new Map();
+  const logDoctorRequest = (stage, payload) => {
+    const doctor = str_(payload && payload.doctor);
+    const branch = str_(payload && payload.branch);
+    if (doctor !== FL2_DEBUG_TRACE_DOCTOR || branch !== FL2_DEBUG_TRACE_BRANCH) return;
+    fl2DebugTrace_(stage, payload);
+  };
   rows.forEach((row, idx) => {
     const status = str_(row['Состояние']);
-    if (!isAllowedProcessedRequestStatus(status)) return;
     const id = str_(row['Номер заявки']) || str_(row['Номер']) || str_(row['ID']) || `ROW-${idx}`;
-    const statusDate = toDate_(row['Дата']) || toDate_(row['ДатаНачала']) || new Date(0);
+    const doctor = str_(row['Сотрудник']);
+    const branch = str_(row['Филиал']);
+    const startDate = toDate_(row['ДатаНачала']);
+    const endDate = toDate_(row['ДатаОкончания']);
+    const intervalParts = normalizeRequestIntervalParts_(row, startDate, endDate);
+    const client = str_(row['Клиент']);
+    const cabinet = str_(row['Кабинет']);
+    const cabinetType = detectCabinetType_(cabinet);
+    const isCabinetRequest = Boolean(cabinetType);
+    const blockedByCategory = doctor && allowedEmployees && !allowedEmployees.has(doctor);
+    if (blockedByCategory && unassignedSet && doctor) unassignedSet.add(doctor);
+    const skipByName = isCabinetRequest
+      ? ((excludedEmployees && excludedEmployees.has(doctor)) || hasStandaloneTestWord_(doctor) || hasStandaloneTestWord_(client))
+      : (!doctor || blockedByCategory || (excludedEmployees && excludedEmployees.has(doctor)) || hasStandaloneTestWord_(doctor) || hasStandaloneTestWord_(client));
+    const skipReason = !skipByName
+      ? ''
+      : (!doctor || blockedByCategory)
+        ? 'doctor_not_allowed'
+        : (excludedEmployees && excludedEmployees.has(doctor))
+          ? 'excluded_employee'
+          : 'skip_by_name';
+    const nomenclatureRaw = str_(row['Номенклатура']);
+    const nomenclature = nomenclatureRaw.toLowerCase();
+    const isDoctorVisit = nomenclature.includes('врача');
+    const isPrimary = nomenclature.includes('первичный');
+    if (!isAllowedProcessedRequestStatus(status)) {
+      logDoctorRequest('DEBUG buildLatestRequests doctor request', {
+        id,
+        status,
+        doctor,
+        branch,
+        date: intervalParts.dateText || dayKeyToDateText_(intervalParts.dayKey),
+        startTime: intervalParts.startTime,
+        endTime: intervalParts.endTime,
+        nomenclature,
+        isDoctorVisit,
+        isPrimary,
+        skipByName,
+        skipReason,
+        intervalError: intervalParts.error,
+        decision: 'excluded',
+        reason: 'status_not_allowed',
+      });
+      return;
+    }
+    const statusDate = toDate_(row['Дата создания']) || toDate_(row['Дата']) || toDate_(row['ДатаНачала']) || new Date(0);
     const statusSort = Number(Utilities.formatDate(statusDate, FL2_TIMEZONE, 'yyyyMMddHHmmss'));
     const prev = latest.get(id);
     if (!prev || statusSort > prev.statusSort || (statusSort === prev.statusSort && idx > prev.idx)) {
-      const startDate = toDate_(row['ДатаНачала']);
-      const endDate = toDate_(row['ДатаОкончания']);
-      const timing = computeRequestTiming_(startDate, endDate);
-      const startMinStored = toIntOrNull_(row['НачалоМин']);
-      const endMinStored = toIntOrNull_(row['ОкончаниеМин']);
-      const durationMinStored = toIntOrNull_(row['ДлительностьМин']);
-      const doctor = str_(row['Сотрудник']);
-      const client = str_(row['Клиент']);
-      const cabinet = str_(row['Кабинет']);
-      const cabinetType = detectCabinetType_(cabinet);
-      const isCabinetRequest = Boolean(cabinetType);
-      const blockedByCategory = doctor && allowedEmployees && !allowedEmployees.has(doctor);
-      if (blockedByCategory && unassignedSet && doctor) unassignedSet.add(doctor);
-      const skipByName = isCabinetRequest
-        ? ((excludedEmployees && excludedEmployees.has(doctor)) || hasStandaloneTestWord_(doctor) || hasStandaloneTestWord_(client))
-        : (!doctor || blockedByCategory || (excludedEmployees && excludedEmployees.has(doctor)) || hasStandaloneTestWord_(doctor) || hasStandaloneTestWord_(client));
-      const nomenclature = str_(row['Номенклатура']).toLowerCase();
-      const isDoctorVisit = nomenclature.includes('врача');
-      const isPrimary = nomenclature.includes('первичный');
+      logDoctorRequest('DEBUG buildLatestRequests doctor request', {
+        id,
+        status,
+        doctor,
+        branch,
+        date: intervalParts.dateText || dayKeyToDateText_(intervalParts.dayKey),
+        startTime: intervalParts.startTime,
+        endTime: intervalParts.endTime,
+        nomenclature,
+        isDoctorVisit,
+        isPrimary,
+        skipByName,
+        skipReason,
+        intervalError: intervalParts.error,
+        decision: 'included',
+      });
       latest.set(id, {
         idx,
         id,
@@ -1900,34 +2406,161 @@ function buildLatestRequests(rows, excludedEmployees, allowedEmployees, unassign
         status,
         doctor,
         branch: str_(row['Филиал']),
-        startDate,
-        endDate,
-        startMin: startMinStored !== null ? startMinStored : timing.startMin,
-        endMin: endMinStored !== null ? endMinStored : timing.endMin,
-        durationMin: durationMinStored !== null ? durationMinStored : timing.durationMin,
+        startDate: dayKeyToDate_(intervalParts.dayKey),
+        endDate: dayKeyToDate_(intervalParts.dayKey),
+        dayKey: intervalParts.dayKey,
+        startMin: intervalParts.startMin,
+        endMin: intervalParts.endMin,
+        startTime: intervalParts.startTime,
+        endTime: intervalParts.endTime,
+        nomenclature: nomenclatureRaw,
         isDoctorVisit,
         isPrimary,
         cabinet,
         cabinetType,
         skipByName,
+        skipReason,
+        intervalError: intervalParts.error,
+      });
+      const inserted = latest.get(id);
+      if (prev) {
+        const prevNomenclature = str_(prev.nomenclature);
+        if (!inserted.nomenclature && prevNomenclature) inserted.nomenclature = prevNomenclature;
+        if (!inserted.nomenclature && prev.isDoctorVisit) inserted.isDoctorVisit = true;
+        if (!inserted.nomenclature && prev.isPrimary) inserted.isPrimary = true;
+      }
+    } else {
+      logDoctorRequest('DEBUG buildLatestRequests doctor request', {
+        id,
+        status,
+        doctor,
+        branch,
+        date: intervalParts.dateText || dayKeyToDateText_(intervalParts.dayKey),
+        startTime: intervalParts.startTime,
+        endTime: intervalParts.endTime,
+        nomenclature,
+        isDoctorVisit,
+        isPrimary,
+        skipByName,
+        skipReason,
+        intervalError: intervalParts.error,
+        decision: 'excluded',
+        reason: 'older_status',
       });
     }
   });
-  return [...latest.values()].filter((r) => !r.skipByName && (!rangeStart || !rangeEnd || isDateInRangeInclusive_(r.startDate, rangeStart, rangeEnd)));
+  return [...latest.values()].filter((r) => {
+    if (r.intervalError) {
+      logDoctorRequest('DEBUG buildLatestRequests doctor request', {
+        id: r.id,
+        status: r.status,
+        doctor: r.doctor,
+        branch: r.branch,
+        date: r.startDate,
+        startTime: r.startTime,
+        endTime: r.endTime,
+        nomenclature: '',
+        isDoctorVisit: r.isDoctorVisit,
+        isPrimary: r.isPrimary,
+        skipByName: r.skipByName,
+        intervalError: r.intervalError,
+        decision: 'excluded',
+        reason: 'interval_error',
+      });
+      fl2Log_('WARN', 'Заявка пропущена: некорректный интервал', `${r.id}: ${r.intervalError}`);
+      return false;
+    }
+    if (r.skipByName) {
+      logDoctorRequest('DEBUG buildLatestRequests doctor request', {
+        id: r.id,
+        status: r.status,
+        doctor: r.doctor,
+        branch: r.branch,
+        date: r.startDate,
+        startTime: r.startTime,
+        endTime: r.endTime,
+        nomenclature: '',
+        isDoctorVisit: r.isDoctorVisit,
+        isPrimary: r.isPrimary,
+        skipByName: r.skipByName,
+        intervalError: r.intervalError,
+        decision: 'excluded',
+        reason: r.skipReason || 'skip_by_name',
+      });
+      return false;
+    }
+    if (rangeStartKey && rangeEndKey && !isDayKeyInRangeInclusive_(r.dayKey, rangeStartKey, rangeEndKey)) {
+      logDoctorRequest('DEBUG buildLatestRequests doctor request', {
+        id: r.id,
+        status: r.status,
+        doctor: r.doctor,
+        branch: r.branch,
+        date: r.startDate,
+        startTime: r.startTime,
+        endTime: r.endTime,
+        nomenclature: '',
+        isDoctorVisit: r.isDoctorVisit,
+        isPrimary: r.isPrimary,
+        skipByName: r.skipByName,
+        intervalError: r.intervalError,
+        decision: 'excluded',
+        reason: 'out_of_range',
+      });
+      return false;
+    }
+    logDoctorRequest('DEBUG buildLatestRequests doctor request', {
+      id: r.id,
+      status: r.status,
+      doctor: r.doctor,
+      branch: r.branch,
+      date: r.startDate,
+      startTime: r.startTime,
+      endTime: r.endTime,
+      nomenclature: '',
+      isDoctorVisit: r.isDoctorVisit,
+      isPrimary: r.isPrimary,
+      skipByName: r.skipByName,
+      intervalError: r.intervalError,
+      decision: 'included',
+    });
+    return true;
+  });
 }
-function computeWindowMetrics(anchorDate, horizonDays, scheduleByDoctorDay, requests, options) {
-  const startDate = addDays(anchorDate, 1);
-  const endDate = addDays(anchorDate, horizonDays);
+function computeWindowMetrics(anchorDayKey, horizonDays, scheduleByDoctorDay, requests, options) {
+  const startDayKey = addDaysToDayKey_(anchorDayKey, 1);
+  const endDayKey = addDaysToDayKey_(anchorDayKey, horizonDays);
   const byBranch = new Map();
   const byDoctor = new Map();
 
   const includeAllNomenclature = Boolean(options && options.includeAllNomenclature);
 
+  const scheduleKeysInWindow = new Set();
+  scheduleByDoctorDay.forEach((_, key) => {
+    const [dKey] = key.split('|');
+    if (!isDayKeyInRangeInclusive_(dKey, startDayKey, endDayKey)) return;
+    scheduleKeysInWindow.add(key);
+  });
+
   const requestIndex = new Map();
   requests.forEach((r) => {
-    if (!isActivePlannedStatus(r.status) || !r.startDate) return;
+    if (!isActivePlannedStatus(r.status)) return;
     if (!includeAllNomenclature && !r.isDoctorVisit) return;
-    const key = `${dateKey_(r.startDate)}|${r.branch}|${r.doctor}`;
+    const requestDayKey = str_(r.dayKey);
+    if (!isDayKeyInRangeInclusive_(requestDayKey, startDayKey, endDayKey)) return;
+    const key = `${requestDayKey}|${r.branch}|${r.doctor}`;
+    if (!scheduleKeysInWindow.has(key)) {
+      if (str_(r.doctor) === FL2_DEBUG_TRACE_DOCTOR && str_(r.branch) === FL2_DEBUG_TRACE_BRANCH) {
+        fl2DebugTrace_('DEBUG computeWindowMetrics request_without_schedule_key', {
+          branch: r.branch,
+          doctor: r.doctor,
+          key,
+          requestId: r.id,
+          status: r.status,
+          dayKey: requestDayKey,
+        });
+      }
+      return;
+    }
     if (!requestIndex.has(key)) requestIndex.set(key, { intervals: [], reqCount: 0, primaryCount: 0 });
     const entry = requestIndex.get(key);
     entry.intervals.push(requestInterval(r));
@@ -1937,14 +2570,15 @@ function computeWindowMetrics(anchorDate, horizonDays, scheduleByDoctorDay, requ
 
   scheduleByDoctorDay.forEach((intervals, key) => {
     const [dKey, branch, doctor] = key.split('|');
-    const day = toDate_(dKey);
-    if (!day || day < startDate || day > endDate) return;
+    if (!isDayKeyInRangeInclusive_(dKey, startDayKey, endDayKey)) return;
 
     const req = requestIndex.get(key) || { intervals: [], reqCount: 0, primaryCount: 0 };
     const reception = mergeIntervals_(intervals.filter((i) => i.type === 'Приемные часы'));
     const nonReception = mergeIntervals_(intervals.filter((i) => i.type !== 'Приемные часы'));
     const occupied = mergeIntervals_(req.intervals);
     const occupiedWithinReception = intersectIntervals(occupied, reception);
+    // Учитываем занятость в не-приемных интервалах только фактическим пересечением
+    // интервалов заявок с интервалами графика на конкретную дату врача.
     const occupiedWithinNonReception = intersectIntervals(occupied, nonReception);
     const nonReceptionOccupiedMin = sumIntervalsMin(occupiedWithinNonReception);
 
@@ -1957,31 +2591,198 @@ function computeWindowMetrics(anchorDate, horizonDays, scheduleByDoctorDay, requ
     const freeMin = sumIntervalsMin(free);
     const freePP = free.reduce((acc, i) => acc + Math.floor((i.end - i.start) / 60), 0);
 
+    if (doctor === FL2_DEBUG_TRACE_DOCTOR && branch === FL2_DEBUG_TRACE_BRANCH) {
+      fl2DebugTrace_('DEBUG computeWindowMetrics doctor day', {
+        branch,
+        doctor,
+        key,
+        receptionIntervals: reception,
+        nonReceptionIntervals: nonReception,
+        requestIntervalsRaw: req.intervals,
+        occupiedMerged: occupied,
+        occupiedWithinReception,
+        occupiedWithinNonReception,
+        freeIntervals: free,
+        receptionMin,
+        occupiedMin,
+        freeMin,
+        freePP,
+        reqCount: req.reqCount,
+        primaryCount: req.primaryCount,
+      });
+      if (req.reqCount > 0 && sumIntervalsMin(occupiedWithinReception) === 0) {
+        fl2DebugTrace_('DEBUG computeWindowMetrics request_not_mapped_to_reception', {
+          branch,
+          doctor,
+          key,
+          reqCount: req.reqCount,
+          requestIntervalsRaw: req.intervals,
+          receptionIntervals: reception,
+        });
+      }
+    }
+
     accumulateForward(byBranch, branch, { receptionMin, occupiedMin, freeMin, freePP, reqCount: req.reqCount, primaryCount: req.primaryCount }, branch, '');
     accumulateForward(byDoctor, `${branch}|${doctor}`, { receptionMin, occupiedMin, freeMin, freePP, reqCount: req.reqCount, primaryCount: req.primaryCount }, branch, doctor);
   });
   return { byBranch, byDoctor };
 }
 
-function computeBaselineMetrics(currentDay, horizonDays, scheduleByDoctorDay, requests, options) {
-  const byBranchSeries = new Map();
-  const byDoctorSeries = new Map();
-  const baselineRequests = requests.map((r) => ({
-    ...r,
-    status: isCompletedStatus(r.status) ? 'Запланирована' : r.status,
-  }));
+function computeWindowDailyBuckets_(anchorDayKey, maxHorizonDays, scheduleByDoctorDay, requests, options) {
+  const startDayKey = addDaysToDayKey_(anchorDayKey, 1);
+  const endDayKey = addDaysToDayKey_(anchorDayKey, maxHorizonDays);
+  const includeAllNomenclature = Boolean(options && options.includeAllNomenclature);
+  const dailyBuckets = new Map();
 
-  for (let i = 1; i <= 42; i += 1) {
-    const ref = addDays(currentDay, -i);
-    if (ref.getDay() !== currentDay.getDay()) continue;
-    const res = computeWindowMetrics(ref, horizonDays, scheduleByDoctorDay, baselineRequests, options);
-    res.byBranch.forEach((v, k) => pushSeries(byBranchSeries, k, v, v.branch, ''));
-    res.byDoctor.forEach((v, k) => pushSeries(byDoctorSeries, k, v, v.branch, v.doctor));
-  }
-  return {
-    byBranch: finalizeSeriesAverage(byBranchSeries),
-    byDoctor: finalizeSeriesAverage(byDoctorSeries),
-  };
+  const scheduleKeysInWindow = new Set();
+  scheduleByDoctorDay.forEach((_, key) => {
+    const [dKey] = key.split('|');
+    if (!isDayKeyInRangeInclusive_(dKey, startDayKey, endDayKey)) return;
+    scheduleKeysInWindow.add(key);
+  });
+
+  const requestIndex = new Map();
+  requests.forEach((r) => {
+    if (!isActivePlannedStatus(r.status)) return;
+    if (!includeAllNomenclature && !r.isDoctorVisit) return;
+    const requestDayKey = str_(r.dayKey);
+    if (!isDayKeyInRangeInclusive_(requestDayKey, startDayKey, endDayKey)) return;
+    const key = `${requestDayKey}|${r.branch}|${r.doctor}`;
+    if (!scheduleKeysInWindow.has(key)) {
+      if (str_(r.doctor) === FL2_DEBUG_TRACE_DOCTOR && str_(r.branch) === FL2_DEBUG_TRACE_BRANCH) {
+        fl2DebugTrace_('DEBUG computeWindowMetrics request_without_schedule_key', {
+          branch: r.branch,
+          doctor: r.doctor,
+          key,
+          requestId: r.id,
+          status: r.status,
+          dayKey: requestDayKey,
+        });
+      }
+      return;
+    }
+    if (!requestIndex.has(key)) requestIndex.set(key, { intervals: [], reqCount: 0, primaryCount: 0 });
+    const entry = requestIndex.get(key);
+    entry.intervals.push(requestInterval(r));
+    entry.reqCount += 1;
+    if (r.isPrimary) entry.primaryCount += 1;
+  });
+
+  scheduleByDoctorDay.forEach((intervals, key) => {
+    const [dKey, branch, doctor] = key.split('|');
+    if (!isDayKeyInRangeInclusive_(dKey, startDayKey, endDayKey)) return;
+
+    const req = requestIndex.get(key) || { intervals: [], reqCount: 0, primaryCount: 0 };
+    const reception = mergeIntervals_(intervals.filter((i) => i.type === 'Приемные часы'));
+    const nonReception = mergeIntervals_(intervals.filter((i) => i.type !== 'Приемные часы'));
+    const occupied = mergeIntervals_(req.intervals);
+    const occupiedWithinReception = intersectIntervals(occupied, reception);
+    const occupiedWithinNonReception = intersectIntervals(occupied, nonReception);
+    const nonReceptionOccupiedMin = sumIntervalsMin(occupiedWithinNonReception);
+
+    if (!reception.length && nonReceptionOccupiedMin <= 0) return;
+
+    const free = subtractIntervals(reception, occupiedWithinReception);
+    const metric = {
+      receptionMin: sumIntervalsMin(reception) + nonReceptionOccupiedMin,
+      occupiedMin: sumIntervalsMin(occupiedWithinReception) + nonReceptionOccupiedMin,
+      freeMin: sumIntervalsMin(free),
+      freePP: free.reduce((acc, i) => acc + Math.floor((i.end - i.start) / 60), 0),
+      reqCount: req.reqCount,
+      primaryCount: req.primaryCount,
+    };
+
+    if (doctor === FL2_DEBUG_TRACE_DOCTOR && branch === FL2_DEBUG_TRACE_BRANCH) {
+      fl2DebugTrace_('DEBUG computeWindowMetrics doctor day', {
+        branch,
+        doctor,
+        key,
+        receptionIntervals: reception,
+        nonReceptionIntervals: nonReception,
+        requestIntervalsRaw: req.intervals,
+        occupiedMerged: occupied,
+        occupiedWithinReception,
+        occupiedWithinNonReception,
+        freeIntervals: free,
+        receptionMin: metric.receptionMin,
+        occupiedMin: metric.occupiedMin,
+        freeMin: metric.freeMin,
+        freePP: metric.freePP,
+        reqCount: req.reqCount,
+        primaryCount: req.primaryCount,
+      });
+      if (req.reqCount > 0 && sumIntervalsMin(occupiedWithinReception) === 0) {
+        fl2DebugTrace_('DEBUG computeWindowMetrics request_not_mapped_to_reception', {
+          branch,
+          doctor,
+          key,
+          reqCount: req.reqCount,
+          requestIntervalsRaw: req.intervals,
+          receptionIntervals: reception,
+        });
+      }
+    }
+
+    if (!dailyBuckets.has(dKey)) dailyBuckets.set(dKey, []);
+    dailyBuckets.get(dKey).push({ branch, doctor, metric });
+  });
+
+  return dailyBuckets;
+}
+
+function aggregateWindowMetricsFromDailyBuckets_(anchorDayKey, horizonDays, dailyBuckets) {
+  const startDayKey = addDaysToDayKey_(anchorDayKey, 1);
+  const endDayKey = addDaysToDayKey_(anchorDayKey, horizonDays);
+  const byBranch = new Map();
+  const byDoctor = new Map();
+
+  (dailyBuckets || new Map()).forEach((entries, dKey) => {
+    if (!isDayKeyInRangeInclusive_(dKey, startDayKey, endDayKey)) return;
+    (entries || []).forEach((entry) => {
+      accumulateForward(byBranch, entry.branch, entry.metric, entry.branch, '');
+      accumulateForward(byDoctor, `${entry.branch}|${entry.doctor}`, entry.metric, entry.branch, entry.doctor);
+    });
+  });
+
+  return { byBranch, byDoctor };
+}
+
+function computeBaselineMetrics(currentDay, horizonDays, scheduleByDoctorDay, requests, options) {
+  const opts = options || {};
+  const categoryResolver = typeof opts.categoryResolver === 'function'
+    ? opts.categoryResolver
+    : () => str_(opts.category || 'doctor');
+  const horizonLabel = Number(horizonDays) === 7 ? '7 дней' : '3 дня';
+
+  const byBranch = new Map();
+  const byDoctor = new Map();
+  const index = loadArchiveBaselineIndex_();
+  const seen = new Set();
+
+  scheduleByDoctorDay.forEach((intervals, key) => {
+    const parts = str_(key).split('|');
+    const branch = str_(parts[1]);
+    const doctor = str_(parts[2]);
+    if (!branch || !doctor) return;
+    const uniq = `${branch}|${doctor}`;
+    if (seen.has(uniq)) return;
+    seen.add(uniq);
+
+    const category = str_(categoryResolver(doctor, branch)) || 'doctor';
+    const metric = getArchiveBaselineMetric_(index, {
+      category,
+      branch,
+      object: doctor,
+      horizon: horizonLabel,
+      reportDate: currentDay,
+      maxObservations: 6,
+    });
+
+    byDoctor.set(uniq, { branch, doctor, metrics: metric });
+    accumulateForward(byBranch, branch, metric, branch, '');
+  });
+
+  return { byBranch, byDoctor };
 }
 function pushSeries(seriesMap, key, value, branch, doctor) {
   if (!seriesMap.has(key)) seriesMap.set(key, { branch, doctor, values: [] });
@@ -2027,7 +2828,9 @@ function mergeForwardRows(current3, current7, base3, base7) {
   });
   return rows;
 }
-function renderForwardLoadSheet(ss, currentDay, reportPeriod, selectedBranch, branchRows, doctorRows, massageSummary, ftSummary, cabinetSummary, massageRows, ftRows, cabinetRows) {
+function renderForwardLoadSheet(ss, currentDay, reportPeriod, selectedBranch, branchRows, doctorRows, massageSummary, ftSummary, cabinetSummary, massageRows, ftRows, cabinetRows, options) {
+  const opts = options || {};
+  const includeBaseline = opts.includeBaseline !== false;
   const sheet = getOrCreateSheet_(ss, selectedBranch);
   resetSheetForRender_(sheet);
   let row = 1;
@@ -2074,6 +2877,7 @@ function renderForwardLoadSheet(ss, currentDay, reportPeriod, selectedBranch, br
     cabinetRows,
     horizon: '3d',
     tableBase: 1,
+    includeBaseline,
   });
 
   row += 1;
@@ -2088,6 +2892,7 @@ function renderForwardLoadSheet(ss, currentDay, reportPeriod, selectedBranch, br
     cabinetRows,
     horizon: '7d',
     tableBase: 5,
+    includeBaseline,
   });
 
   sheet.autoResizeColumns(1, 8);
@@ -2095,6 +2900,7 @@ function renderForwardLoadSheet(ss, currentDay, reportPeriod, selectedBranch, br
 
 function renderPlanBlockByHorizon_(sheet, row, horizonLabel, periodLabel, ctx) {
   const h = ctx.horizon;
+  const includeBaseline = ctx.includeBaseline !== false;
   const summaryHeader = ['Категория', 'Приемные (ч)', 'Занятые (ч)', 'Загрузка (%)', 'Свободные (ч)', 'Заявки (шт)', 'Заявки на ПП (шт)', 'Свободные слоты под ПП'];
   const titleRowRange = sheet.getRange(row, 1, 1, summaryHeader.length);
   const titleRange = sheet.getRange(row, 1, 1, 4);
@@ -2115,34 +2921,36 @@ function renderPlanBlockByHorizon_(sheet, row, horizonLabel, periodLabel, ctx) {
   styleForecastHeaderRow(sheet, row, summaryHeader.length);
   row += 1;
 
-  row = renderSummaryCategoryRow_(sheet, row, 'Врачи', ctx.doctorsSummary.current, ctx.doctorsSummary.baseline, h, summaryHeader.length, true);
-  row = renderSummaryCategoryRow_(sheet, row, 'Массажисты', ctx.massageSummary.current, ctx.massageSummary.baseline, h, summaryHeader.length, false);
-  row = renderSummaryCategoryRow_(sheet, row, 'ФТ', ctx.ftSummary.current, ctx.ftSummary.baseline, h, summaryHeader.length, false);
-  row = renderSummaryCategoryRow_(sheet, row, 'Физиотерапия', ctx.physioSummary.current, ctx.physioSummary.baseline, h, summaryHeader.length, false);
+  row = renderSummaryCategoryRow_(sheet, row, 'Врачи', ctx.doctorsSummary.current, ctx.doctorsSummary.baseline, h, summaryHeader.length, true, includeBaseline);
+  row = renderSummaryCategoryRow_(sheet, row, 'Массажисты', ctx.massageSummary.current, ctx.massageSummary.baseline, h, summaryHeader.length, false, includeBaseline);
+  row = renderSummaryCategoryRow_(sheet, row, 'ФТ', ctx.ftSummary.current, ctx.ftSummary.baseline, h, summaryHeader.length, false, includeBaseline);
+  row = renderSummaryCategoryRow_(sheet, row, 'Физиотерапия', ctx.physioSummary.current, ctx.physioSummary.baseline, h, summaryHeader.length, false, includeBaseline);
 
   row += 1;
-  row = renderForwardDetailsTable_(sheet, row, `Таблица ${ctx.tableBase} — Врачи (${horizonLabel})`, 'Врач', ctx.doctorRows, h, true);
+  row = renderForwardDetailsTable_(sheet, row, `Таблица ${ctx.tableBase} — Врачи (${horizonLabel})`, 'Врач', ctx.doctorRows, h, true, includeBaseline);
   row += 1;
-  row = renderForwardDetailsTable_(sheet, row, `Таблица ${ctx.tableBase + 1} — Массажисты (${horizonLabel})`, 'Сотрудник', ctx.massageRows, h, false);
+  row = renderForwardDetailsTable_(sheet, row, `Таблица ${ctx.tableBase + 1} — Массажисты (${horizonLabel})`, 'Сотрудник', ctx.massageRows, h, false, includeBaseline);
   row += 1;
-  row = renderForwardDetailsTable_(sheet, row, `Таблица ${ctx.tableBase + 2} — ФТ (${horizonLabel})`, 'Сотрудник', ctx.ftRows, h, false);
+  row = renderForwardDetailsTable_(sheet, row, `Таблица ${ctx.tableBase + 2} — ФТ (${horizonLabel})`, 'Сотрудник', ctx.ftRows, h, false, includeBaseline);
   row += 1;
-  row = renderCabinetDetailsTable_(sheet, row, `Таблица ${ctx.tableBase + 3} — Кабинеты физиотерапии (${horizonLabel})`, ctx.cabinetRows, h);
+  row = renderCabinetDetailsTable_(sheet, row, `Таблица ${ctx.tableBase + 3} — Кабинеты физиотерапии (${horizonLabel})`, ctx.cabinetRows, h, includeBaseline);
 
   return row;
 }
 
-function renderSummaryCategoryRow_(sheet, row, name, current, baseline, horizon, columns, includePrimaryCols) {
+function renderSummaryCategoryRow_(sheet, row, name, current, baseline, horizon, columns, includePrimaryCols, includeBaseline) {
   const loadCur = current.receptionMin ? (current.occupiedMin / current.receptionMin) * 100 : 0;
   const loadBase = baseline.receptionMin ? (baseline.occupiedMin / baseline.receptionMin) * 100 : 0;
   const values = [
     name,
     round1_(current.receptionMin / 60),
-    `${round1_(current.occupiedMin / 60)} (${round1_(baseline.occupiedMin / 60)})`,
-    `${round0(loadCur)} (${round0(loadBase)})`,
+    formatMetricWithOptionalBaseline_(current.occupiedMin / 60, baseline.occupiedMin / 60, includeBaseline),
+    formatPercentWithOptionalBaseline_(loadCur, loadBase, includeBaseline),
     round1_(current.freeMin / 60),
     round1_(current.reqCount),
-    includePrimaryCols ? round1_(current.primaryCount) : '',
+    includePrimaryCols
+      ? formatMetricWithOptionalBaseline_(current.primaryCount, baseline.primaryCount, includeBaseline)
+      : '',
     includePrimaryCols ? round1_(current.freePP) : '',
   ];
   sheet.getRange(row, 1, 1, columns).setValues([values]);
@@ -2151,7 +2959,7 @@ function renderSummaryCategoryRow_(sheet, row, name, current, baseline, horizon,
   return row + 1;
 }
 
-function renderForwardDetailsTable_(sheet, row, title, firstColTitle, rows, horizon, includePrimaryCols) {
+function renderForwardDetailsTable_(sheet, row, title, firstColTitle, rows, horizon, includePrimaryCols, includeBaseline) {
   const includePrimary = includePrimaryCols !== false;
   const header = [firstColTitle, 'Приемные (ч)', 'Занятые (ч)', 'Загрузка (%)', 'Свободные (ч)', 'Заявки (шт)'];
   if (includePrimary) {
@@ -2173,13 +2981,16 @@ function renderForwardDetailsTable_(sheet, row, title, firstColTitle, rows, hori
     const values = [
       str_(r.doctor),
       round1_(current.receptionMin / 60),
-      `${round1_(current.occupiedMin / 60)} (${round1_(baseline.occupiedMin / 60)})`,
-      `${round0(loadCur)} (${round0(loadBase)})`,
+      formatMetricWithOptionalBaseline_(current.occupiedMin / 60, baseline.occupiedMin / 60, includeBaseline),
+      formatPercentWithOptionalBaseline_(loadCur, loadBase, includeBaseline),
       round1_(current.freeMin / 60),
       round1_(current.reqCount),
     ];
     if (includePrimary) {
-      values.push(round1_(current.primaryCount), round1_(current.freePP));
+      values.push(
+        formatMetricWithOptionalBaseline_(current.primaryCount, baseline.primaryCount, includeBaseline),
+        round1_(current.freePP)
+      );
     }
     sheet.getRange(row, 1, 1, columns).setValues([values]);
     styleForecastDataRow(sheet, row, columns);
@@ -2190,7 +3001,7 @@ function renderForwardDetailsTable_(sheet, row, title, firstColTitle, rows, hori
   return row;
 }
 
-function renderCabinetDetailsTable_(sheet, row, title, rows, horizon) {
+function renderCabinetDetailsTable_(sheet, row, title, rows, horizon, includeBaseline) {
   const columns = 6;
   const header = ['Кабинет', 'Приемные (ч)', 'Занятые (ч)', 'Загрузка (%)', 'Свободные (ч)', 'Заявки (шт)'];
   sheet.getRange(row, 1, 1, columns).merge().setValue(title).setFontWeight('bold').setBackground('#cfe2f3');
@@ -2208,8 +3019,8 @@ function renderCabinetDetailsTable_(sheet, row, title, rows, horizon) {
     const values = [
       str_(r.cabinet),
       round1_(current.receptionMin / 60),
-      `${round1_(current.occupiedMin / 60)} (${round1_(baseline.occupiedMin / 60)})`,
-      `${round0(loadCur)} (${round0(loadBase)})`,
+      formatMetricWithOptionalBaseline_(current.occupiedMin / 60, baseline.occupiedMin / 60, includeBaseline),
+      formatPercentWithOptionalBaseline_(loadCur, loadBase, includeBaseline),
       round1_(current.freeMin / 60),
       round1_(current.reqCount),
     ];
@@ -2220,6 +3031,18 @@ function renderCabinetDetailsTable_(sheet, row, title, rows, horizon) {
   });
 
   return row;
+}
+
+function formatMetricWithOptionalBaseline_(currentValue, baselineValue, includeBaseline) {
+  const current = round1_(Number(currentValue) || 0);
+  const baseline = round1_(Number(baselineValue) || 0);
+  return includeBaseline ? `${current} (${baseline})` : `${current}`;
+}
+
+function formatPercentWithOptionalBaseline_(currentValue, baselineValue, includeBaseline) {
+  const current = round0(Number(currentValue) || 0);
+  const baseline = round0(Number(baselineValue) || 0);
+  return includeBaseline ? `${current} (${baseline})` : `${current}`;
 }
 
 function renderForwardRowsSingle(sheet, startRow, rows, horizon) {
@@ -2315,20 +3138,122 @@ function sendForwardReportEmail(ss, selectedBranch, currentDay) {
   });
 }
 
-function scheduledBuildForwardLoadAllBranchesAndSend() {
-  fl2Log_('INFO', 'scheduledBuildForwardLoadAllBranchesAndSend: старт', '');
+function fl2LogTriggerSourceEmailPreview_() {
+  const sourceMessage = findSingleSourceMessageForToday_();
+  const subject = str_(sourceMessage.getSubject());
+  const sourceAttachments = pickSourceAttachments_(sourceMessage.getAttachments());
+  fl2TriggerLog_('INFO', 'Триггер: тема найденного письма', subject);
+  fl2TriggerLog_(
+    'INFO',
+    'Триггер: выбранные вложения',
+    `${sourceAttachments.schedule.getName()} | ${sourceAttachments.requests.getName()}`
+  );
+}
+
+function triggerBuildAggregatorDiscountsAndSend() {
+  fl2TriggerLog_('INFO', 'triggerBuildAggregatorDiscountsAndSend: старт', '');
   try {
-    runForwardLoadReportAllBranchesCore_({ sendEmails: true });
-    fl2Log_('INFO', 'scheduledBuildForwardLoadAllBranchesAndSend: успех', '');
+    fl2TriggerLog_('INFO', 'triggerBuildAggregatorDiscountsAndSend: начало загрузки из письма', '');
+    fl2LogTriggerSourceEmailPreview_();
+    loadAndProcessSourceDataFromEmail();
+    fl2TriggerLog_('INFO', 'triggerBuildAggregatorDiscountsAndSend: завершение loadAndProcessSourceDataFromEmail', '');
+
+    fl2TriggerLog_('INFO', 'triggerBuildAggregatorDiscountsAndSend: режим расчета', 'baseline=OFF, sendEmails=OFF, discountsMode=aggregators');
+    fl2TriggerLog_('INFO', 'triggerBuildAggregatorDiscountsAndSend: начало построения планов', '');
+    runForwardLoadReportsDirect_({
+      includeBaseline: false,
+      sendEmails: false,
+    });
+    fl2TriggerLog_('INFO', 'triggerBuildAggregatorDiscountsAndSend: завершение построения планов', '');
+
+    fl2TriggerLog_('INFO', 'triggerBuildAggregatorDiscountsAndSend: начало обновления скидок', '');
+    updateDiscountsByPlan({ silent: true });
+    fl2TriggerLog_('INFO', 'triggerBuildAggregatorDiscountsAndSend: завершение обновления скидок', '');
+
+    fl2TriggerLog_('INFO', 'triggerBuildAggregatorDiscountsAndSend: начало отправки письма', 'mode=aggregators');
+    sendDiscountsEmailsByMode_({
+      targetMode: 'aggregators',
+      silent: true,
+    });
+    fl2TriggerLog_('INFO', 'triggerBuildAggregatorDiscountsAndSend: завершение отправки письма', 'mode=aggregators');
+    fl2TriggerLog_('INFO', 'triggerBuildAggregatorDiscountsAndSend: success', '');
   } catch (e) {
     const message = e && e.message ? e.message : String(e);
-    fl2Log_('ERROR', 'scheduledBuildForwardLoadAllBranchesAndSend: ошибка', message);
+    const details = e && e.stack ? e.stack : (e && e.message ? e.message : String(e));
+    fl2TriggerLog_('ERROR', 'triggerBuildAggregatorDiscountsAndSend: error', `${message}\n${details}`);
+    throw e;
+  }
+}
+
+function triggerBuildNonAggregatorDiscountsAndSend() {
+  fl2TriggerLog_('INFO', 'triggerBuildNonAggregatorDiscountsAndSend: старт', '');
+  try {
+    fl2TriggerLog_('INFO', 'triggerBuildNonAggregatorDiscountsAndSend: начало загрузки из письма', '');
+    fl2LogTriggerSourceEmailPreview_();
+    loadAndProcessSourceDataFromEmail();
+    fl2TriggerLog_('INFO', 'triggerBuildNonAggregatorDiscountsAndSend: завершение loadAndProcessSourceDataFromEmail', '');
+
+    fl2TriggerLog_('INFO', 'triggerBuildNonAggregatorDiscountsAndSend: режим расчета', 'baseline=OFF, sendEmails=OFF, discountsMode=non_aggregators');
+    fl2TriggerLog_('INFO', 'triggerBuildNonAggregatorDiscountsAndSend: начало построения планов', '');
+    runForwardLoadReportsDirect_({
+      includeBaseline: false,
+      sendEmails: false,
+    });
+    fl2TriggerLog_('INFO', 'triggerBuildNonAggregatorDiscountsAndSend: завершение построения планов', '');
+
+    fl2TriggerLog_('INFO', 'triggerBuildNonAggregatorDiscountsAndSend: начало обновления скидок', '');
+    updateDiscountsByPlan({ silent: true });
+    fl2TriggerLog_('INFO', 'triggerBuildNonAggregatorDiscountsAndSend: завершение обновления скидок', '');
+
+    fl2TriggerLog_('INFO', 'triggerBuildNonAggregatorDiscountsAndSend: начало отправки письма', 'mode=non_aggregators');
+    sendDiscountsEmailsByMode_({
+      targetMode: 'non_aggregators',
+      silent: true,
+    });
+    fl2TriggerLog_('INFO', 'triggerBuildNonAggregatorDiscountsAndSend: завершение отправки письма', 'mode=non_aggregators');
+    fl2TriggerLog_('INFO', 'triggerBuildNonAggregatorDiscountsAndSend: success', '');
+  } catch (e) {
+    const message = e && e.message ? e.message : String(e);
+    const details = e && e.stack ? e.stack : (e && e.message ? e.message : String(e));
+    fl2TriggerLog_('ERROR', 'triggerBuildNonAggregatorDiscountsAndSend: error', `${message}\n${details}`);
+    throw e;
+  }
+}
+
+function triggerBuildBaselinePlansAndSend() {
+  fl2TriggerLog_('INFO', 'triggerBuildBaselinePlansAndSend: старт', '');
+  try {
+    fl2TriggerLog_('INFO', 'triggerBuildBaselinePlansAndSend: начало загрузки из письма', '');
+    fl2LogTriggerSourceEmailPreview_();
+    loadAndProcessSourceDataFromEmail();
+    fl2TriggerLog_('INFO', 'triggerBuildBaselinePlansAndSend: завершение loadAndProcessSourceDataFromEmail', '');
+
+    fl2TriggerLog_('INFO', 'triggerBuildBaselinePlansAndSend: режим расчета', 'baseline=ON, sendEmails=ON, discountsMode=none');
+    fl2TriggerLog_('INFO', 'triggerBuildBaselinePlansAndSend: начало построения планов', '');
+    runForwardLoadReportsDirect_({
+      includeBaseline: true,
+      sendEmails: true,
+    });
+    fl2TriggerLog_('INFO', 'triggerBuildBaselinePlansAndSend: завершение построения планов', '');
+
+    fl2TriggerLog_('INFO', 'triggerBuildBaselinePlansAndSend: начало отправки письма', 'overall forecast');
+    buildOverallForecastCore_({
+      sendEmail: true,
+      refreshDiscountsAfter: false,
+    });
+    fl2TriggerLog_('INFO', 'triggerBuildBaselinePlansAndSend: завершение отправки письма', 'overall forecast');
+    fl2TriggerLog_('INFO', 'triggerBuildBaselinePlansAndSend: success', '');
+  } catch (e) {
+    const message = e && e.message ? e.message : String(e);
+    const details = e && e.stack ? e.stack : (e && e.message ? e.message : String(e));
+    fl2TriggerLog_('ERROR', 'triggerBuildBaselinePlansAndSend: error', `${message}\n${details}`);
     throw e;
   }
 }
 
 function buildOverallForecastCore_(options) {
   const opts = options || {};
+  const refreshDiscountsAfter = opts.refreshDiscountsAfter === true;
   const ss = SpreadsheetApp.getActive();
   ensureDoctorScheduleFresh(ss);
   const sheets = ss.getSheets();
@@ -2353,7 +3278,9 @@ function buildOverallForecastCore_(options) {
   if (opts.sendEmail) {
     sendOverallForecastEmail(ss, effectivePeriodLabel);
   }
-  refreshDiscountsAfterPlanUpdate_();
+  if (refreshDiscountsAfter) {
+    refreshDiscountsAfterPlanUpdate_();
+  }
   return effectivePeriodLabel;
 }
 
@@ -2365,18 +3292,6 @@ function buildOverallForecastReport() {
     sendOverallForecastEmail(SpreadsheetApp.getActive(), reportPeriodLabel);
   }
   SpreadsheetApp.getActive().toast('Общий план собран', MENU_NAME, 5);
-}
-
-function scheduledBuildOverallForecastAndSend() {
-  fl2Log_('INFO', 'scheduledBuildOverallForecastAndSend: старт', '');
-  try {
-    buildOverallForecastCore_({ sendEmail: true });
-    fl2Log_('INFO', 'scheduledBuildOverallForecastAndSend: успех', '');
-  } catch (e) {
-    const message = e && e.message ? e.message : String(e);
-    fl2Log_('ERROR', 'scheduledBuildOverallForecastAndSend: ошибка', message);
-    throw e;
-  }
 }
 
 function updateDiscountsByPlan(options) {
@@ -2615,8 +3530,9 @@ function writeColumnBatch_(sheet, startRow, columns, rows) {
   });
 }
 
-function sendDiscountsEmails(options) {
+function sendDiscountsEmailsByMode_(options) {
   const opts = options || {};
+  const targetMode = str_(opts.targetMode);
   const silent = Boolean(opts.silent);
   const ss = SpreadsheetApp.getActive();
   const discountsSheet = ss.getSheetByName(SHEET_DISCOUNTS);
@@ -2627,15 +3543,32 @@ function sendDiscountsEmails(options) {
 
   const discountRows = getSheetObjects_(discountsSheet).map((row) => normalizeDiscountMailRow_(row));
   const mailingRows = getSheetObjects_(mailingSheet);
-  const mailingTarget = mailingRows.find((r) => str_(r['Филиал']) === 'Скидки');
+
+  let mailingBranchName = 'Скидки';
+  let allowedSectionKeys = ['pp_discount', 'p_discount', 'smm', 'site', 'aggregators'];
+  let subject = `Сводка по скидкам на ${formatDateDDMMYYYY_(new Date())}`;
+
+  if (targetMode === 'aggregators') {
+    mailingBranchName = 'Агрегатор';
+    allowedSectionKeys = ['aggregators'];
+    subject = `Скидки для агрегаторов на ${formatDateDDMMYYYY_(new Date())}`;
+  } else if (targetMode === 'non_aggregators') {
+    mailingBranchName = 'Скидки';
+    allowedSectionKeys = ['pp_discount', 'p_discount', 'smm', 'site'];
+    subject = `Сводка по скидкам на ${formatDateDDMMYYYY_(new Date())}`;
+  } else {
+    throw new Error(`Неизвестный режим отправки скидок: ${targetMode}`);
+  }
+
+  const mailingTarget = mailingRows.find((r) => str_(r['Филиал']) === mailingBranchName);
   if (!mailingTarget) {
-    throw new Error('В листе "Отправка" не найдена строка "Скидки"');
+    throw new Error(`В листе "Отправка" не найдена строка "${mailingBranchName}"`);
   }
 
   const to = parseEmailList(mailingTarget['Кому']);
   const cc = parseEmailList(mailingTarget['Копия']);
   if (!to.length) {
-    if (!silent) SpreadsheetApp.getActive().toast('Для рассылки скидок не заполнена колонка "Кому"', MENU_NAME, 5);
+    if (!silent) SpreadsheetApp.getActive().toast(`Для рассылки "${mailingBranchName}" не заполнено поле "Кому"`, MENU_NAME, 5);
     return;
   }
 
@@ -2685,7 +3618,9 @@ function sendDiscountsEmails(options) {
   const previousState = readDiscountsEmailState_(ss);
   const changeDiff = diffDiscountDoctorsBySection_(previousState, currentState);
 
-  const sectionsForSend = sections.filter((section) => sectionHasDiscountDiff_(section, changeDiff));
+  const sectionsForSend = sections
+    .filter((section) => sectionHasDiscountDiff_(section, changeDiff))
+    .filter((section) => allowedSectionKeys.includes(section.key));
   if (!sectionsForSend.length) {
     if (!silent) SpreadsheetApp.getActive().toast('Нет данных для отправки скидок', MENU_NAME, 5);
     return;
@@ -2695,7 +3630,7 @@ function sendDiscountsEmails(options) {
   MailApp.sendEmail({
     to: to.join(','),
     cc: cc.join(','),
-    subject: `Сводка по скидкам на ${formatDateDDMMYYYY_(new Date())}`,
+    subject,
     htmlBody,
   });
 
@@ -2706,46 +3641,11 @@ function sendDiscountsEmails(options) {
   }
 }
 
-function scheduledUpdateDiscountsAndSend() {
-  fl2Log_('INFO', 'scheduledUpdateDiscountsAndSend: старт', '');
-  try {
-    updateDiscountsByPlan({ silent: true });
-    sendDiscountsEmails({ silent: true });
-    fl2Log_('INFO', 'scheduledUpdateDiscountsAndSend: успех', '');
-  } catch (e) {
-    const message = e && e.message ? e.message : String(e);
-    fl2Log_('ERROR', 'scheduledUpdateDiscountsAndSend: ошибка', message);
-    throw e;
-  }
-}
-
-function scheduledRunDailyReportsPipeline() {
-  fl2Log_('INFO', 'scheduledRunDailyReportsPipeline: старт', '');
-  const stages = [
-    { name: 'scheduledBuildForwardLoadAllBranchesAndSend', fn: scheduledBuildForwardLoadAllBranchesAndSend },
-    { name: 'scheduledBuildOverallForecastAndSend', fn: scheduledBuildOverallForecastAndSend },
-    { name: 'scheduledUpdateDiscountsAndSend', fn: scheduledUpdateDiscountsAndSend },
-  ];
-  const errors = [];
-
-  stages.forEach((stage) => {
-    fl2Log_('INFO', 'scheduledRunDailyReportsPipeline: старт этапа', stage.name);
-    try {
-      stage.fn();
-      fl2Log_('INFO', 'scheduledRunDailyReportsPipeline: этап завершен', stage.name);
-    } catch (e) {
-      const message = e && e.message ? e.message : String(e);
-      errors.push(`${stage.name}: ${message}`);
-      fl2Log_('ERROR', 'scheduledRunDailyReportsPipeline: ошибка этапа', `${stage.name}: ${message}`);
-    }
+function sendDiscountsEmails(options) {
+  return sendDiscountsEmailsByMode_({
+    targetMode: 'non_aggregators',
+    silent: options && options.silent,
   });
-
-  if (errors.length) {
-    const summary = `scheduledRunDailyReportsPipeline завершен с ошибками (${errors.length}): ${errors.join(' | ')}`;
-    fl2Log_('ERROR', 'scheduledRunDailyReportsPipeline: итог', summary);
-    throw new Error(summary);
-  }
-  fl2Log_('INFO', 'scheduledRunDailyReportsPipeline: итог', 'успех');
 }
 
 function buildDiscountsDigestHtmlBody_(sections, changeDiff, previousState, currentState) {
@@ -3053,6 +3953,7 @@ function parseClinicForecastSheet(data) {
   const pushRow = (category, horizon, reception, occupiedVal, loadVal, free, requests, cabinetType, primaryCount, freePP) => {
     const occupied = parseCombinedMetric(occupiedVal);
     const load = parseCombinedMetric(loadVal);
+    const primary = parseCombinedMetricOrSingle_(primaryCount);
     rows.push({
       category,
       branch,
@@ -3066,7 +3967,8 @@ function parseClinicForecastSheet(data) {
       free: parseLocaleNumber(free),
       freePP: parseLocaleNumber(freePP),
       requests: parseLocaleNumber(requests),
-      primaryCount: parseLocaleNumber(primaryCount),
+      primaryCount: primary.current,
+      primaryCountUsual: primary.usual,
     });
   };
 
@@ -3127,6 +4029,7 @@ function parseClinicForecastSheet(data) {
     if (currentCategory === 'doctor') {
       const occupied = parseCombinedMetric(row[2]);
       const load = parseCombinedMetric(row[4]);
+      const primary = parseCombinedMetricOrSingle_(row[8]);
       rows.push({
         category: currentCategory,
         branch,
@@ -3139,7 +4042,8 @@ function parseClinicForecastSheet(data) {
         free: parseLocaleNumber(row[5]),
         freePP: parseLocaleNumber(row[6]),
         requests: parseLocaleNumber(row[7]),
-        primaryCount: parseLocaleNumber(row[8]),
+        primaryCount: primary.current,
+        primaryCountUsual: primary.usual,
       });
       return;
     }
@@ -3158,6 +4062,10 @@ function parseCombinedMetric(value) {
     current: parseLocaleNumber(m[1]),
     usual: parseLocaleNumber(m[2]),
   };
+}
+
+function parseCombinedMetricOrSingle_(value) {
+  return parseCombinedMetric(value);
 }
 function parseLocaleNumber(value) {
   const normalized = str_(value).replace(/\s/g, '').replace(',', '.');
@@ -3318,7 +4226,7 @@ function renderOverallHorizonTable(sheet, row, clinicRows, horizonLabel, title) 
       `${round0(r.loadCur)} (${round0(r.loadUsual)})`,
       round1_(r.free),
       round1_(r.requests),
-      round1_(r.primaryCount),
+      formatMetricWithOptionalBaseline_(r.primaryCount, r.primaryCountUsual, true),
       round1_(r.freePP),
     ];
     sheet.getRange(row, 1, 1, columns).setValues([values]);
@@ -3334,6 +4242,7 @@ function renderOverallHorizonTable(sheet, row, clinicRows, horizonLabel, title) 
   const free = subset.reduce((a, r) => a + r.free, 0);
   const requests = subset.reduce((a, r) => a + r.requests, 0);
   const primaryCount = subset.reduce((a, r) => a + (r.primaryCount || 0), 0);
+  const primaryCountUsual = subset.reduce((a, r) => a + (r.primaryCountUsual || 0), 0);
   const freePP = subset.reduce((a, r) => a + r.freePP, 0);
   const totalValues = [
     'ИТОГО',
@@ -3342,7 +4251,7 @@ function renderOverallHorizonTable(sheet, row, clinicRows, horizonLabel, title) 
     `${round0(weightedCur)} (${round0(weightedUsual)})`,
     round1_(free),
     round1_(requests),
-    round1_(primaryCount),
+    formatMetricWithOptionalBaseline_(primaryCount, primaryCountUsual, true),
     round1_(freePP),
   ];
   sheet.getRange(row, 1, 1, columns).setValues([totalValues]);
@@ -3462,11 +4371,18 @@ function mergeCabinetTypeSummary_(summary) {
   return out;
 }
 
-function buildCabinetRowsByName_(currentDay, scheduleRows, requests) {
-  const c3 = computeCabinetByNameWindowMetrics_(currentDay, 3, scheduleRows, requests);
-  const c7 = computeCabinetByNameWindowMetrics_(currentDay, 7, scheduleRows, requests);
-  const b3 = computeCabinetByNameBaselineMetrics_(currentDay, 3, scheduleRows, requests);
-  const b7 = computeCabinetByNameBaselineMetrics_(currentDay, 7, scheduleRows, requests);
+function buildCabinetRowsByName_(currentDay, scheduleRows, requests, options) {
+  const opts = options || {};
+  const includeBaseline = opts.includeBaseline !== false;
+  const dailyBuckets = computeCabinetByNameDailyBuckets_(currentDay, 7, scheduleRows, requests);
+  const c3 = aggregateCabinetByNameDailyBuckets_(currentDay, 3, dailyBuckets);
+  const c7 = aggregateCabinetByNameDailyBuckets_(currentDay, 7, dailyBuckets);
+  const b3 = includeBaseline
+    ? computeCabinetByNameBaselineMetrics_(currentDay, 3, scheduleRows, requests)
+    : new Map();
+  const b7 = includeBaseline
+    ? computeCabinetByNameBaselineMetrics_(currentDay, 7, scheduleRows, requests)
+    : new Map();
   const keys = new Set([...c3.keys(), ...c7.keys(), ...b3.keys(), ...b7.keys()]);
   return [...keys].map((cabinet) => ({
     cabinet,
@@ -3513,8 +4429,13 @@ function buildCabinetRequestByNameIndex_(requests, startDate, endDate) {
 }
 
 function computeCabinetByNameWindowMetrics_(anchorDate, horizonDays, scheduleRows, requests) {
+  const dailyBuckets = computeCabinetByNameDailyBuckets_(anchorDate, horizonDays, scheduleRows, requests);
+  return aggregateCabinetByNameDailyBuckets_(anchorDate, horizonDays, dailyBuckets);
+}
+
+function computeCabinetByNameDailyBuckets_(anchorDate, maxHorizonDays, scheduleRows, requests) {
   const startDate = addDays(anchorDate, 1);
-  const endDate = addDays(anchorDate, horizonDays);
+  const endDate = addDays(anchorDate, maxHorizonDays);
   const scheduleIndex = buildCabinetScheduleByNameIndex_(scheduleRows);
   const requestIndex = buildCabinetRequestByNameIndex_(requests, startDate, endDate);
   const out = new Map();
@@ -3529,8 +4450,9 @@ function computeCabinetByNameWindowMetrics_(anchorDate, horizonDays, scheduleRow
     const occupied = mergeIntervals_(req.intervals);
     const occupiedWithinWork = intersectIntervals(occupied, workIntervals);
     const free = subtractIntervals(workIntervals, occupiedWithinWork);
-    if (!out.has(cabinet)) out.set(cabinet, emptyForwardMetric());
-    addForwardMetric(out.get(cabinet), {
+    if (!out.has(dKey)) out.set(dKey, []);
+    out.get(dKey).push({
+      cabinet,
       receptionMin: sumIntervalsMin(workIntervals),
       occupiedMin: sumIntervalsMin(occupiedWithinWork),
       freeMin: sumIntervalsMin(free),
@@ -3542,9 +4464,10 @@ function computeCabinetByNameWindowMetrics_(anchorDate, horizonDays, scheduleRow
 
   requestIndex.forEach((req, key) => {
     if (touched.has(key)) return;
-    const [, cabinet] = key.split('|');
-    if (!out.has(cabinet)) out.set(cabinet, emptyForwardMetric());
-    addForwardMetric(out.get(cabinet), {
+    const [dKey, cabinet] = key.split('|');
+    if (!out.has(dKey)) out.set(dKey, []);
+    out.get(dKey).push({
+      cabinet,
       receptionMin: 0,
       occupiedMin: sumIntervalsMin(mergeIntervals_(req.intervals)),
       freeMin: 0,
@@ -3557,68 +4480,48 @@ function computeCabinetByNameWindowMetrics_(anchorDate, horizonDays, scheduleRow
   return out;
 }
 
-function computeCabinetByNameBaselineMetrics_(currentDay, horizonDays, scheduleRows, requests) {
-  const scheduleIndex = buildCabinetScheduleByNameIndex_(scheduleRows);
-  const baselineRequests = (requests || []).map((r) => ({ ...r, status: isCompletedStatus(r.status) ? 'Запланирована' : r.status }));
-  const series = new Map();
-
-  for (let i = 1; i <= 42; i += 1) {
-    const ref = addDays(currentDay, -i);
-    if (ref.getDay() !== currentDay.getDay()) continue;
-    const startDate = addDays(ref, 1);
-    const endDate = addDays(ref, horizonDays);
-    const reqIndex = buildCabinetRequestByNameIndex_(baselineRequests, startDate, endDate);
-    const win = new Map();
-    const touched = new Set();
-
-    scheduleIndex.forEach((workIntervals, key) => {
-      const [dKey, cabinet] = key.split('|');
-      const day = toDate_(dKey);
-      if (!day || day < startDate || day > endDate) return;
-      const req = reqIndex.get(key) || { intervals: [], reqCount: 0 };
-      touched.add(key);
-      const occupied = mergeIntervals_(req.intervals);
-      const occupiedWithinWork = intersectIntervals(occupied, workIntervals);
-      const free = subtractIntervals(workIntervals, occupiedWithinWork);
-      if (!win.has(cabinet)) win.set(cabinet, emptyForwardMetric());
-      addForwardMetric(win.get(cabinet), {
-        receptionMin: sumIntervalsMin(workIntervals),
-        occupiedMin: sumIntervalsMin(occupiedWithinWork),
-        freeMin: sumIntervalsMin(free),
-        freePP: 0,
-        reqCount: req.reqCount,
-        primaryCount: 0,
-      });
-    });
-
-    reqIndex.forEach((req, key) => {
-      if (touched.has(key)) return;
-      const [, cabinet] = key.split('|');
-      if (!win.has(cabinet)) win.set(cabinet, emptyForwardMetric());
-      addForwardMetric(win.get(cabinet), {
-        receptionMin: 0,
-        occupiedMin: sumIntervalsMin(mergeIntervals_(req.intervals)),
-        freeMin: 0,
-        freePP: 0,
-        reqCount: req.reqCount,
-        primaryCount: 0,
-      });
-    });
-
-    win.forEach((m, cabinet) => {
-      if (!series.has(cabinet)) series.set(cabinet, []);
-      series.get(cabinet).push(m);
-    });
-  }
-
+function aggregateCabinetByNameDailyBuckets_(anchorDate, horizonDays, dailyBuckets) {
+  const startDate = addDays(anchorDate, 1);
+  const endDate = addDays(anchorDate, horizonDays);
   const out = new Map();
-  series.forEach((arr, cabinet) => {
-    const avg = emptyForwardMetric();
-    arr.forEach((m) => addForwardMetric(avg, m));
-    const n = arr.length || 1;
-    Object.keys(avg).forEach((k) => { avg[k] /= n; });
-    out.set(cabinet, avg);
+
+  (dailyBuckets || new Map()).forEach((entries, dKey) => {
+    const day = toDate_(dKey);
+    if (!day || day < startDate || day > endDate) return;
+    (entries || []).forEach((entry) => {
+      if (!out.has(entry.cabinet)) out.set(entry.cabinet, emptyForwardMetric());
+      addForwardMetric(out.get(entry.cabinet), entry);
+    });
   });
+
+  return out;
+}
+
+function computeCabinetByNameBaselineMetrics_(currentDay, horizonDays, scheduleRows, requests) {
+  const horizonLabel = Number(horizonDays) === 7 ? '7 дней' : '3 дня';
+  const index = loadArchiveBaselineIndex_();
+  const out = new Map();
+  const seen = new Set();
+
+  (scheduleRows || []).forEach((row) => {
+    const cabinet = str_(row['Кабинет']);
+    const branch = str_(row['Филиал']);
+    const type = detectCabinetType_(cabinet);
+    if (!cabinet || !branch || !type) return;
+    const key = `${branch}|${cabinet}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+
+    out.set(cabinet, getArchiveBaselineMetric_(index, {
+      category: 'physio',
+      branch,
+      object: cabinet,
+      horizon: horizonLabel,
+      reportDate: currentDay,
+      maxObservations: 6,
+    }));
+  });
+
   return out;
 }
 
@@ -3666,8 +4569,13 @@ function buildCabinetRequestIndex_(requests, startDate, endDate) {
 }
 
 function computeCabinetTypeWindowMetrics_(anchorDate, horizonDays, scheduleRows, requests) {
+  const dailyBuckets = computeCabinetTypeDailyBuckets_(anchorDate, horizonDays, scheduleRows, requests);
+  return aggregateCabinetTypeDailyBuckets_(anchorDate, horizonDays, dailyBuckets);
+}
+
+function computeCabinetTypeDailyBuckets_(anchorDate, maxHorizonDays, scheduleRows, requests) {
   const startDate = addDays(anchorDate, 1);
-  const endDate = addDays(anchorDate, horizonDays);
+  const endDate = addDays(anchorDate, maxHorizonDays);
   const scheduleIndex = buildCabinetScheduleIndex_(scheduleRows);
   const requestIndex = buildCabinetRequestIndex_(requests, startDate, endDate);
 
@@ -3684,110 +4592,94 @@ function computeCabinetTypeWindowMetrics_(anchorDate, horizonDays, scheduleRows,
     const occupiedWithinWork = intersectIntervals(occupied, workIntervals);
     const free = subtractIntervals(workIntervals, occupiedWithinWork);
 
-    const metric = {
+    if (!out.has(dKey)) out.set(dKey, []);
+    out.get(dKey).push({
+      type,
       receptionMin: sumIntervalsMin(workIntervals),
       occupiedMin: sumIntervalsMin(occupiedWithinWork),
       freeMin: sumIntervalsMin(free),
       freePP: 0,
       reqCount: req.reqCount,
       primaryCount: 0,
-    };
-    accumulateForward(out, type, metric, type, '');
+    });
   });
 
   requestIndex.forEach((req, key) => {
     if (touchedReq.has(key)) return;
-    const [, type] = key.split('|');
-    const occupied = mergeIntervals_(req.intervals);
-    const metric = {
+    const [dKey, type] = key.split('|');
+    if (!out.has(dKey)) out.set(dKey, []);
+    out.get(dKey).push({
+      type,
       receptionMin: 0,
-      occupiedMin: sumIntervalsMin(occupied),
+      occupiedMin: sumIntervalsMin(mergeIntervals_(req.intervals)),
       freeMin: 0,
       freePP: 0,
       reqCount: req.reqCount,
       primaryCount: 0,
-    };
-    accumulateForward(out, type, metric, type, '');
+    });
+  });
+
+  return out;
+}
+
+function aggregateCabinetTypeDailyBuckets_(anchorDate, horizonDays, dailyBuckets) {
+  const startDate = addDays(anchorDate, 1);
+  const endDate = addDays(anchorDate, horizonDays);
+  const out = new Map();
+
+  (dailyBuckets || new Map()).forEach((entries, dKey) => {
+    const day = toDate_(dKey);
+    if (!day || day < startDate || day > endDate) return;
+    (entries || []).forEach((entry) => {
+      accumulateForward(out, entry.type, entry, entry.type, '');
+    });
   });
 
   return out;
 }
 
 function computeCabinetTypeBaselineMetrics_(currentDay, horizonDays, scheduleRows, requests) {
-  const scheduleIndex = buildCabinetScheduleIndex_(scheduleRows);
-  const baselineRequests = (requests || []).map((r) => ({
-    ...r,
-    status: isCompletedStatus(r.status) ? 'Запланирована' : r.status,
-  }));
-
-  const series = new Map();
-  for (let i = 1; i <= 42; i += 1) {
-    const ref = addDays(currentDay, -i);
-    if (ref.getDay() !== currentDay.getDay()) continue;
-
-    const startDate = addDays(ref, 1);
-    const endDate = addDays(ref, horizonDays);
-    const reqIndex = buildCabinetRequestIndex_(baselineRequests, startDate, endDate);
-
-    const winByType = new Map();
-    const touchedReq = new Set();
-    scheduleIndex.forEach((workIntervals, key) => {
-      const [dKey, type] = key.split('|');
-      const day = toDate_(dKey);
-      if (!day || day < startDate || day > endDate) return;
-
-      const req = reqIndex.get(key) || { intervals: [], reqCount: 0 };
-      touchedReq.add(key);
-      const occupied = mergeIntervals_(req.intervals);
-      const occupiedWithinWork = intersectIntervals(occupied, workIntervals);
-      const free = subtractIntervals(workIntervals, occupiedWithinWork);
-      if (!winByType.has(type)) winByType.set(type, emptyForwardMetric());
-      addForwardMetric(winByType.get(type), {
-        receptionMin: sumIntervalsMin(workIntervals),
-        occupiedMin: sumIntervalsMin(occupiedWithinWork),
-        freeMin: sumIntervalsMin(free),
-        freePP: 0,
-        reqCount: req.reqCount,
-        primaryCount: 0,
-      });
-    });
-
-    reqIndex.forEach((req, key) => {
-      if (touchedReq.has(key)) return;
-      const [, type] = key.split('|');
-      if (!winByType.has(type)) winByType.set(type, emptyForwardMetric());
-      addForwardMetric(winByType.get(type), {
-        receptionMin: 0,
-        occupiedMin: sumIntervalsMin(mergeIntervals_(req.intervals)),
-        freeMin: 0,
-        freePP: 0,
-        reqCount: req.reqCount,
-        primaryCount: 0,
-      });
-    });
-
-    winByType.forEach((m, type) => {
-      if (!series.has(type)) series.set(type, []);
-      series.get(type).push(m);
-    });
-  }
-
+  const horizonLabel = Number(horizonDays) === 7 ? '7 дней' : '3 дня';
+  const index = loadArchiveBaselineIndex_();
   const out = new Map();
-  series.forEach((arr, type) => {
-    const n = arr.length || 1;
-    const avg = emptyForwardMetric();
-    arr.forEach((m) => addForwardMetric(avg, m));
-    Object.keys(avg).forEach((k) => { avg[k] /= n; });
-    out.set(type, avg);
+  const seen = new Set();
+
+  (scheduleRows || []).forEach((row) => {
+    const cabinet = str_(row['Кабинет']);
+    const branch = str_(row['Филиал']);
+    const type = detectCabinetType_(cabinet);
+    if (!cabinet || !branch || !type) return;
+    const key = `${branch}|${cabinet}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+
+    const metric = getArchiveBaselineMetric_(index, {
+      category: 'physio',
+      branch,
+      object: cabinet,
+      horizon: horizonLabel,
+      reportDate: currentDay,
+      maxObservations: 6,
+    });
+    if (!out.has(type)) out.set(type, emptyForwardMetric());
+    addForwardMetric(out.get(type), metric);
   });
+
   return out;
 }
 
-function buildCabinetTypeSummary_(currentDay, scheduleRows, requests) {
-  const c3 = computeCabinetTypeWindowMetrics_(currentDay, 3, scheduleRows, requests);
-  const c7 = computeCabinetTypeWindowMetrics_(currentDay, 7, scheduleRows, requests);
-  const b3 = computeCabinetTypeBaselineMetrics_(currentDay, 3, scheduleRows, requests);
-  const b7 = computeCabinetTypeBaselineMetrics_(currentDay, 7, scheduleRows, requests);
+function buildCabinetTypeSummary_(currentDay, scheduleRows, requests, options) {
+  const opts = options || {};
+  const includeBaseline = opts.includeBaseline !== false;
+  const dailyBuckets = computeCabinetTypeDailyBuckets_(currentDay, 7, scheduleRows, requests);
+  const c3 = aggregateCabinetTypeDailyBuckets_(currentDay, 3, dailyBuckets);
+  const c7 = aggregateCabinetTypeDailyBuckets_(currentDay, 7, dailyBuckets);
+  const b3 = includeBaseline
+    ? computeCabinetTypeBaselineMetrics_(currentDay, 3, scheduleRows, requests)
+    : new Map();
+  const b7 = includeBaseline
+    ? computeCabinetTypeBaselineMetrics_(currentDay, 7, scheduleRows, requests)
+    : new Map();
 
   const getSummary = (type) => ({
     c3: c3.get(type) ? c3.get(type).metrics : emptyForwardMetric(),
@@ -3877,22 +4769,10 @@ function renderOverallCabinetTypeTable_(sheet, row, clinicRows, title) {
   return row;
 }
 
-function getSourceGraphMaxCreatedAt_(graphSheet) {
-  if (!graphSheet) return new Date(0);
-  const graphRows = getSheetObjects_(graphSheet);
-  let sourceMaxGraphCreated = new Date(0);
-  graphRows.forEach((row) => {
-    const d = toDate_(row['Дата создания']);
-    if (d && d > sourceMaxGraphCreated) sourceMaxGraphCreated = d;
-  });
-  return sourceMaxGraphCreated;
-}
-
 function ensureDoctorScheduleFresh(ss) {
-  const graphSheet = ss.getSheetByName(SHEET_SCHEDULE_SOURCE);
   const doctorScheduleSheet = ss.getSheetByName(SHEET_DOCTOR_SCHEDULE);
-  if (!graphSheet || !doctorScheduleSheet) {
-    throw new Error('Проверьте наличие листов: График, Обработанный график');
+  if (!doctorScheduleSheet) {
+    throw new Error('Проверьте наличие листа: Обработанный график');
   }
   const builtAt = detectDoctorScheduleBuiltAtFallback(doctorScheduleSheet);
   if (!builtAt) {
@@ -3904,10 +4784,6 @@ function ensureDoctorScheduleFresh(ss) {
     }
     return ensureDoctorScheduleFresh(ss);
   }
-  const sourceMaxGraphCreated = getSourceGraphMaxCreatedAt_(graphSheet);
-  if (sourceMaxGraphCreated > builtAt) {
-    throw new Error(`"Обработанный график" неактуален (последняя сборка: ${formatDateTimeDDMMYYYY_(builtAt)}). Обновите его перед запуском.`);
-  }
 }
 
 function detectDoctorScheduleBuiltAtFallback(doctorScheduleSheet) {
@@ -3916,7 +4792,7 @@ function detectDoctorScheduleBuiltAtFallback(doctorScheduleSheet) {
   const marker = doctorScheduleSheet.getRange(lastRow, 1, 1, 10).getDisplayValues()[0];
   const markerKey = str_(marker[0]);
   const markerDate = toDate_(marker[8]);
-  if (markerKey !== '__SYSTEM_TIMESTAMP__' || !markerDate) return null;
+  if (markerKey !== FL2_SYSTEM_MARKER || !markerDate) return null;
   return markerDate;
 }
 function sendOverallForecastEmail(ss, reportPeriodLabel) {
@@ -4053,6 +4929,105 @@ function computeSheetDisplayHash_(sheet) {
   const serialized = JSON.stringify(values);
   const digest = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, serialized, Utilities.Charset.UTF_8);
   return digest.map((b) => (b + 256).toString(16).slice(-2)).join('');
+}
+
+function getArchiveSpreadsheet_() {
+  return SpreadsheetApp.openById(FL2_PLAN_ARCHIVE_SPREADSHEET_ID);
+}
+
+function toArchiveHorizonLabel_(value) {
+  const raw = str_(value).toLowerCase();
+  if (raw === '3 дня' || raw === '3') return '3 дня';
+  if (raw === '7 дней' || raw === '7') return '7 дней';
+  return '';
+}
+
+function toArchiveMetricFromRow_(row) {
+  const receptionHours = Number(str_(row['Приемные (ч)']).replace(',', '.')) || 0;
+  const occupiedHours = Number(str_(row['Занятые (ч) текущее']).replace(',', '.')) || 0;
+  const freeHours = Number(str_(row['Свободные (ч)']).replace(',', '.')) || 0;
+  const primaryCombined = parseCombinedMetricOrSingle_(row['Заявки на ПП (шт)']);
+  return {
+    receptionMin: receptionHours * 60,
+    occupiedMin: occupiedHours * 60,
+    freeMin: freeHours * 60,
+    reqCount: Number(str_(row['Заявки (шт)']).replace(',', '.')) || 0,
+    primaryCount: Number(primaryCombined.current) || 0,
+    freePP: Number(str_(row['Свободные слоты под ПП']).replace(',', '.')) || 0,
+  };
+}
+
+function archiveBaselineKey_(category, branch, objectName, horizon) {
+  return [str_(category), str_(branch), str_(objectName), toArchiveHorizonLabel_(horizon)].join('|');
+}
+
+function loadArchiveBaselineIndex_() {
+  if (FL2_ARCHIVE_BASELINE_CACHE && FL2_ARCHIVE_BASELINE_CACHE.index) return FL2_ARCHIVE_BASELINE_CACHE.index;
+
+  const timer = fl2StageTimer_();
+  const archive = getArchiveSpreadsheet_();
+  const index = new Map();
+
+  Object.keys(FL2_ARCHIVE_CATEGORY_SHEET_MAP).forEach((category) => {
+    const sheetName = FL2_ARCHIVE_CATEGORY_SHEET_MAP[category];
+    const sheet = archive.getSheetByName(sheetName);
+    if (!sheet) return;
+    const rows = getSheetObjectsDisplay_(sheet);
+    rows.forEach((row) => {
+      const rowType = str_(row['ТипСтроки']);
+      if (rowType !== 'Детализация') return;
+      const branch = str_(row['Филиал']);
+      const objectName = str_(row['Объект']);
+      const horizon = toArchiveHorizonLabel_(row['Горизонт']);
+      const reportDate = toDate_(row['ОтчетДата']);
+      if (!branch || !objectName || !horizon || !reportDate) return;
+
+      const key = archiveBaselineKey_(category, branch, objectName, horizon);
+      if (!index.has(key)) index.set(key, []);
+      index.get(key).push({
+        reportDate,
+        metric: toArchiveMetricFromRow_(row),
+      });
+    });
+  });
+
+  index.forEach((arr, key) => {
+    arr.sort((a, b) => b.reportDate.getTime() - a.reportDate.getTime());
+  });
+
+  FL2_ARCHIVE_BASELINE_CACHE = {
+    builtAt: new Date(),
+    index,
+  };
+  fl2Log_('INFO', 'Baseline архив: индекс построен', `keys=${index.size}, elapsedMs=${timer.ms()}`);
+  return index;
+}
+
+function getArchiveBaselineMetric_(index, params) {
+  const p = params || {};
+  const maxObs = Number(p.maxObservations) > 0 ? Number(p.maxObservations) : 6;
+  const key = archiveBaselineKey_(p.category, p.branch, p.object, p.horizon);
+  const arr = index && index.get(key) ? index.get(key) : [];
+  const reportDate = toDate_(p.reportDate);
+  const filtered = arr.filter((item) => !reportDate || item.reportDate.getTime() < reportDate.getTime());
+  const used = filtered.slice(0, maxObs);
+
+  const logPrefix = `cat=${str_(p.category)}, branch=${str_(p.branch)}, object=${str_(p.object)}, horizon=${str_(p.horizon)}`;
+  fl2Log_('INFO', 'Baseline архив: найдено наблюдений', `${logPrefix}, found=${filtered.length}, used=${used.length}`);
+  if (filtered.length < maxObs) {
+    fl2Log_('INFO', 'Baseline архив: наблюдений меньше лимита', `${logPrefix}, max=${maxObs}, found=${filtered.length}`);
+  }
+  if (!used.length) {
+    fl2Log_('INFO', 'Baseline архив: наблюдения отсутствуют', logPrefix);
+    return emptyForwardMetric();
+  }
+
+  const out = emptyForwardMetric();
+  used.forEach((item) => addForwardMetric(out, item.metric));
+  Object.keys(out).forEach((k) => {
+    out[k] /= used.length;
+  });
+  return out;
 }
 
 function archivePlanReportsDaily() {
@@ -4263,7 +5238,7 @@ function parsePlanDetailRowsForArchive_(data) {
     const load = parseCombinedMetric(row[3]);
     const free = parseLocaleNumber(row[4]);
     const requests = parseLocaleNumber(row[5]);
-    const primaryCount = parseLocaleNumber(row[6]);
+    const primaryCountCombined = parseCombinedMetricOrSingle_(row[6]);
     const freePP = parseLocaleNumber(row[7]);
     rows.push({
       category,
@@ -4277,7 +5252,8 @@ function parsePlanDetailRowsForArchive_(data) {
       loadUsual: load.usual,
       free,
       requests,
-      primaryCount,
+      primaryCount: primaryCountCombined.current,
+      primaryCountUsual: primaryCountCombined.usual,
       freePP,
     });
   });
@@ -4428,11 +5404,11 @@ function isPlannedStatus(status) {
 }
 
 function isAllowedProcessedRequestStatus(status) {
-  return isCompletedStatus(status) || isPlannedStatus(status);
+  return isPlannedStatus(status);
 }
 
 function isActivePlannedStatus(status) {
-  return isPlannedStatus(status) || isCompletedStatus(status);
+  return isPlannedStatus(status);
 }
 function toIntOrNull_(value) {
   if (value === '' || value === null || value === undefined) return null;
@@ -4441,35 +5417,142 @@ function toIntOrNull_(value) {
   return Math.trunc(num);
 }
 
-function computeRequestTiming_(startDate, endDate) {
-  if (!startDate || !endDate) {
-    return { startMin: null, endMin: null, durationMin: null };
-  }
-  const startMin = startDate.getHours() * 60 + startDate.getMinutes();
-  let endMin = endDate.getHours() * 60 + endDate.getMinutes();
-  let durationMin = endMin - startMin;
-  if (durationMin <= 0) {
-    durationMin += 24 * 60;
-    endMin = startMin + durationMin;
-  }
-  return { startMin, endMin, durationMin };
+function numOrZero_(value) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : 0;
 }
 
 function requestInterval(req) {
-  if (req && Number.isFinite(req.startMin) && Number.isFinite(req.durationMin) && req.durationMin > 0) {
-    return { start: req.startMin, end: req.startMin + req.durationMin };
-  }
-  if (req && Number.isFinite(req.startMin) && Number.isFinite(req.endMin) && req.endMin > req.startMin) {
-    return { start: req.startMin, end: req.endMin };
-  }
-  if (!req || !req.startDate || !req.endDate) {
+  if (!req) {
     return { start: 0, end: 1 };
   }
-  const timing = computeRequestTiming_(req.startDate, req.endDate);
-  if (!Number.isFinite(timing.startMin) || !Number.isFinite(timing.durationMin) || timing.durationMin <= 0) {
+  const start = req.startMin !== undefined ? toIntOrNull_(req.startMin) : parseTimeToMinutes_(req.startTime || req['Время начала']);
+  const end = req.endMin !== undefined ? toIntOrNull_(req.endMin) : parseTimeToMinutes_(req.endTime || req['Время окончания']);
+  if (start === null || end === null || end <= start) {
     return { start: 0, end: 1 };
   }
-  return { start: timing.startMin, end: timing.startMin + timing.durationMin };
+  return { start, end };
+}
+
+function applyProcessedRequestsIntervalColumnFormat_(sheet, headers) {
+  if (!sheet || !Array.isArray(headers) || !headers.length) return;
+  const dateHeaders = ['Дата'];
+  const timeHeaders = ['Время начала', 'Время окончания'];
+  const dataRowCount = Math.max(1, sheet.getMaxRows() - 1);
+  dateHeaders.forEach((header) => {
+    const colIdx = headers.indexOf(header);
+    if (colIdx < 0) return;
+    const columnRange = sheet.getRange(2, colIdx + 1, dataRowCount, 1);
+    columnRange.clearFormat();
+    columnRange.setNumberFormat('@');
+  });
+  timeHeaders.forEach((header) => {
+    const colIdx = headers.indexOf(header);
+    if (colIdx < 0) return;
+    const columnRange = sheet.getRange(2, colIdx + 1, dataRowCount, 1);
+    columnRange.clearFormat();
+    columnRange.setNumberFormat('@');
+  });
+}
+
+function splitRequestDateTimeParts_(startDisplay, endDisplay, startRaw, endRaw) {
+  const start = extractDateTimeTokenParts_(startDisplay) || extractDateTimeTokenParts_(startRaw);
+  const end = extractDateTimeTokenParts_(endDisplay) || extractDateTimeTokenParts_(endRaw);
+  if (!start || !end || !start.dateText || !start.timeText || !end.timeText) {
+    return { date: '', startTime: '', endTime: '' };
+  }
+  return {
+    date: start.dateText,
+    startTime: start.timeText,
+    endTime: end.timeText,
+  };
+}
+
+function normalizeRequestIntervalParts_(row, startDateRaw, endDateRaw) {
+  const startExtracted = extractDateTimeTokenParts_(row['ДатаНачала']);
+  const endExtracted = extractDateTimeTokenParts_(row['ДатаОкончания']);
+  const dayKey = parseLocalDayKey_(row['Дата'])
+    || (startExtracted && startExtracted.dayKey)
+    || parseLocalDayKey_(startDateRaw);
+  const startCandidate = row['Время начала'] !== undefined && row['Время начала'] !== null && row['Время начала'] !== ''
+    ? row['Время начала']
+    : (startExtracted && startExtracted.timeText ? startExtracted.timeText : '');
+  const endCandidate = row['Время окончания'] !== undefined && row['Время окончания'] !== null && row['Время окончания'] !== ''
+    ? row['Время окончания']
+    : (endExtracted && endExtracted.timeText ? endExtracted.timeText : '');
+
+  const startMin = parseTimeToMinutes_(startCandidate);
+  const endMin = parseTimeToMinutes_(endCandidate);
+
+  if (!dayKey || startMin === null || endMin === null) {
+    return { dayKey, startMin, endMin, startTime: str_(startCandidate), endTime: str_(endCandidate), dateText: dayKeyToDateText_(dayKey), error: 'Не удалось определить Дату/Время начала/Время окончания' };
+  }
+  if (endMin <= startMin) {
+    return {
+      dayKey,
+      startMin,
+      endMin,
+      startTime: minutesToTimeString_(startMin),
+      endTime: minutesToTimeString_(endMin),
+      dateText: dayKeyToDateText_(dayKey),
+      error: `Время окончания (${minutesToTimeString_(endMin)}) <= времени начала (${minutesToTimeString_(startMin)})`,
+    };
+  }
+  const startDayKey = (startExtracted && startExtracted.dayKey) || parseLocalDayKey_(startDateRaw);
+  const endDayKey = (endExtracted && endExtracted.dayKey) || parseLocalDayKey_(endDateRaw);
+  if (startDayKey && endDayKey && startDayKey !== endDayKey) {
+    return {
+      dayKey,
+      startMin,
+      endMin,
+      startTime: minutesToTimeString_(startMin),
+      endTime: minutesToTimeString_(endMin),
+      dateText: dayKeyToDateText_(dayKey),
+      error: `Интервал выходит за границы суток (${formatDateDDMMYYYY_(startDateRaw)} ${minutesToTimeString_(startMin)} -> ${formatDateDDMMYYYY_(endDateRaw)} ${minutesToTimeString_(endMin)})`,
+    };
+  }
+
+  return {
+    dayKey,
+    startMin,
+    endMin,
+    startTime: minutesToTimeString_(startMin),
+    endTime: minutesToTimeString_(endMin),
+    dateText: dayKeyToDateText_(dayKey),
+    error: '',
+  };
+}
+
+function extractDateTimeTokenParts_(value) {
+  const text = str_(value);
+  if (text) {
+    const dateMatch = text.match(/(\d{1,2})\.(\d{1,2})\.(\d{4})/);
+    const timeMatch = text.match(/(\d{1,2}):(\d{2})/);
+    if (dateMatch && timeMatch) {
+      const day = Number(dateMatch[1]);
+      const month = Number(dateMatch[2]);
+      const year = Number(dateMatch[3]);
+      const hh = Number(timeMatch[1]);
+      const mm = Number(timeMatch[2]);
+      if (day >= 1 && day <= 31 && month >= 1 && month <= 12 && hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) {
+        const dayKey = `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+        return {
+          dateText: `${String(day).padStart(2, '0')}.${String(month).padStart(2, '0')}.${String(year).padStart(4, '0')}`,
+          dayKey,
+          timeText: `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`,
+        };
+      }
+    }
+  }
+
+  const date = toDate_(value);
+  if (!date) return null;
+  const dayKey = parseLocalDayKey_(date);
+  return {
+    dateText: dayKeyToDateText_(dayKey),
+    dayKey,
+    timeText: Utilities.formatDate(date, FL2_TIMEZONE, 'HH:mm'),
+  };
 }
 function sumIntervalsMin(intervals) {
   return intervals.reduce((acc, i) => acc + (i.end - i.start), 0);
