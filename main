@@ -766,13 +766,13 @@ function formatReportPeriodLabel_(startDate, endDate) {
   return `${formatDateDDMMYYYY_(start)} (${getWeekdayNameRu_(start)}) - ${formatDateDDMMYYYY_(end)} (${getWeekdayNameRu_(end)})`;
 }
 
-function computeReportPeriodFromReferenceMoment_(referenceMoment) {
+function computeReportPeriodFromReferenceMoment_(referenceMoment, baseDayDate) {
   const timestamp = toDate_(referenceMoment);
   if (!timestamp) return null;
-  const referenceDate = normalizeDateToTimezoneStart_(timestamp);
+  const referenceDate = normalizeDateToTimezoneStart_(baseDayDate || timestamp);
   if (!referenceDate) return null;
   const referenceHour = Number(Utilities.formatDate(timestamp, FL2_TIMEZONE, 'H'));
-  const startDate = referenceHour >= REPORT_PERIOD_ROLLOVER_HOUR ? addDays(referenceDate, 1) : referenceDate;
+  const startDate = referenceHour > REPORT_PERIOD_ROLLOVER_HOUR ? addDays(referenceDate, 1) : referenceDate;
   const endDate = addDays(startDate, 6);
   return {
     referenceMoment: timestamp,
@@ -1673,7 +1673,7 @@ function prepareForwardLoadInput_(ss, options) {
   if (!currentDayKey || !currentDay || Number.isNaN(currentDay.getTime())) {
     throw new Error('Не найдены выполненные заявки для определения CurrentDate');
   }
-  const reportPeriod = computeReportPeriodFromReferenceMoment_(currentDay);
+  const reportPeriod = computeReportPeriodFromReferenceMoment_(new Date(), currentDay);
 
   const anchorDayKey = reportPeriod && reportPeriod.anchorDate
     ? parseLocalDayKey_(reportPeriod.anchorDate)
