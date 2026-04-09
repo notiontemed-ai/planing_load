@@ -1687,7 +1687,7 @@ function buildForwardLoadReportForBranch_(ss, selectedBranch, prep, options) {
   });
 
   const renderTimer = fl2StageTimer_();
-  renderForwardLoadSheet(ss, anchorDay, prep.reportPeriod, branchName, rowsBranch, doctorRows, massageSummary, ftSummary, cabinetSummary, massageRows, ftRows, cabinetRows, {
+  renderForwardLoadSheet(ss, anchorDay, prep.reportPeriod, branchName, rowsBranch, rowsDoctor, massageSummary, ftSummary, cabinetSummary, massageRows, ftRows, cabinetRows, {
     includeBaseline,
   });
   stage('branch: renderForwardLoadSheet done', `rowsBranch=${rowsBranch.length}, rowsDoctor=${rowsDoctor.length}`, renderTimer);
