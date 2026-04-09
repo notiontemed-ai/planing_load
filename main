@@ -1896,27 +1896,37 @@ function buildForwardLoadReportForBranch_(ss, selectedBranch, prep, options) {
     ].join(', ')
   );
 
+  const currentDailyDoctorTimer = fl2StageTimer_();
+  const currentDailyDoctorBuckets = computeWindowDailyBuckets_(anchorDayKey, 7, doctorScheduleByDoctorDay, latestRequests);
+  stage('branch: computeWindowDailyBuckets_(7) done', `days=${currentDailyDoctorBuckets.size}`, currentDailyDoctorTimer);
+  tick();
+
   const h3Timer = fl2StageTimer_();
-  const horizon3 = computeWindowMetrics(anchorDayKey, 3, doctorScheduleByDoctorDay, latestRequests);
-  stage('branch: computeWindowMetrics(3) done', `byBranch=${horizon3.byBranch.size}, byDoctor=${horizon3.byDoctor.size}`, h3Timer);
+  const horizon3 = aggregateWindowMetricsFromDailyBuckets_(anchorDayKey, 3, currentDailyDoctorBuckets);
+  stage('branch: aggregateWindowMetricsFromDailyBuckets_(3) done', `byBranch=${horizon3.byBranch.size}, byDoctor=${horizon3.byDoctor.size}`, h3Timer);
   tick();
 
   const h7Timer = fl2StageTimer_();
-  const horizon7 = computeWindowMetrics(anchorDayKey, 7, doctorScheduleByDoctorDay, latestRequests);
-  stage('branch: computeWindowMetrics(7) done', `byBranch=${horizon7.byBranch.size}, byDoctor=${horizon7.byDoctor.size}`, h7Timer);
+  const horizon7 = aggregateWindowMetricsFromDailyBuckets_(anchorDayKey, 7, currentDailyDoctorBuckets);
+  stage('branch: aggregateWindowMetricsFromDailyBuckets_(7) done', `byBranch=${horizon7.byBranch.size}, byDoctor=${horizon7.byDoctor.size}`, h7Timer);
   tick();
 
   let baseline3;
   let baseline7;
 
+  const currentDailyAllTimer = fl2StageTimer_();
+  const currentDailyAllBuckets = computeWindowDailyBuckets_(anchorDayKey, 7, scheduleByDoctorDay, latestRequests, { includeAllNomenclature: true });
+  stage('branch: computeWindowDailyBuckets_(7, all nomenclature) done', `days=${currentDailyAllBuckets.size}`, currentDailyAllTimer);
+  tick();
+
   const h3AllTimer = fl2StageTimer_();
-  const horizon3All = computeWindowMetrics(anchorDayKey, 3, scheduleByDoctorDay, latestRequests, { includeAllNomenclature: true });
-  stage('branch: computeWindowMetrics(3, all nomenclature) done', `byBranch=${horizon3All.byBranch.size}, byDoctor=${horizon3All.byDoctor.size}`, h3AllTimer);
+  const horizon3All = aggregateWindowMetricsFromDailyBuckets_(anchorDayKey, 3, currentDailyAllBuckets);
+  stage('branch: aggregateWindowMetricsFromDailyBuckets_(3, all nomenclature) done', `byBranch=${horizon3All.byBranch.size}, byDoctor=${horizon3All.byDoctor.size}`, h3AllTimer);
   tick();
 
   const h7AllTimer = fl2StageTimer_();
-  const horizon7All = computeWindowMetrics(anchorDayKey, 7, scheduleByDoctorDay, latestRequests, { includeAllNomenclature: true });
-  stage('branch: computeWindowMetrics(7, all nomenclature) done', `byBranch=${horizon7All.byBranch.size}, byDoctor=${horizon7All.byDoctor.size}`, h7AllTimer);
+  const horizon7All = aggregateWindowMetricsFromDailyBuckets_(anchorDayKey, 7, currentDailyAllBuckets);
+  stage('branch: aggregateWindowMetricsFromDailyBuckets_(7, all nomenclature) done', `byBranch=${horizon7All.byBranch.size}, byDoctor=${horizon7All.byDoctor.size}`, h7AllTimer);
   tick();
 
   let baseline3All;
@@ -2616,6 +2626,125 @@ function computeWindowMetrics(anchorDayKey, horizonDays, scheduleByDoctorDay, re
     accumulateForward(byBranch, branch, { receptionMin, occupiedMin, freeMin, freePP, reqCount: req.reqCount, primaryCount: req.primaryCount }, branch, '');
     accumulateForward(byDoctor, `${branch}|${doctor}`, { receptionMin, occupiedMin, freeMin, freePP, reqCount: req.reqCount, primaryCount: req.primaryCount }, branch, doctor);
   });
+  return { byBranch, byDoctor };
+}
+
+function computeWindowDailyBuckets_(anchorDayKey, maxHorizonDays, scheduleByDoctorDay, requests, options) {
+  const startDayKey = addDaysToDayKey_(anchorDayKey, 1);
+  const endDayKey = addDaysToDayKey_(anchorDayKey, maxHorizonDays);
+  const includeAllNomenclature = Boolean(options && options.includeAllNomenclature);
+  const dailyBuckets = new Map();
+
+  const scheduleKeysInWindow = new Set();
+  scheduleByDoctorDay.forEach((_, key) => {
+    const [dKey] = key.split('|');
+    if (!isDayKeyInRangeInclusive_(dKey, startDayKey, endDayKey)) return;
+    scheduleKeysInWindow.add(key);
+  });
+
+  const requestIndex = new Map();
+  requests.forEach((r) => {
+    if (!isActivePlannedStatus(r.status)) return;
+    if (!includeAllNomenclature && !r.isDoctorVisit) return;
+    const requestDayKey = str_(r.dayKey);
+    if (!isDayKeyInRangeInclusive_(requestDayKey, startDayKey, endDayKey)) return;
+    const key = `${requestDayKey}|${r.branch}|${r.doctor}`;
+    if (!scheduleKeysInWindow.has(key)) {
+      if (str_(r.doctor) === FL2_DEBUG_TRACE_DOCTOR && str_(r.branch) === FL2_DEBUG_TRACE_BRANCH) {
+        fl2DebugTrace_('DEBUG computeWindowMetrics request_without_schedule_key', {
+          branch: r.branch,
+          doctor: r.doctor,
+          key,
+          requestId: r.id,
+          status: r.status,
+          dayKey: requestDayKey,
+        });
+      }
+      return;
+    }
+    if (!requestIndex.has(key)) requestIndex.set(key, { intervals: [], reqCount: 0, primaryCount: 0 });
+    const entry = requestIndex.get(key);
+    entry.intervals.push(requestInterval(r));
+    entry.reqCount += 1;
+    if (r.isPrimary) entry.primaryCount += 1;
+  });
+
+  scheduleByDoctorDay.forEach((intervals, key) => {
+    const [dKey, branch, doctor] = key.split('|');
+    if (!isDayKeyInRangeInclusive_(dKey, startDayKey, endDayKey)) return;
+
+    const req = requestIndex.get(key) || { intervals: [], reqCount: 0, primaryCount: 0 };
+    const reception = mergeIntervals_(intervals.filter((i) => i.type === 'Приемные часы'));
+    const nonReception = mergeIntervals_(intervals.filter((i) => i.type !== 'Приемные часы'));
+    const occupied = mergeIntervals_(req.intervals);
+    const occupiedWithinReception = intersectIntervals(occupied, reception);
+    const occupiedWithinNonReception = intersectIntervals(occupied, nonReception);
+    const nonReceptionOccupiedMin = sumIntervalsMin(occupiedWithinNonReception);
+
+    if (!reception.length && nonReceptionOccupiedMin <= 0) return;
+
+    const free = subtractIntervals(reception, occupiedWithinReception);
+    const metric = {
+      receptionMin: sumIntervalsMin(reception) + nonReceptionOccupiedMin,
+      occupiedMin: sumIntervalsMin(occupiedWithinReception) + nonReceptionOccupiedMin,
+      freeMin: sumIntervalsMin(free),
+      freePP: free.reduce((acc, i) => acc + Math.floor((i.end - i.start) / 60), 0),
+      reqCount: req.reqCount,
+      primaryCount: req.primaryCount,
+    };
+
+    if (doctor === FL2_DEBUG_TRACE_DOCTOR && branch === FL2_DEBUG_TRACE_BRANCH) {
+      fl2DebugTrace_('DEBUG computeWindowMetrics doctor day', {
+        branch,
+        doctor,
+        key,
+        receptionIntervals: reception,
+        nonReceptionIntervals: nonReception,
+        requestIntervalsRaw: req.intervals,
+        occupiedMerged: occupied,
+        occupiedWithinReception,
+        occupiedWithinNonReception,
+        freeIntervals: free,
+        receptionMin: metric.receptionMin,
+        occupiedMin: metric.occupiedMin,
+        freeMin: metric.freeMin,
+        freePP: metric.freePP,
+        reqCount: req.reqCount,
+        primaryCount: req.primaryCount,
+      });
+      if (req.reqCount > 0 && sumIntervalsMin(occupiedWithinReception) === 0) {
+        fl2DebugTrace_('DEBUG computeWindowMetrics request_not_mapped_to_reception', {
+          branch,
+          doctor,
+          key,
+          reqCount: req.reqCount,
+          requestIntervalsRaw: req.intervals,
+          receptionIntervals: reception,
+        });
+      }
+    }
+
+    if (!dailyBuckets.has(dKey)) dailyBuckets.set(dKey, []);
+    dailyBuckets.get(dKey).push({ branch, doctor, metric });
+  });
+
+  return dailyBuckets;
+}
+
+function aggregateWindowMetricsFromDailyBuckets_(anchorDayKey, horizonDays, dailyBuckets) {
+  const startDayKey = addDaysToDayKey_(anchorDayKey, 1);
+  const endDayKey = addDaysToDayKey_(anchorDayKey, horizonDays);
+  const byBranch = new Map();
+  const byDoctor = new Map();
+
+  (dailyBuckets || new Map()).forEach((entries, dKey) => {
+    if (!isDayKeyInRangeInclusive_(dKey, startDayKey, endDayKey)) return;
+    (entries || []).forEach((entry) => {
+      accumulateForward(byBranch, entry.branch, entry.metric, entry.branch, '');
+      accumulateForward(byDoctor, `${entry.branch}|${entry.doctor}`, entry.metric, entry.branch, entry.doctor);
+    });
+  });
+
   return { byBranch, byDoctor };
 }
 
@@ -4246,8 +4375,9 @@ function mergeCabinetTypeSummary_(summary) {
 function buildCabinetRowsByName_(currentDay, scheduleRows, requests, options) {
   const opts = options || {};
   const includeBaseline = opts.includeBaseline !== false;
-  const c3 = computeCabinetByNameWindowMetrics_(currentDay, 3, scheduleRows, requests);
-  const c7 = computeCabinetByNameWindowMetrics_(currentDay, 7, scheduleRows, requests);
+  const dailyBuckets = computeCabinetByNameDailyBuckets_(currentDay, 7, scheduleRows, requests);
+  const c3 = aggregateCabinetByNameDailyBuckets_(currentDay, 3, dailyBuckets);
+  const c7 = aggregateCabinetByNameDailyBuckets_(currentDay, 7, dailyBuckets);
   const b3 = includeBaseline
     ? computeCabinetByNameBaselineMetrics_(currentDay, 3, scheduleRows, requests)
     : new Map();
@@ -4300,8 +4430,13 @@ function buildCabinetRequestByNameIndex_(requests, startDate, endDate) {
 }
 
 function computeCabinetByNameWindowMetrics_(anchorDate, horizonDays, scheduleRows, requests) {
+  const dailyBuckets = computeCabinetByNameDailyBuckets_(anchorDate, horizonDays, scheduleRows, requests);
+  return aggregateCabinetByNameDailyBuckets_(anchorDate, horizonDays, dailyBuckets);
+}
+
+function computeCabinetByNameDailyBuckets_(anchorDate, maxHorizonDays, scheduleRows, requests) {
   const startDate = addDays(anchorDate, 1);
-  const endDate = addDays(anchorDate, horizonDays);
+  const endDate = addDays(anchorDate, maxHorizonDays);
   const scheduleIndex = buildCabinetScheduleByNameIndex_(scheduleRows);
   const requestIndex = buildCabinetRequestByNameIndex_(requests, startDate, endDate);
   const out = new Map();
@@ -4316,8 +4451,9 @@ function computeCabinetByNameWindowMetrics_(anchorDate, horizonDays, scheduleRow
     const occupied = mergeIntervals_(req.intervals);
     const occupiedWithinWork = intersectIntervals(occupied, workIntervals);
     const free = subtractIntervals(workIntervals, occupiedWithinWork);
-    if (!out.has(cabinet)) out.set(cabinet, emptyForwardMetric());
-    addForwardMetric(out.get(cabinet), {
+    if (!out.has(dKey)) out.set(dKey, []);
+    out.get(dKey).push({
+      cabinet,
       receptionMin: sumIntervalsMin(workIntervals),
       occupiedMin: sumIntervalsMin(occupiedWithinWork),
       freeMin: sumIntervalsMin(free),
@@ -4329,15 +4465,33 @@ function computeCabinetByNameWindowMetrics_(anchorDate, horizonDays, scheduleRow
 
   requestIndex.forEach((req, key) => {
     if (touched.has(key)) return;
-    const [, cabinet] = key.split('|');
-    if (!out.has(cabinet)) out.set(cabinet, emptyForwardMetric());
-    addForwardMetric(out.get(cabinet), {
+    const [dKey, cabinet] = key.split('|');
+    if (!out.has(dKey)) out.set(dKey, []);
+    out.get(dKey).push({
+      cabinet,
       receptionMin: 0,
       occupiedMin: sumIntervalsMin(mergeIntervals_(req.intervals)),
       freeMin: 0,
       freePP: 0,
       reqCount: req.reqCount,
       primaryCount: 0,
+    });
+  });
+
+  return out;
+}
+
+function aggregateCabinetByNameDailyBuckets_(anchorDate, horizonDays, dailyBuckets) {
+  const startDate = addDays(anchorDate, 1);
+  const endDate = addDays(anchorDate, horizonDays);
+  const out = new Map();
+
+  (dailyBuckets || new Map()).forEach((entries, dKey) => {
+    const day = toDate_(dKey);
+    if (!day || day < startDate || day > endDate) return;
+    (entries || []).forEach((entry) => {
+      if (!out.has(entry.cabinet)) out.set(entry.cabinet, emptyForwardMetric());
+      addForwardMetric(out.get(entry.cabinet), entry);
     });
   });
 
@@ -4416,8 +4570,13 @@ function buildCabinetRequestIndex_(requests, startDate, endDate) {
 }
 
 function computeCabinetTypeWindowMetrics_(anchorDate, horizonDays, scheduleRows, requests) {
+  const dailyBuckets = computeCabinetTypeDailyBuckets_(anchorDate, horizonDays, scheduleRows, requests);
+  return aggregateCabinetTypeDailyBuckets_(anchorDate, horizonDays, dailyBuckets);
+}
+
+function computeCabinetTypeDailyBuckets_(anchorDate, maxHorizonDays, scheduleRows, requests) {
   const startDate = addDays(anchorDate, 1);
-  const endDate = addDays(anchorDate, horizonDays);
+  const endDate = addDays(anchorDate, maxHorizonDays);
   const scheduleIndex = buildCabinetScheduleIndex_(scheduleRows);
   const requestIndex = buildCabinetRequestIndex_(requests, startDate, endDate);
 
@@ -4434,30 +4593,47 @@ function computeCabinetTypeWindowMetrics_(anchorDate, horizonDays, scheduleRows,
     const occupiedWithinWork = intersectIntervals(occupied, workIntervals);
     const free = subtractIntervals(workIntervals, occupiedWithinWork);
 
-    const metric = {
+    if (!out.has(dKey)) out.set(dKey, []);
+    out.get(dKey).push({
+      type,
       receptionMin: sumIntervalsMin(workIntervals),
       occupiedMin: sumIntervalsMin(occupiedWithinWork),
       freeMin: sumIntervalsMin(free),
       freePP: 0,
       reqCount: req.reqCount,
       primaryCount: 0,
-    };
-    accumulateForward(out, type, metric, type, '');
+    });
   });
 
   requestIndex.forEach((req, key) => {
     if (touchedReq.has(key)) return;
-    const [, type] = key.split('|');
-    const occupied = mergeIntervals_(req.intervals);
-    const metric = {
+    const [dKey, type] = key.split('|');
+    if (!out.has(dKey)) out.set(dKey, []);
+    out.get(dKey).push({
+      type,
       receptionMin: 0,
-      occupiedMin: sumIntervalsMin(occupied),
+      occupiedMin: sumIntervalsMin(mergeIntervals_(req.intervals)),
       freeMin: 0,
       freePP: 0,
       reqCount: req.reqCount,
       primaryCount: 0,
-    };
-    accumulateForward(out, type, metric, type, '');
+    });
+  });
+
+  return out;
+}
+
+function aggregateCabinetTypeDailyBuckets_(anchorDate, horizonDays, dailyBuckets) {
+  const startDate = addDays(anchorDate, 1);
+  const endDate = addDays(anchorDate, horizonDays);
+  const out = new Map();
+
+  (dailyBuckets || new Map()).forEach((entries, dKey) => {
+    const day = toDate_(dKey);
+    if (!day || day < startDate || day > endDate) return;
+    (entries || []).forEach((entry) => {
+      accumulateForward(out, entry.type, entry, entry.type, '');
+    });
   });
 
   return out;
@@ -4496,8 +4672,9 @@ function computeCabinetTypeBaselineMetrics_(currentDay, horizonDays, scheduleRow
 function buildCabinetTypeSummary_(currentDay, scheduleRows, requests, options) {
   const opts = options || {};
   const includeBaseline = opts.includeBaseline !== false;
-  const c3 = computeCabinetTypeWindowMetrics_(currentDay, 3, scheduleRows, requests);
-  const c7 = computeCabinetTypeWindowMetrics_(currentDay, 7, scheduleRows, requests);
+  const dailyBuckets = computeCabinetTypeDailyBuckets_(currentDay, 7, scheduleRows, requests);
+  const c3 = aggregateCabinetTypeDailyBuckets_(currentDay, 3, dailyBuckets);
+  const c7 = aggregateCabinetTypeDailyBuckets_(currentDay, 7, dailyBuckets);
   const b3 = includeBaseline
     ? computeCabinetTypeBaselineMetrics_(currentDay, 3, scheduleRows, requests)
     : new Map();
