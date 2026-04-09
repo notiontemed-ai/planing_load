@@ -887,6 +887,7 @@ var FL2_PROP_FORWARD_BATCH_LOCK_OWNER = 'FL2_PROP_FORWARD_BATCH_LOCK_OWNER';
 var FL2_BATCH_MAX_RUN_MS = 120000;
 var FL2_BATCH_MAX_BRANCHES_PER_RUN = 1;
 var FL2_ENABLE_LOG = false;
+var FL2_ENABLE_TRIGGER_LOG = true;
 var FL2_PLAN_ARCHIVE_SPREADSHEET_ID = '1w9PLSlkxbJX6kigWtxYZElTyCLTM1ceDriA29yeFBgc';
 var FL2_TIMEZONE = 'Europe/Moscow';
 var FL2_ARCHIVE_CATEGORY_SHEET_MAP = {
@@ -899,6 +900,10 @@ var FL2_ARCHIVE_BASELINE_CACHE = null;
 
 function fl2Log_(level, message, details) {
   if (!FL2_ENABLE_LOG) return;
+  fl2AppendLogRow_(level, message, details);
+}
+
+function fl2AppendLogRow_(level, message, details) {
   try {
     const ss = SpreadsheetApp.getActive();
     const sheet = getOrCreateSheet_(ss, SHEET_REPORT_LOG);
@@ -912,6 +917,11 @@ function fl2Log_(level, message, details) {
   } catch (e) {
     // намеренно игнорируем ошибки логирования, чтобы не ломать основной сценарий
   }
+}
+
+function fl2TriggerLog_(level, message, details) {
+  if (!FL2_ENABLE_TRIGGER_LOG) return;
+  fl2AppendLogRow_(level || 'INFO', `[TRIGGER] ${message || ''}`, details || '');
 }
 
 function fl2StateSummary_(state) {
@@ -972,6 +982,73 @@ function buildForwardLoadReportAllBranches() {
   const sendAnswer = ui.alert('Пакетный план по клиникам', 'После завершения очереди отправить письма автоматически?', ui.ButtonSet.YES_NO);
   const sendEmails = sendAnswer === ui.Button.YES;
   runForwardLoadReportAllBranchesCore_({ sendEmails, currentDay: prep.currentDay });
+}
+
+function runForwardLoadReportsDirect_(options) {
+  const opts = options || {};
+  const ss = SpreadsheetApp.getActive();
+  const sendEmails = opts.sendEmails === true;
+  const includeBaseline = opts.includeBaseline !== false;
+
+  const doctorScheduleSheet = ss.getSheetByName(SHEET_DOCTOR_SCHEDULE);
+  const processedRequestsSheet = ss.getSheetByName(SHEET_PROCESSED_REQUESTS);
+  if (!doctorScheduleSheet || !processedRequestsSheet) {
+    throw new Error('Проверьте наличие листов: Обработанный график, Обработанные заявки');
+  }
+  ensureDoctorScheduleFresh(ss);
+
+  const builtAt = detectDoctorScheduleBuiltAtFallback(doctorScheduleSheet);
+  const graphSheet = ss.getSheetByName(SHEET_SCHEDULE_SOURCE);
+  const sourceMaxGraphCreated = graphSheet ? getSourceGraphMaxCreatedAt_(graphSheet) : new Date(0);
+  if (!builtAt) {
+    throw new Error('Сначала сформируйте лист "Обработанный график" (в последней строке нет системного timestamp)');
+  }
+  if (sourceMaxGraphCreated > builtAt) {
+    throw new Error(`"Обработанный график" неактуален по timestamp (последняя сборка: ${formatDateTimeDDMMYYYY_(builtAt)}). Обновите его перед запуском.`);
+  }
+
+  const prep = prepareForwardLoadInput_(ss, { persistUnassigned: false });
+  const currentDay = opts.currentDay ? new Date(Number(opts.currentDay)) : prep.currentDay;
+  const branches = prep.branches || [];
+  const errors = [];
+
+  const sharedExcluded = prep.excludedEmployees;
+  const sharedRegistry = { allowed: prep.allowedEmployees, unassignedFound: prep.unassignedEmployees };
+  const sharedDoctorsSet = prep.doctorsSet;
+  const sharedMassageSet = prep.massageSet;
+  const sharedFtSet = prep.ftSet;
+
+  branches.forEach((branchName) => {
+    const branch = str_(branchName);
+    try {
+      const branchPrep = prepareForwardLoadInput_(ss, {
+        selectedBranch: branch,
+        currentDay,
+        persistUnassigned: false,
+        excludedEmployees: sharedExcluded,
+        employeeRegistry: sharedRegistry,
+        doctorsSet: sharedDoctorsSet,
+        massageSet: sharedMassageSet,
+        ftSet: sharedFtSet,
+      });
+      buildForwardLoadReportForBranch_(ss, branch, branchPrep, {
+        includeBaseline,
+      });
+      if (sendEmails) {
+        sendForwardReportEmail(ss, branch, currentDay);
+      }
+    } catch (e) {
+      const err = `${branch || '(пусто)'}: ${e && e.message ? e.message : String(e)}`;
+      errors.push(err);
+    }
+  });
+
+  if (errors.length) {
+    throw new Error(`Построение планов по клиникам завершено с ошибками: ${errors.slice(0, 3).join(' | ')}`);
+  }
+  return {
+    branchCount: branches.length,
+  };
 }
 
 function runForwardLoadReportAllBranchesCore_(options) {
@@ -1500,7 +1577,6 @@ function buildForwardLoadReportForBranch_(ss, selectedBranch, prep, options) {
   const scheduleIndexTimer = fl2StageTimer_();
   const scheduleByDoctorDay = buildReceptionScheduleIndex(filteredScheduleRows, prep.excludedEmployees, prep.allowedEmployees);
   stage('branch: buildReceptionScheduleIndex done', `keys=${scheduleByDoctorDay.size}`, scheduleIndexTimer);
-  logDoctorForwardDebug_(ss, branchName, 'Долинский Павел Максимович', anchorDay, scheduleByDoctorDay);
   tick();
 
   const doctorsSet = prep.doctorsSet || getDoctorsSetFromEmployeesSheet_(ss);
@@ -1620,35 +1696,6 @@ function buildForwardLoadReportForBranch_(ss, selectedBranch, prep, options) {
   return prep.currentDay;
 }
 
-function logDoctorForwardDebug_(ss, branchName, doctorName, anchorDate, scheduleByDoctorDay) {
-  try {
-    const startDate = addDays(anchorDate, 1);
-    const endDate = addDays(anchorDate, 3);
-    const parts = [];
-    let totalReceptionMin = 0;
-
-    for (let d = new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate()); d <= endDate; d = addDays(d, 1)) {
-      const key = `${dateKey_(d)}|${branchName}|${doctorName}`;
-      const intervals = scheduleByDoctorDay.get(key) || [];
-      const reception = mergeIntervals_(intervals.filter((i) => i.type === 'Приемные часы'));
-      const receptionMin = sumIntervalsMin(reception);
-      totalReceptionMin += receptionMin;
-      parts.push(`${formatDateDDMMYYYY_(d)}=${round1_(receptionMin / 60)}ч`);
-    }
-
-    const details = `Окно3д(${formatDateDDMMYYYY_(startDate)}..${formatDateDDMMYYYY_(endDate)}), ${doctorName}, ${parts.join('; ')}, Итого=${round1_(totalReceptionMin / 60)}ч`;
-    const sheet = getOrCreateSheet_(ss, SHEET_REPORT_LOG);
-    const header = ['Время', 'Уровень', 'Сообщение', 'Детали'];
-    const needHeader = sheet.getLastRow() < 1 || str_(sheet.getRange(1, 1).getDisplayValue()) !== 'Время';
-    if (needHeader) {
-      sheet.clearContents();
-      sheet.getRange(1, 1, 1, header.length).setValues([header]);
-    }
-    sheet.appendRow([new Date(), 'DEBUG', 'Forward debug doctor', details]);
-  } catch (e) {
-    // не ломаем основной расчет из-за диагностического лога
-  }
-}
 function clearForwardLoadBatchTriggers_() {
   ScriptApp.getProjectTriggers()
     .filter((t) => t.getHandlerFunction && t.getHandlerFunction() === FL2_FORWARD_BATCH_HANDLER)
@@ -2375,64 +2422,115 @@ function sendForwardReportEmail(ss, selectedBranch, currentDay) {
   });
 }
 
+function fl2LogTriggerSourceEmailPreview_() {
+  const sourceMessage = findSingleSourceMessageForToday_();
+  const subject = str_(sourceMessage.getSubject());
+  const sourceAttachments = pickSourceAttachments_(sourceMessage.getAttachments());
+  fl2TriggerLog_('INFO', 'Триггер: тема найденного письма', subject);
+  fl2TriggerLog_(
+    'INFO',
+    'Триггер: выбранные вложения',
+    `${sourceAttachments.schedule.getName()} | ${sourceAttachments.requests.getName()}`
+  );
+}
+
 function triggerBuildAggregatorDiscountsAndSend() {
-  fl2Log_('INFO', 'triggerBuildAggregatorDiscountsAndSend: старт', '');
+  fl2TriggerLog_('INFO', 'triggerBuildAggregatorDiscountsAndSend: старт', '');
   try {
-    runForwardLoadReportAllBranchesCore_({
+    fl2TriggerLog_('INFO', 'triggerBuildAggregatorDiscountsAndSend: начало загрузки из письма', '');
+    fl2LogTriggerSourceEmailPreview_();
+    loadAndProcessSourceDataFromEmail();
+    fl2TriggerLog_('INFO', 'triggerBuildAggregatorDiscountsAndSend: завершение loadAndProcessSourceDataFromEmail', '');
+
+    fl2TriggerLog_('INFO', 'triggerBuildAggregatorDiscountsAndSend: режим расчета', 'baseline=OFF, sendEmails=OFF, discountsMode=aggregators');
+    fl2TriggerLog_('INFO', 'triggerBuildAggregatorDiscountsAndSend: начало построения планов', '');
+    runForwardLoadReportsDirect_({
       includeBaseline: false,
       sendEmails: false,
-      refreshDiscountsAfter: false,
     });
+    fl2TriggerLog_('INFO', 'triggerBuildAggregatorDiscountsAndSend: завершение построения планов', '');
+
+    fl2TriggerLog_('INFO', 'triggerBuildAggregatorDiscountsAndSend: начало обновления скидок', '');
     updateDiscountsByPlan({ silent: true });
+    fl2TriggerLog_('INFO', 'triggerBuildAggregatorDiscountsAndSend: завершение обновления скидок', '');
+
+    fl2TriggerLog_('INFO', 'triggerBuildAggregatorDiscountsAndSend: начало отправки письма', 'mode=aggregators');
     sendDiscountsEmailsByMode_({
       targetMode: 'aggregators',
       silent: true,
     });
-    fl2Log_('INFO', 'triggerBuildAggregatorDiscountsAndSend: успех', '');
+    fl2TriggerLog_('INFO', 'triggerBuildAggregatorDiscountsAndSend: завершение отправки письма', 'mode=aggregators');
+    fl2TriggerLog_('INFO', 'triggerBuildAggregatorDiscountsAndSend: success', '');
   } catch (e) {
     const message = e && e.message ? e.message : String(e);
-    fl2Log_('ERROR', 'triggerBuildAggregatorDiscountsAndSend: ошибка', message);
+    const details = e && e.stack ? e.stack : (e && e.message ? e.message : String(e));
+    fl2TriggerLog_('ERROR', 'triggerBuildAggregatorDiscountsAndSend: error', `${message}\n${details}`);
     throw e;
   }
 }
 
 function triggerBuildNonAggregatorDiscountsAndSend() {
-  fl2Log_('INFO', 'triggerBuildNonAggregatorDiscountsAndSend: старт', '');
+  fl2TriggerLog_('INFO', 'triggerBuildNonAggregatorDiscountsAndSend: старт', '');
   try {
-    runForwardLoadReportAllBranchesCore_({
+    fl2TriggerLog_('INFO', 'triggerBuildNonAggregatorDiscountsAndSend: начало загрузки из письма', '');
+    fl2LogTriggerSourceEmailPreview_();
+    loadAndProcessSourceDataFromEmail();
+    fl2TriggerLog_('INFO', 'triggerBuildNonAggregatorDiscountsAndSend: завершение loadAndProcessSourceDataFromEmail', '');
+
+    fl2TriggerLog_('INFO', 'triggerBuildNonAggregatorDiscountsAndSend: режим расчета', 'baseline=OFF, sendEmails=OFF, discountsMode=non_aggregators');
+    fl2TriggerLog_('INFO', 'triggerBuildNonAggregatorDiscountsAndSend: начало построения планов', '');
+    runForwardLoadReportsDirect_({
       includeBaseline: false,
       sendEmails: false,
-      refreshDiscountsAfter: false,
     });
+    fl2TriggerLog_('INFO', 'triggerBuildNonAggregatorDiscountsAndSend: завершение построения планов', '');
+
+    fl2TriggerLog_('INFO', 'triggerBuildNonAggregatorDiscountsAndSend: начало обновления скидок', '');
     updateDiscountsByPlan({ silent: true });
+    fl2TriggerLog_('INFO', 'triggerBuildNonAggregatorDiscountsAndSend: завершение обновления скидок', '');
+
+    fl2TriggerLog_('INFO', 'triggerBuildNonAggregatorDiscountsAndSend: начало отправки письма', 'mode=non_aggregators');
     sendDiscountsEmailsByMode_({
       targetMode: 'non_aggregators',
       silent: true,
     });
-    fl2Log_('INFO', 'triggerBuildNonAggregatorDiscountsAndSend: успех', '');
+    fl2TriggerLog_('INFO', 'triggerBuildNonAggregatorDiscountsAndSend: завершение отправки письма', 'mode=non_aggregators');
+    fl2TriggerLog_('INFO', 'triggerBuildNonAggregatorDiscountsAndSend: success', '');
   } catch (e) {
     const message = e && e.message ? e.message : String(e);
-    fl2Log_('ERROR', 'triggerBuildNonAggregatorDiscountsAndSend: ошибка', message);
+    const details = e && e.stack ? e.stack : (e && e.message ? e.message : String(e));
+    fl2TriggerLog_('ERROR', 'triggerBuildNonAggregatorDiscountsAndSend: error', `${message}\n${details}`);
     throw e;
   }
 }
 
 function triggerBuildBaselinePlansAndSend() {
-  fl2Log_('INFO', 'triggerBuildBaselinePlansAndSend: старт', '');
+  fl2TriggerLog_('INFO', 'triggerBuildBaselinePlansAndSend: старт', '');
   try {
-    runForwardLoadReportAllBranchesCore_({
+    fl2TriggerLog_('INFO', 'triggerBuildBaselinePlansAndSend: начало загрузки из письма', '');
+    fl2LogTriggerSourceEmailPreview_();
+    loadAndProcessSourceDataFromEmail();
+    fl2TriggerLog_('INFO', 'triggerBuildBaselinePlansAndSend: завершение loadAndProcessSourceDataFromEmail', '');
+
+    fl2TriggerLog_('INFO', 'triggerBuildBaselinePlansAndSend: режим расчета', 'baseline=ON, sendEmails=ON, discountsMode=none');
+    fl2TriggerLog_('INFO', 'triggerBuildBaselinePlansAndSend: начало построения планов', '');
+    runForwardLoadReportsDirect_({
       includeBaseline: true,
       sendEmails: true,
-      refreshDiscountsAfter: false,
     });
+    fl2TriggerLog_('INFO', 'triggerBuildBaselinePlansAndSend: завершение построения планов', '');
+
+    fl2TriggerLog_('INFO', 'triggerBuildBaselinePlansAndSend: начало отправки письма', 'overall forecast');
     buildOverallForecastCore_({
       sendEmail: true,
       refreshDiscountsAfter: false,
     });
-    fl2Log_('INFO', 'triggerBuildBaselinePlansAndSend: успех', '');
+    fl2TriggerLog_('INFO', 'triggerBuildBaselinePlansAndSend: завершение отправки письма', 'overall forecast');
+    fl2TriggerLog_('INFO', 'triggerBuildBaselinePlansAndSend: success', '');
   } catch (e) {
     const message = e && e.message ? e.message : String(e);
-    fl2Log_('ERROR', 'triggerBuildBaselinePlansAndSend: ошибка', message);
+    const details = e && e.stack ? e.stack : (e && e.message ? e.message : String(e));
+    fl2TriggerLog_('ERROR', 'triggerBuildBaselinePlansAndSend: error', `${message}\n${details}`);
     throw e;
   }
 }
@@ -4100,12 +4198,13 @@ function toArchiveMetricFromRow_(row) {
   const receptionHours = Number(str_(row['Приемные (ч)']).replace(',', '.')) || 0;
   const occupiedHours = Number(str_(row['Занятые (ч) текущее']).replace(',', '.')) || 0;
   const freeHours = Number(str_(row['Свободные (ч)']).replace(',', '.')) || 0;
+  const primaryCombined = parseCombinedMetricOrSingle_(row['Заявки на ПП (шт)']);
   return {
     receptionMin: receptionHours * 60,
     occupiedMin: occupiedHours * 60,
     freeMin: freeHours * 60,
     reqCount: Number(str_(row['Заявки (шт)']).replace(',', '.')) || 0,
-    primaryCount: Number(str_(row['Заявки на ПП (шт)']).replace(',', '.')) || 0,
+    primaryCount: Number(primaryCombined.current) || 0,
     freePP: Number(str_(row['Свободные слоты под ПП']).replace(',', '.')) || 0,
   };
 }
@@ -4391,7 +4490,7 @@ function parsePlanDetailRowsForArchive_(data) {
     const load = parseCombinedMetric(row[3]);
     const free = parseLocaleNumber(row[4]);
     const requests = parseLocaleNumber(row[5]);
-    const primaryCount = parseLocaleNumber(row[6]);
+    const primaryCountCombined = parseCombinedMetricOrSingle_(row[6]);
     const freePP = parseLocaleNumber(row[7]);
     rows.push({
       category,
@@ -4405,7 +4504,8 @@ function parsePlanDetailRowsForArchive_(data) {
       loadUsual: load.usual,
       free,
       requests,
-      primaryCount,
+      primaryCount: primaryCountCombined.current,
+      primaryCountUsual: primaryCountCombined.usual,
       freePP,
     });
   });
