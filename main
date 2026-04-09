@@ -1432,34 +1432,29 @@ function prepareForwardLoadInput_(ss, options) {
 
   const scheduleSheet = ss.getSheetByName(SHEET_DOCTOR_SCHEDULE);
   const requestsSheet = ss.getSheetByName(SHEET_PROCESSED_REQUESTS);
-  if (!scheduleSheet || !requestsSheet) {
-    throw new Error('Проверьте наличие листов: Обработанный график, Обработанные заявки');
+  const sourceRequestsSheet = ss.getSheetByName(SHEET_REQUESTS);
+  if (!scheduleSheet || !requestsSheet || !sourceRequestsSheet) {
+    throw new Error('Проверьте наличие листов: Обработанный график, Обработанные заявки, Заявки');
   }
   ensureDoctorScheduleFresh(ss);
 
   const excludedEmployees = opts.excludedEmployees ? opts.excludedEmployees : getExcludedEmployeesSet_(ss);
   const employeeRegistry = opts.employeeRegistry ? opts.employeeRegistry : getEmployeeRegistry_(ss);
   const selectedBranch = str_(opts.selectedBranch);
-  const scheduleBuiltAt = detectDoctorScheduleBuiltAtFallback(scheduleSheet);
 
-  let currentDay = opts.currentDay ? new Date(Number(opts.currentDay)) : null;
   let requestRowsRawAll = null;
-  let reportPeriod = currentDay ? computeReportPeriodFromReferenceMoment_(currentDay) : null;
+  let currentDay = opts.currentDay ? new Date(Number(opts.currentDay)) : null;
   if (!currentDay || Number.isNaN(currentDay.getTime())) {
     const detectDayTimer = fl2StageTimer_();
-    requestRowsRawAll = getSheetObjectsDisplay_(requestsSheet);
-    stage('prepare: loaded processed requests for currentDay detect', `rows=${requestRowsRawAll.length}`, detectDayTimer);
+    const sourceRequestRows = getSheetObjects_(sourceRequestsSheet);
+    stage('prepare: loaded source requests for CurrentDate detect', `rows=${sourceRequestRows.length}`, detectDayTimer);
     tick();
-    const latestRequestsAllBranches = buildLatestRequests(requestRowsRawAll, excludedEmployees, employeeRegistry.allowed, employeeRegistry.unassignedFound);
-    currentDay = detectLatestCompletedRequestMoment_(latestRequestsAllBranches);
-    reportPeriod = computeReportPeriodFromReferenceMoment_(currentDay);
+    currentDay = detectCurrentDayFromSourceRequestsRows_(sourceRequestRows);
   }
-  if ((!currentDay || Number.isNaN(currentDay.getTime())) && scheduleBuiltAt) {
-    reportPeriod = computeReportPeriodFromScheduleTimestamp_(scheduleBuiltAt);
-    currentDay = reportPeriod && reportPeriod.startDate ? new Date(reportPeriod.startDate.getTime()) : null;
-    stage('prepare: fallback currentDay from schedule timestamp', `startDate=${formatDateDDMMYYYY_(currentDay)}`);
+  if (!currentDay || Number.isNaN(currentDay.getTime())) {
+    throw new Error('Не найдены выполненные заявки для определения CurrentDate');
   }
-  if (!currentDay) throw new Error('Не найдены выполненные заявки для определения текущего дня');
+  const reportPeriod = computeReportPeriodFromReferenceMoment_(currentDay);
 
   const anchorDay = reportPeriod && reportPeriod.anchorDate
     ? new Date(reportPeriod.anchorDate.getTime())
@@ -1954,6 +1949,20 @@ function detectCurrentDayFromRawRequests_(rows, allowedEmployees, excludedEmploy
     const d = toDate_(row['ДатаНачала']);
     if (!d) return;
     if (!maxDate || d > maxDate) maxDate = d;
+  });
+  if (!maxDate) return null;
+  return new Date(maxDate.getFullYear(), maxDate.getMonth(), maxDate.getDate());
+}
+
+function detectCurrentDayFromSourceRequestsRows_(rows) {
+  let maxDate = null;
+  const list = Array.isArray(rows) ? rows : [];
+  list.forEach((row) => {
+    const status = str_(row['Состояние']);
+    if (!isCompletedStatus(status)) return;
+    const startedAt = toDate_(row['ДатаНачала']);
+    if (!startedAt) return;
+    if (!maxDate || startedAt > maxDate) maxDate = startedAt;
   });
   if (!maxDate) return null;
   return new Date(maxDate.getFullYear(), maxDate.getMonth(), maxDate.getDate());
