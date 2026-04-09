@@ -2061,11 +2061,20 @@ function computeWindowMetrics(anchorDate, horizonDays, scheduleByDoctorDay, requ
 
   const includeAllNomenclature = Boolean(options && options.includeAllNomenclature);
 
+  const scheduleKeysInWindow = new Set();
+  scheduleByDoctorDay.forEach((_, key) => {
+    const [dKey] = key.split('|');
+    const day = toDate_(dKey);
+    if (!day || day < startDate || day > endDate) return;
+    scheduleKeysInWindow.add(key);
+  });
+
   const requestIndex = new Map();
   requests.forEach((r) => {
     if (!isActivePlannedStatus(r.status) || !r.startDate) return;
     if (!includeAllNomenclature && !r.isDoctorVisit) return;
     const key = `${dateKey_(r.startDate)}|${r.branch}|${r.doctor}`;
+    if (!scheduleKeysInWindow.has(key)) return;
     if (!requestIndex.has(key)) requestIndex.set(key, { intervals: [], reqCount: 0, primaryCount: 0 });
     const entry = requestIndex.get(key);
     entry.intervals.push(requestInterval(r));
@@ -2083,6 +2092,8 @@ function computeWindowMetrics(anchorDate, horizonDays, scheduleByDoctorDay, requ
     const nonReception = mergeIntervals_(intervals.filter((i) => i.type !== 'Приемные часы'));
     const occupied = mergeIntervals_(req.intervals);
     const occupiedWithinReception = intersectIntervals(occupied, reception);
+    // Учитываем занятость в не-приемных интервалах только фактическим пересечением
+    // интервалов заявок с интервалами графика на конкретную дату врача.
     const occupiedWithinNonReception = intersectIntervals(occupied, nonReception);
     const nonReceptionOccupiedMin = sumIntervalsMin(occupiedWithinNonReception);
 
