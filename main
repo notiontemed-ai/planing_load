@@ -255,23 +255,63 @@ function buildDoctorSchedule() {
     const cabinet = str_(row['Кабинет']);
     const cabinetType = detectCabinetType_(cabinet);
     const isCabinetRow = Boolean(cabinetType);
+    const rowBranch = str_(row['Филиал']);
+    const rowDate = toDate_(row['Дата']);
+    const rowStart = parseTimeToMinutes_(row['Время начала']);
+    const rowEnd = parseTimeToMinutes_(row['Время окончания']);
+    const rowTimeKind = str_(row['Вид времени']);
+    let scheduleDecision = 'included';
+    let scheduleReason = '';
     if (!isCabinetRow) {
-      if (!employee || excludedEmployees.has(employee) || hasStandaloneTestWord_(employee)) return;
-      if (!employeeRegistry.allowed.has(employee)) {
+      if (!employee || excludedEmployees.has(employee)) {
+        scheduleDecision = 'excluded';
+        scheduleReason = 'excluded_employee';
+      } else if (hasStandaloneTestWord_(employee)) {
+        scheduleDecision = 'excluded';
+        scheduleReason = 'test_name';
+      } else if (!employeeRegistry.allowed.has(employee)) {
+        scheduleDecision = 'excluded';
+        scheduleReason = 'employee_not_allowed';
         employeeRegistry.unassignedFound.add(employee);
-        return;
       }
-    } else if (employee && (excludedEmployees.has(employee) || hasStandaloneTestWord_(employee))) {
-      return;
+    } else if (employee && excludedEmployees.has(employee)) {
+      scheduleDecision = 'excluded';
+      scheduleReason = 'excluded_employee';
+    } else if (employee && hasStandaloneTestWord_(employee)) {
+      scheduleDecision = 'excluded';
+      scheduleReason = 'test_name';
     }
 
-    const date = toDate_(row['Дата']);
-    if (!isDateInRangeInclusive_(date, rangeStart, rangeEnd)) return;
+    if (scheduleDecision === 'included' && !isDateInRangeInclusive_(rowDate, rangeStart, rangeEnd)) {
+      scheduleDecision = 'excluded';
+      scheduleReason = 'date_out_of_range';
+    }
+    if (scheduleDecision === 'included' && (rowStart === null || rowEnd === null || rowEnd <= rowStart)) {
+      scheduleDecision = 'excluded';
+      scheduleReason = 'invalid_interval';
+    }
+
+    if (employee === FL2_DEBUG_TRACE_DOCTOR && rowBranch === FL2_DEBUG_TRACE_BRANCH) {
+      fl2DebugTrace_('DEBUG buildDoctorSchedule source row', {
+        branch: rowBranch,
+        doctor: employee,
+        date: rowDate ? dateKey_(rowDate) : str_(row['Дата']),
+        startTime: str_(row['Время начала']),
+        endTime: str_(row['Время окончания']),
+        timeKind: rowTimeKind,
+        timeType: mapTimeType_(rowTimeKind),
+        decision: scheduleDecision,
+        reason: scheduleReason || undefined,
+      });
+    }
+
+    if (scheduleDecision !== 'included') return;
+    const date = rowDate;
     const dateLabel = formatDateDDMMYYYY_(date || row['Дата']);
-    const branch = str_(row['Филиал']);
-    const start = parseTimeToMinutes_(row['Время начала']);
-    const end = parseTimeToMinutes_(row['Время окончания']);
-    const timeKind = str_(row['Вид времени']);
+    const branch = rowBranch;
+    const start = rowStart;
+    const end = rowEnd;
+    const timeKind = rowTimeKind;
     const sourceCreatedAt = toDate_(row['Дата создания']);
     if (sourceCreatedAt && sourceCreatedAt > sourceGraphMaxCreatedAt) sourceGraphMaxCreatedAt = sourceCreatedAt;
 
@@ -281,7 +321,6 @@ function buildDoctorSchedule() {
     const createdAtLabel = formatDateTimeDDMMYYYY_(createdAtRaw) || formatDateTimeDDMMYYYY_(createdAt);
 
     if (!date || !dateLabel || !branch || start === null || end === null || !timeKind) return;
-    if (end <= start) return;
 
     const key = [dateKey_(date), branch, employee, cabinet].join('|');
     if (!grouped.has(key)) grouped.set(key, []);
@@ -384,22 +423,61 @@ function buildProcessedRequestsSheet_(ss, requestsSheet, allowedEmployees, exclu
     const client = str_(row[idxClient]);
     const status = str_(row[idxStatus]);
     const startDate = toDate_(row[idxStart]);
+    const branch = str_(row[idxBranch]);
     const cabinetType = detectCabinetType_(idxCabinet >= 0 ? row[idxCabinet] : '');
     const isCabinetRequest = Boolean(cabinetType);
+    let decision = 'included';
+    let reason = '';
 
     if (!isCabinetRequest) {
-      if (!employee || (excludedEmployees && excludedEmployees.has(employee)) || hasStandaloneTestWord_(employee) || hasStandaloneTestWord_(client)) return false;
-      if (allowedEmployees && !allowedEmployees.has(employee)) {
+      if (!employee || (excludedEmployees && excludedEmployees.has(employee))) {
+        decision = 'excluded';
+        reason = 'excluded_employee';
+      } else if (hasStandaloneTestWord_(employee) || hasStandaloneTestWord_(client)) {
+        decision = 'excluded';
+        reason = 'test_name';
+      } else if (allowedEmployees && !allowedEmployees.has(employee)) {
+        decision = 'excluded';
+        reason = 'employee_not_allowed';
         if (unassignedSet) unassignedSet.add(employee);
-        return false;
       }
-    } else {
-      if (employee && ((excludedEmployees && excludedEmployees.has(employee)) || hasStandaloneTestWord_(employee))) return false;
-      if (hasStandaloneTestWord_(client)) return false;
+    } else if (employee && ((excludedEmployees && excludedEmployees.has(employee)))) {
+      decision = 'excluded';
+      reason = 'excluded_employee';
+    } else if ((employee && hasStandaloneTestWord_(employee)) || hasStandaloneTestWord_(client)) {
+      decision = 'excluded';
+      reason = 'test_name';
     }
-    if (!isAllowedProcessedRequestStatus(status)) return false;
-    if (isPlannedStatus(status) && startDate && currentDay && startDate < currentDay) return false;
-    if (!isDateInRangeInclusive_(startDate, rangeStart, rangeEnd)) return false;
+
+    if (decision === 'included' && !isAllowedProcessedRequestStatus(status)) {
+      decision = 'excluded';
+      reason = 'status_not_allowed';
+    }
+    if (decision === 'included' && isPlannedStatus(status) && startDate && currentDay && startDate < currentDay) {
+      decision = 'excluded';
+      reason = 'planned_before_current_day';
+    }
+    if (decision === 'included' && !isDateInRangeInclusive_(startDate, rangeStart, rangeEnd)) {
+      decision = 'excluded';
+      reason = 'out_of_range';
+    }
+
+    if (employee === FL2_DEBUG_TRACE_DOCTOR && branch === FL2_DEBUG_TRACE_BRANCH) {
+      fl2DebugTrace_('DEBUG buildProcessedRequestsSheet row', {
+        branch,
+        doctor: employee,
+        id: str_(row[headers.indexOf('Номер заявки')] || row[headers.indexOf('Номер')] || ''),
+        status,
+        date: startDate ? dateKey_(startDate) : '',
+        startTime: str_(row[idxStart]),
+        endTime: str_(row[idxEnd]),
+        nomenclature: str_(row[headers.indexOf('Номенклатура')]),
+        decision,
+        reason: reason || undefined,
+      });
+    }
+
+    if (decision !== 'included') return false;
     return true;
   });
 
@@ -910,6 +988,9 @@ var FL2_BATCH_MAX_RUN_MS = 120000;
 var FL2_BATCH_MAX_BRANCHES_PER_RUN = 1;
 var FL2_ENABLE_LOG = false;
 var FL2_ENABLE_TRIGGER_LOG = true;
+var FL2_DEBUG_TRACE_ENABLED = true;
+var FL2_DEBUG_TRACE_BRANCH = 'Темед Пионерская';
+var FL2_DEBUG_TRACE_DOCTOR = 'Алибеков Эйлер Ровшанович';
 var FL2_PLAN_ARCHIVE_SPREADSHEET_ID = '1w9PLSlkxbJX6kigWtxYZElTyCLTM1ceDriA29yeFBgc';
 var FL2_TIMEZONE = 'Europe/Moscow';
 var FL2_ARCHIVE_CATEGORY_SHEET_MAP = {
@@ -923,6 +1004,27 @@ var FL2_ARCHIVE_BASELINE_CACHE = null;
 function fl2Log_(level, message, details) {
   if (!FL2_ENABLE_LOG) return;
   fl2AppendLogRow_(level, message, details);
+}
+
+function fl2DebugTrace_(stage, payload) {
+  if (!FL2_DEBUG_TRACE_ENABLED) return;
+  const data = payload || {};
+  const branch = str_(data.branch || data.selectedBranch || data['Филиал']);
+  const doctor = str_(data.doctor || data.employee || data['Сотрудник']);
+  if (branch !== FL2_DEBUG_TRACE_BRANCH || doctor !== FL2_DEBUG_TRACE_DOCTOR) return;
+  const jsonDetails = fl2DebugStringify_(data);
+  fl2AppendLogRow_('DEBUG', str_(stage), jsonDetails);
+}
+
+function fl2DebugStringify_(payload) {
+  try {
+    return JSON.stringify(payload, (key, value) => {
+      if (value instanceof Date) return formatDateTimeDDMMYYYY_(value);
+      return value;
+    });
+  } catch (e) {
+    return JSON.stringify({ error: 'debug_payload_not_serializable', message: str_(e && e.message ? e.message : e) });
+  }
 }
 
 function fl2AppendLogRow_(level, message, details) {
@@ -1499,6 +1601,31 @@ function prepareForwardLoadInput_(ss, options) {
     });
   stage('prepare: filtered schedule rows', `rows=${scheduleRows.length}`, filterScheduleTimer);
   tick();
+  fl2DebugTrace_('DEBUG prepareForwardLoadInput overview', {
+    branch: selectedBranch || FL2_DEBUG_TRACE_BRANCH,
+    doctor: FL2_DEBUG_TRACE_DOCTOR,
+    selectedBranch,
+    currentDay,
+    anchorDay,
+    rangeStart,
+    rangeEnd,
+    scheduleRowsCount: scheduleRows.length,
+  });
+  scheduleRows.forEach((row, idx) => {
+    const doctor = str_(row['Сотрудник']);
+    const branch = str_(row['Филиал']);
+    if (doctor !== FL2_DEBUG_TRACE_DOCTOR || branch !== FL2_DEBUG_TRACE_BRANCH) return;
+    fl2DebugTrace_('DEBUG prepareForwardLoadInput doctor schedule row', {
+      branch,
+      doctor,
+      index: idx,
+      date: str_(row['Дата']),
+      startTime: str_(row['Время начала']),
+      endTime: str_(row['Время окончания']),
+      timeKind: str_(row['Вид времени']),
+      timeType: str_(row['Тип времени']),
+    });
+  });
 
   const readRequestsTimer = fl2StageTimer_();
   const requestSourceRows = selectedBranch
@@ -1518,6 +1645,33 @@ function prepareForwardLoadInput_(ss, options) {
 
   stage('prepare: filtered request rows', `rows=${requestRowsRaw.length}`, filterRequestsTimer);
   tick();
+  fl2DebugTrace_('DEBUG prepareForwardLoadInput request overview', {
+    branch: selectedBranch || FL2_DEBUG_TRACE_BRANCH,
+    doctor: FL2_DEBUG_TRACE_DOCTOR,
+    selectedBranch,
+    currentDay,
+    anchorDay,
+    rangeStart,
+    rangeEnd,
+    scheduleRowsCount: scheduleRows.length,
+    requestRowsRawCount: requestRowsRaw.length,
+  });
+  requestRowsRaw.forEach((row, idx) => {
+    const doctor = str_(row['Сотрудник']);
+    const branch = str_(row['Филиал']);
+    if (doctor !== FL2_DEBUG_TRACE_DOCTOR || branch !== FL2_DEBUG_TRACE_BRANCH) return;
+    fl2DebugTrace_('DEBUG prepareForwardLoadInput doctor request row', {
+      branch,
+      doctor,
+      index: idx,
+      id: str_(row['Номер заявки'] || row['Номер'] || row['ID']),
+      status: str_(row['Состояние']),
+      date: str_(row['Дата'] || row['ДатаНачала']),
+      startTime: str_(row['Время начала'] || row['ДатаНачала']),
+      endTime: str_(row['Время окончания'] || row['ДатаОкончания']),
+      nomenclature: str_(row['Номенклатура']),
+    });
+  });
 
   const branchesTimer = fl2StageTimer_();
   const branchesAll = getBranchesFromEmployeesSheet_(ss);
@@ -1687,6 +1841,29 @@ function buildForwardLoadReportForBranch_(ss, selectedBranch, prep, options) {
   const rowsDoctor = rowsDoctorAll.filter((r) => doctorsSet.has(str_(r.doctor)));
   stage('branch: filtered doctors rows', `rowsDoctor=${rowsDoctor.length}`, doctorFilterTimer);
   tick();
+
+  rowsDoctorAll.forEach((row) => {
+    if (str_(row.branch) !== FL2_DEBUG_TRACE_BRANCH || str_(row.doctor) !== FL2_DEBUG_TRACE_DOCTOR) return;
+    fl2DebugTrace_('DEBUG buildForwardLoadReportForBranch doctor row all', {
+      branch: row.branch,
+      doctor: row.doctor,
+      c3: row.c3,
+      c7: row.c7,
+      b3: row.b3,
+      b7: row.b7,
+    });
+  });
+  rowsDoctor.forEach((row) => {
+    if (str_(row.branch) !== FL2_DEBUG_TRACE_BRANCH || str_(row.doctor) !== FL2_DEBUG_TRACE_DOCTOR) return;
+    fl2DebugTrace_('DEBUG buildForwardLoadReportForBranch final doctor row', {
+      branch: row.branch,
+      doctor: row.doctor,
+      c3: row.c3,
+      c7: row.c7,
+      b3: row.b3,
+      b7: row.b7,
+    });
+  });
 
   const occupiedDoctorsCount = rowsDoctor.filter((r) => (numOrZero_(r && r.c3 && r.c3.occupiedMin) > 0) || (numOrZero_(r && r.c7 && r.c7.occupiedMin) > 0)).length;
   const zeroDoctorsCount = rowsDoctor.filter((r) => numOrZero_(r && r.c3 && r.c3.occupiedMin) === 0 && numOrZero_(r && r.c7 && r.c7.occupiedMin) === 0).length;
@@ -1982,6 +2159,7 @@ function detectCurrentDay(requests) {
 }
 function buildReceptionScheduleIndex(scheduleRows, excludedEmployees, allowedEmployees) {
   const map = new Map();
+  const rawByKey = new Map();
   scheduleRows.forEach((row) => {
     const date = toDate_(row['Дата']);
     const doctor = str_(row['Сотрудник']);
@@ -1994,37 +2172,109 @@ function buildReceptionScheduleIndex(scheduleRows, excludedEmployees, allowedEmp
     if (!date || !doctor || !branch || !type || start === null || end === null || end <= start) return;
     const key = `${dateKey_(date)}|${branch}|${doctor}`;
     if (!map.has(key)) map.set(key, []);
-    map.get(key).push({ type, start, end });
+    const interval = { type, start, end };
+    map.get(key).push(interval);
+    if (doctor === FL2_DEBUG_TRACE_DOCTOR && branch === FL2_DEBUG_TRACE_BRANCH) {
+      if (!rawByKey.has(key)) rawByKey.set(key, []);
+      rawByKey.get(key).push(interval);
+    }
   });
-  map.forEach((arr) => arr.sort((a, b) => a.start - b.start));
+  map.forEach((arr, key) => {
+    arr.sort((a, b) => a.start - b.start);
+    const parts = key.split('|');
+    const branch = str_(parts[1]);
+    const doctor = str_(parts[2]);
+    if (doctor !== FL2_DEBUG_TRACE_DOCTOR || branch !== FL2_DEBUG_TRACE_BRANCH) return;
+    const beforeMerge = rawByKey.get(key) || [];
+    const receptionOnly = arr.filter((i) => i.type === 'Приемные часы');
+    const excluded = arr.filter((i) => i.type !== 'Приемные часы');
+    fl2DebugTrace_('DEBUG buildReceptionScheduleIndex doctor day', {
+      branch,
+      doctor,
+      key,
+      rawIntervalsBeforeMerge: beforeMerge,
+      intervalsAfterMerge: arr,
+      receptionIntervals: receptionOnly,
+      nonReceptionIntervals: excluded,
+    });
+  });
   return map;
 }
 function buildLatestRequests(rows, excludedEmployees, allowedEmployees, unassignedSet, rangeStart, rangeEnd) {
   const latest = new Map();
+  const logDoctorRequest = (stage, payload) => {
+    const doctor = str_(payload && payload.doctor);
+    const branch = str_(payload && payload.branch);
+    if (doctor !== FL2_DEBUG_TRACE_DOCTOR || branch !== FL2_DEBUG_TRACE_BRANCH) return;
+    fl2DebugTrace_(stage, payload);
+  };
   rows.forEach((row, idx) => {
     const status = str_(row['Состояние']);
-    if (!isAllowedProcessedRequestStatus(status)) return;
     const id = str_(row['Номер заявки']) || str_(row['Номер']) || str_(row['ID']) || `ROW-${idx}`;
+    const doctor = str_(row['Сотрудник']);
+    const branch = str_(row['Филиал']);
+    const startDate = toDate_(row['ДатаНачала']);
+    const endDate = toDate_(row['ДатаОкончания']);
+    const intervalParts = normalizeRequestIntervalParts_(row, startDate, endDate);
+    const client = str_(row['Клиент']);
+    const cabinet = str_(row['Кабинет']);
+    const cabinetType = detectCabinetType_(cabinet);
+    const isCabinetRequest = Boolean(cabinetType);
+    const blockedByCategory = doctor && allowedEmployees && !allowedEmployees.has(doctor);
+    if (blockedByCategory && unassignedSet && doctor) unassignedSet.add(doctor);
+    const skipByName = isCabinetRequest
+      ? ((excludedEmployees && excludedEmployees.has(doctor)) || hasStandaloneTestWord_(doctor) || hasStandaloneTestWord_(client))
+      : (!doctor || blockedByCategory || (excludedEmployees && excludedEmployees.has(doctor)) || hasStandaloneTestWord_(doctor) || hasStandaloneTestWord_(client));
+    const skipReason = !skipByName
+      ? ''
+      : (!doctor || blockedByCategory)
+        ? 'doctor_not_allowed'
+        : (excludedEmployees && excludedEmployees.has(doctor))
+          ? 'excluded_employee'
+          : 'skip_by_name';
+    const nomenclature = str_(row['Номенклатура']).toLowerCase();
+    const isDoctorVisit = nomenclature.includes('врача');
+    const isPrimary = nomenclature.includes('первичный');
+    if (!isAllowedProcessedRequestStatus(status)) {
+      logDoctorRequest('DEBUG buildLatestRequests doctor request', {
+        id,
+        status,
+        doctor,
+        branch,
+        date: intervalParts.date,
+        startTime: intervalParts.startTime,
+        endTime: intervalParts.endTime,
+        nomenclature,
+        isDoctorVisit,
+        isPrimary,
+        skipByName,
+        skipReason,
+        intervalError: intervalParts.error,
+        decision: 'excluded',
+        reason: 'status_not_allowed',
+      });
+      return;
+    }
     const statusDate = toDate_(row['Дата создания']) || toDate_(row['Дата']) || toDate_(row['ДатаНачала']) || new Date(0);
     const statusSort = Number(Utilities.formatDate(statusDate, FL2_TIMEZONE, 'yyyyMMddHHmmss'));
     const prev = latest.get(id);
     if (!prev || statusSort > prev.statusSort || (statusSort === prev.statusSort && idx > prev.idx)) {
-      const startDate = toDate_(row['ДатаНачала']);
-      const endDate = toDate_(row['ДатаОкончания']);
-      const intervalParts = normalizeRequestIntervalParts_(row, startDate, endDate);
-      const doctor = str_(row['Сотрудник']);
-      const client = str_(row['Клиент']);
-      const cabinet = str_(row['Кабинет']);
-      const cabinetType = detectCabinetType_(cabinet);
-      const isCabinetRequest = Boolean(cabinetType);
-      const blockedByCategory = doctor && allowedEmployees && !allowedEmployees.has(doctor);
-      if (blockedByCategory && unassignedSet && doctor) unassignedSet.add(doctor);
-      const skipByName = isCabinetRequest
-        ? ((excludedEmployees && excludedEmployees.has(doctor)) || hasStandaloneTestWord_(doctor) || hasStandaloneTestWord_(client))
-        : (!doctor || blockedByCategory || (excludedEmployees && excludedEmployees.has(doctor)) || hasStandaloneTestWord_(doctor) || hasStandaloneTestWord_(client));
-      const nomenclature = str_(row['Номенклатура']).toLowerCase();
-      const isDoctorVisit = nomenclature.includes('врача');
-      const isPrimary = nomenclature.includes('первичный');
+      logDoctorRequest('DEBUG buildLatestRequests doctor request', {
+        id,
+        status,
+        doctor,
+        branch,
+        date: intervalParts.date,
+        startTime: intervalParts.startTime,
+        endTime: intervalParts.endTime,
+        nomenclature,
+        isDoctorVisit,
+        isPrimary,
+        skipByName,
+        skipReason,
+        intervalError: intervalParts.error,
+        decision: 'included',
+      });
       latest.set(id, {
         idx,
         id,
@@ -2041,16 +2291,104 @@ function buildLatestRequests(rows, excludedEmployees, allowedEmployees, unassign
         cabinet,
         cabinetType,
         skipByName,
+        skipReason,
         intervalError: intervalParts.error,
+      });
+    } else {
+      logDoctorRequest('DEBUG buildLatestRequests doctor request', {
+        id,
+        status,
+        doctor,
+        branch,
+        date: intervalParts.date,
+        startTime: intervalParts.startTime,
+        endTime: intervalParts.endTime,
+        nomenclature,
+        isDoctorVisit,
+        isPrimary,
+        skipByName,
+        skipReason,
+        intervalError: intervalParts.error,
+        decision: 'excluded',
+        reason: 'older_status',
       });
     }
   });
   return [...latest.values()].filter((r) => {
     if (r.intervalError) {
+      logDoctorRequest('DEBUG buildLatestRequests doctor request', {
+        id: r.id,
+        status: r.status,
+        doctor: r.doctor,
+        branch: r.branch,
+        date: r.startDate,
+        startTime: r.startTime,
+        endTime: r.endTime,
+        nomenclature: '',
+        isDoctorVisit: r.isDoctorVisit,
+        isPrimary: r.isPrimary,
+        skipByName: r.skipByName,
+        intervalError: r.intervalError,
+        decision: 'excluded',
+        reason: 'interval_error',
+      });
       fl2Log_('WARN', 'Заявка пропущена: некорректный интервал', `${r.id}: ${r.intervalError}`);
       return false;
     }
-    return !r.skipByName && (!rangeStart || !rangeEnd || isDateInRangeInclusive_(r.startDate, rangeStart, rangeEnd));
+    if (r.skipByName) {
+      logDoctorRequest('DEBUG buildLatestRequests doctor request', {
+        id: r.id,
+        status: r.status,
+        doctor: r.doctor,
+        branch: r.branch,
+        date: r.startDate,
+        startTime: r.startTime,
+        endTime: r.endTime,
+        nomenclature: '',
+        isDoctorVisit: r.isDoctorVisit,
+        isPrimary: r.isPrimary,
+        skipByName: r.skipByName,
+        intervalError: r.intervalError,
+        decision: 'excluded',
+        reason: r.skipReason || 'skip_by_name',
+      });
+      return false;
+    }
+    if (rangeStart && rangeEnd && !isDateInRangeInclusive_(r.startDate, rangeStart, rangeEnd)) {
+      logDoctorRequest('DEBUG buildLatestRequests doctor request', {
+        id: r.id,
+        status: r.status,
+        doctor: r.doctor,
+        branch: r.branch,
+        date: r.startDate,
+        startTime: r.startTime,
+        endTime: r.endTime,
+        nomenclature: '',
+        isDoctorVisit: r.isDoctorVisit,
+        isPrimary: r.isPrimary,
+        skipByName: r.skipByName,
+        intervalError: r.intervalError,
+        decision: 'excluded',
+        reason: 'out_of_range',
+      });
+      return false;
+    }
+    logDoctorRequest('DEBUG buildLatestRequests doctor request', {
+      id: r.id,
+      status: r.status,
+      doctor: r.doctor,
+      branch: r.branch,
+      date: r.startDate,
+      startTime: r.startTime,
+      endTime: r.endTime,
+      nomenclature: '',
+      isDoctorVisit: r.isDoctorVisit,
+      isPrimary: r.isPrimary,
+      skipByName: r.skipByName,
+      intervalError: r.intervalError,
+      decision: 'included',
+    });
+    return true;
   });
 }
 function computeWindowMetrics(anchorDate, horizonDays, scheduleByDoctorDay, requests, options) {
@@ -2074,7 +2412,19 @@ function computeWindowMetrics(anchorDate, horizonDays, scheduleByDoctorDay, requ
     if (!isActivePlannedStatus(r.status) || !r.startDate) return;
     if (!includeAllNomenclature && !r.isDoctorVisit) return;
     const key = `${dateKey_(r.startDate)}|${r.branch}|${r.doctor}`;
-    if (!scheduleKeysInWindow.has(key)) return;
+    if (!scheduleKeysInWindow.has(key)) {
+      if (str_(r.doctor) === FL2_DEBUG_TRACE_DOCTOR && str_(r.branch) === FL2_DEBUG_TRACE_BRANCH) {
+        fl2DebugTrace_('DEBUG computeWindowMetrics request_without_schedule_key', {
+          branch: r.branch,
+          doctor: r.doctor,
+          key,
+          requestId: r.id,
+          status: r.status,
+          date: r.startDate,
+        });
+      }
+      return;
+    }
     if (!requestIndex.has(key)) requestIndex.set(key, { intervals: [], reqCount: 0, primaryCount: 0 });
     const entry = requestIndex.get(key);
     entry.intervals.push(requestInterval(r));
@@ -2105,6 +2455,37 @@ function computeWindowMetrics(anchorDate, horizonDays, scheduleByDoctorDay, requ
     const occupiedMin = sumIntervalsMin(occupiedWithinReception) + nonReceptionOccupiedMin;
     const freeMin = sumIntervalsMin(free);
     const freePP = free.reduce((acc, i) => acc + Math.floor((i.end - i.start) / 60), 0);
+
+    if (doctor === FL2_DEBUG_TRACE_DOCTOR && branch === FL2_DEBUG_TRACE_BRANCH) {
+      fl2DebugTrace_('DEBUG computeWindowMetrics doctor day', {
+        branch,
+        doctor,
+        key,
+        receptionIntervals: reception,
+        nonReceptionIntervals: nonReception,
+        requestIntervalsRaw: req.intervals,
+        occupiedMerged: occupied,
+        occupiedWithinReception,
+        occupiedWithinNonReception,
+        freeIntervals: free,
+        receptionMin,
+        occupiedMin,
+        freeMin,
+        freePP,
+        reqCount: req.reqCount,
+        primaryCount: req.primaryCount,
+      });
+      if (req.reqCount > 0 && sumIntervalsMin(occupiedWithinReception) === 0) {
+        fl2DebugTrace_('DEBUG computeWindowMetrics request_not_mapped_to_reception', {
+          branch,
+          doctor,
+          key,
+          reqCount: req.reqCount,
+          requestIntervalsRaw: req.intervals,
+          receptionIntervals: reception,
+        });
+      }
+    }
 
     accumulateForward(byBranch, branch, { receptionMin, occupiedMin, freeMin, freePP, reqCount: req.reqCount, primaryCount: req.primaryCount }, branch, '');
     accumulateForward(byDoctor, `${branch}|${doctor}`, { receptionMin, occupiedMin, freeMin, freePP, reqCount: req.reqCount, primaryCount: req.primaryCount }, branch, doctor);
