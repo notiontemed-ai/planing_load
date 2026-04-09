@@ -241,11 +241,11 @@ function buildDoctorSchedule() {
   const requestRows = requestsSheet ? getSheetObjects_(requestsSheet) : [];
   const excludedEmployees = getExcludedEmployeesSet_(ss);
   const employeeRegistry = getEmployeeRegistry_(ss);
-  const currentDay = detectCurrentDayFromRawRequests_(requestRows, employeeRegistry.allowed, excludedEmployees, employeeRegistry.unassignedFound);
-  if (!currentDay) throw new Error('Не найдены выполненные заявки для определения актуальной даты');
-  const rangeStart = addDays(currentDay, -42);
-  const rangeEnd = addDays(currentDay, 7);
-  const requestsRangeEnd = addDays(currentDay, 8);
+  const currentDayKey = detectCurrentDayFromRawRequests_(requestRows, employeeRegistry.allowed, excludedEmployees, employeeRegistry.unassignedFound);
+  if (!currentDayKey) throw new Error('Не найдены выполненные заявки для определения актуальной даты');
+  const rangeStartKey = addDaysToDayKey_(currentDayKey, -42);
+  const rangeEndKey = addDaysToDayKey_(currentDayKey, 7);
+  const requestsRangeEndKey = addDaysToDayKey_(currentDayKey, 8);
 
   const grouped = new Map();
   let sourceGraphMaxCreatedAt = new Date(0);
@@ -282,7 +282,7 @@ function buildDoctorSchedule() {
       scheduleReason = 'test_name';
     }
 
-    if (scheduleDecision === 'included' && !isDateInRangeInclusive_(rowDate, rangeStart, rangeEnd)) {
+    if (scheduleDecision === 'included' && !isDayKeyInRangeInclusive_(parseLocalDayKey_(rowDate) || parseLocalDayKey_(row['Дата']), rangeStartKey, rangeEndKey)) {
       scheduleDecision = 'excluded';
       scheduleReason = 'date_out_of_range';
     }
@@ -381,12 +381,12 @@ function buildDoctorSchedule() {
     target.getRange(2, 1, 1, header.length).setValues([markerRow]);
   }
 
-  buildProcessedRequestsSheet_(ss, requestsSheet, employeeRegistry.allowed, excludedEmployees, rangeStart, requestsRangeEnd, currentDay, employeeRegistry.unassignedFound);
+  buildProcessedRequestsSheet_(ss, requestsSheet, employeeRegistry.allowed, excludedEmployees, rangeStartKey, requestsRangeEndKey, currentDayKey, employeeRegistry.unassignedFound);
   saveUnassignedEmployees_(ss, employeeRegistry.unassignedFound);
   SpreadsheetApp.getActive().toast('Обработанные данные сформированы', MENU_NAME, 5);
 }
 
-function buildProcessedRequestsSheet_(ss, requestsSheet, allowedEmployees, excludedEmployees, rangeStart, rangeEnd, currentDay, unassignedSet) {
+function buildProcessedRequestsSheet_(ss, requestsSheet, allowedEmployees, excludedEmployees, rangeStartKey, rangeEndKey, currentDayKey, unassignedSet) {
   if (!requestsSheet) return;
   const dataRange = requestsSheet.getDataRange();
   const values = dataRange.getValues();
@@ -422,7 +422,7 @@ function buildProcessedRequestsSheet_(ss, requestsSheet, allowedEmployees, exclu
     const employee = str_(row[idxEmployee]);
     const client = str_(row[idxClient]);
     const status = str_(row[idxStatus]);
-    const startDate = toDate_(row[idxStart]);
+    const startDayKey = parseLocalDayKey_(row[idxStart]) || parseLocalDayKey_(row[headers.indexOf('Дата')]);
     const branch = str_(row[idxBranch]);
     const cabinetType = detectCabinetType_(idxCabinet >= 0 ? row[idxCabinet] : '');
     const isCabinetRequest = Boolean(cabinetType);
@@ -453,11 +453,11 @@ function buildProcessedRequestsSheet_(ss, requestsSheet, allowedEmployees, exclu
       decision = 'excluded';
       reason = 'status_not_allowed';
     }
-    if (decision === 'included' && isPlannedStatus(status) && startDate && currentDay && startDate < currentDay) {
+    if (decision === 'included' && isPlannedStatus(status) && startDayKey && currentDayKey && startDayKey < currentDayKey) {
       decision = 'excluded';
       reason = 'planned_before_current_day';
     }
-    if (decision === 'included' && !isDateInRangeInclusive_(startDate, rangeStart, rangeEnd)) {
+    if (decision === 'included' && !isDayKeyInRangeInclusive_(startDayKey, rangeStartKey, rangeEndKey)) {
       decision = 'excluded';
       reason = 'out_of_range';
     }
@@ -468,7 +468,7 @@ function buildProcessedRequestsSheet_(ss, requestsSheet, allowedEmployees, exclu
         doctor: employee,
         id: str_(row[headers.indexOf('Номер заявки')] || row[headers.indexOf('Номер')] || ''),
         status,
-        date: startDate ? dateKey_(startDate) : '',
+        date: startDayKey || '',
         startTime: str_(row[idxStart]),
         endTime: str_(row[idxEnd]),
         nomenclature: str_(row[headers.indexOf('Номенклатура')]),
@@ -485,9 +485,12 @@ function buildProcessedRequestsSheet_(ss, requestsSheet, allowedEmployees, exclu
     const ba = str_(a[idxBranch]);
     const bb = str_(b[idxBranch]);
     if (ba !== bb) return ba.localeCompare(bb, 'ru');
-    const da = toDate_(a[idxStart]);
-    const db = toDate_(b[idxStart]);
-    return (da ? da.getTime() : 0) - (db ? db.getTime() : 0);
+    const da = parseLocalDayKey_(a[idxStart]) || '';
+    const db = parseLocalDayKey_(b[idxStart]) || '';
+    if (da !== db) return da.localeCompare(db);
+    const ta = parseTimeToMinutes_(a[headers.indexOf('Время начала')]);
+    const tb = parseTimeToMinutes_(b[headers.indexOf('Время начала')]);
+    return (ta === null ? 0 : ta) - (tb === null ? 0 : tb);
   });
 
   const idxCreatedAtOut = outHeaders.indexOf('Дата создания');
@@ -984,6 +987,25 @@ function dayKeyToDate_(dayKey) {
   return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
 }
 
+function dayKeyToDateText_(dayKey) {
+  const d = dayKeyToDate_(dayKey);
+  return d ? formatDateDDMMYYYY_(d) : '';
+}
+
+function addDaysToDayKey_(dayKey, days) {
+  const d = dayKeyToDate_(dayKey);
+  if (!d) return '';
+  return dateKey_(addDays(d, days));
+}
+
+function isDayKeyInRangeInclusive_(dayKey, startKey, endKey) {
+  const d = str_(dayKey);
+  const s = str_(startKey);
+  const e = str_(endKey);
+  if (!d || !s || !e) return false;
+  return d >= s && d <= e;
+}
+
 function monthKey_(date) {
   if (!date) return '';
   return Utilities.formatDate(date, FL2_TIMEZONE, 'yyyy-MM');
@@ -1149,7 +1171,7 @@ function runForwardLoadReportsDirect_(options) {
   ensureDoctorScheduleFresh(ss);
 
   const prep = prepareForwardLoadInput_(ss, { persistUnassigned: false });
-  const currentDay = opts.currentDay ? new Date(Number(opts.currentDay)) : prep.currentDay;
+  const currentDay = opts.currentDay || prep.currentDay;
   const branches = prep.branches || [];
   const errors = [];
 
@@ -1217,7 +1239,7 @@ function runForwardLoadReportAllBranchesCore_(options) {
   ensureDoctorScheduleFresh(ss);
 
   const prep = prepareForwardLoadInput_(ss, { persistUnassigned: false });
-  const currentDay = opts.currentDay ? new Date(Number(opts.currentDay)) : prep.currentDay;
+  const currentDay = opts.currentDay || prep.currentDay;
   const runId = `${Date.now()}`;
   const branches = prep.branches || [];
   const errors = [];
@@ -1464,13 +1486,13 @@ function scheduleNextForwardLoadBatchStep_(stepFinishedAtMs) {
 
 function finishForwardLoadBatch_(state) {
   const ss = SpreadsheetApp.getActive();
-  const currentDay = state && state.currentDay ? new Date(Number(state.currentDay)) : new Date();
+  const currentDay = str_(state && state.currentDay) || dateKey_(new Date());
   const props = PropertiesService.getScriptProperties();
 
   props.setProperty(FL2_PROP_FORWARD_BATCH_PENDING_EMAIL, JSON.stringify({
     runId: str_(state && state.runId),
     branches: Array.isArray(state && state.branches) ? state.branches : [],
-    currentDay: currentDay.getTime(),
+    currentDay,
     errors: Array.isArray(state && state.errors) ? state.errors : [],
   }));
 
@@ -1502,7 +1524,7 @@ function confirmAndSendForwardBatchEmails() {
 
   const payload = JSON.parse(raw);
   const branches = Array.isArray(payload.branches) ? payload.branches : [];
-  const currentDay = payload.currentDay ? new Date(Number(payload.currentDay)) : new Date();
+  const currentDay = str_(payload.currentDay) || dateKey_(new Date());
   const errors = Array.isArray(payload.errors) ? payload.errors.slice() : [];
   const ss = SpreadsheetApp.getActive();
 
@@ -1572,26 +1594,34 @@ function prepareForwardLoadInput_(ss, options) {
   const selectedBranch = str_(opts.selectedBranch);
 
   let requestRowsRawAll = null;
-  let currentDay = opts.currentDay ? new Date(Number(opts.currentDay)) : null;
-  if (!currentDay || Number.isNaN(currentDay.getTime())) {
+  let currentDayKey = str_(opts.currentDayKey);
+  if (!currentDayKey && opts.currentDay) {
+    if (opts.currentDay instanceof Date) currentDayKey = parseLocalDayKey_(opts.currentDay);
+    else currentDayKey = parseLocalDayKey_(opts.currentDay) || parseLocalDayKey_(new Date(Number(opts.currentDay)));
+  }
+  if (!currentDayKey) {
     const detectDayTimer = fl2StageTimer_();
     const sourceRequestRows = getSheetObjects_(sourceRequestsSheet);
     stage('prepare: loaded source requests for CurrentDate detect', `rows=${sourceRequestRows.length}`, detectDayTimer);
     tick();
-    currentDay = detectCurrentDayFromSourceRequestsRows_(sourceRequestRows);
+    currentDayKey = detectCurrentDayFromSourceRequestsRows_(sourceRequestRows);
   }
-  if (!currentDay || Number.isNaN(currentDay.getTime())) {
+  const currentDay = dayKeyToDate_(currentDayKey);
+  if (!currentDayKey || !currentDay || Number.isNaN(currentDay.getTime())) {
     throw new Error('Не найдены выполненные заявки для определения CurrentDate');
   }
   const reportPeriod = computeReportPeriodFromReferenceMoment_(currentDay);
 
-  const anchorDay = reportPeriod && reportPeriod.anchorDate
-    ? new Date(reportPeriod.anchorDate.getTime())
-    : new Date(currentDay.getFullYear(), currentDay.getMonth(), currentDay.getDate() - 1);
-  const rangeStart = addDays(anchorDay, -42);
-  const rangeEnd = reportPeriod && reportPeriod.endDate
-    ? new Date(reportPeriod.endDate.getTime())
-    : addDays(anchorDay, 7);
+  const anchorDayKey = reportPeriod && reportPeriod.anchorDate
+    ? parseLocalDayKey_(reportPeriod.anchorDate)
+    : addDaysToDayKey_(currentDayKey, -1);
+  const rangeStartKey = addDaysToDayKey_(anchorDayKey, -42);
+  const rangeEndKey = reportPeriod && reportPeriod.endDate
+    ? parseLocalDayKey_(reportPeriod.endDate)
+    : addDaysToDayKey_(anchorDayKey, 7);
+  const anchorDay = dayKeyToDate_(anchorDayKey);
+  const rangeStart = dayKeyToDate_(rangeStartKey);
+  const rangeEnd = dayKeyToDate_(rangeEndKey);
 
   const readScheduleTimer = fl2StageTimer_();
   const scheduleSourceRows = selectedBranch
@@ -1604,7 +1634,7 @@ function prepareForwardLoadInput_(ss, options) {
   const filterScheduleTimer = fl2StageTimer_();
   const scheduleRows = scheduleSourceRows
     .filter((r) => {
-      const d = dayKeyToDate_(parseLocalDayKey_(r['Дата']));
+      const dKey = parseLocalDayKey_(r['Дата']);
       const emp = str_(r['Сотрудник']);
       const branch = str_(r['Филиал']);
       const cabinetType = detectCabinetType_(r['Кабинет']);
@@ -1616,7 +1646,7 @@ function prepareForwardLoadInput_(ss, options) {
           return false;
         }
       }
-      return isDateInRangeInclusive_(d, rangeStart, rangeEnd);
+      return isDayKeyInRangeInclusive_(dKey, rangeStartKey, rangeEndKey);
     })
     .sort((a, b) => {
       const ba = str_(a['Филиал']);
@@ -1632,10 +1662,14 @@ function prepareForwardLoadInput_(ss, options) {
     branch: selectedBranch || FL2_DEBUG_TRACE_BRANCH,
     doctor: FL2_DEBUG_TRACE_DOCTOR,
     selectedBranch,
-    currentDay,
+    currentDay: currentDayKey,
+    currentDayKey,
     anchorDay,
+    anchorDayKey,
     rangeStart,
     rangeEnd,
+    rangeStartKey,
+    rangeEndKey,
     scheduleRowsCount: scheduleRows.length,
   });
   scheduleRows.forEach((row, idx) => {
@@ -1664,10 +1698,10 @@ function prepareForwardLoadInput_(ss, options) {
 
   const filterRequestsTimer = fl2StageTimer_();
   const requestRowsRaw = requestSourceRows.filter((r) => {
-    const d = dayKeyToDate_(parseLocalDayKey_(r['Дата']) || parseLocalDayKey_(r['ДатаНачала']));
+    const dKey = parseLocalDayKey_(r['Дата']) || parseLocalDayKey_(r['ДатаНачала']);
     const branch = str_(r['Филиал']);
     if (selectedBranch && branch !== selectedBranch) return false;
-    return isDateInRangeInclusive_(d, rangeStart, rangeEnd);
+    return isDayKeyInRangeInclusive_(dKey, rangeStartKey, rangeEndKey);
   });
 
   stage('prepare: filtered request rows', `rows=${requestRowsRaw.length}`, filterRequestsTimer);
@@ -1676,10 +1710,14 @@ function prepareForwardLoadInput_(ss, options) {
     branch: selectedBranch || FL2_DEBUG_TRACE_BRANCH,
     doctor: FL2_DEBUG_TRACE_DOCTOR,
     selectedBranch,
-    currentDay,
+    currentDay: currentDayKey,
+    currentDayKey,
     anchorDay,
+    anchorDayKey,
     rangeStart,
     rangeEnd,
+    rangeStartKey,
+    rangeEndKey,
     scheduleRowsCount: scheduleRows.length,
     requestRowsRawCount: requestRowsRaw.length,
   });
@@ -1715,10 +1753,14 @@ function prepareForwardLoadInput_(ss, options) {
     requestRowsRaw,
     branches,
     excludedEmployees,
-    currentDay,
+    currentDay: currentDayKey,
+    currentDayKey,
     anchorDay,
+    anchorDayKey,
     rangeStart,
     rangeEnd,
+    rangeStartKey,
+    rangeEndKey,
     reportPeriod,
     allowedEmployees: employeeRegistry.allowed,
     unassignedEmployees: employeeRegistry.unassignedFound,
@@ -1745,7 +1787,8 @@ function buildForwardLoadReportForBranch_(ss, selectedBranch, prep, options) {
   };
   const tick = () => { if (hb) hb(); };
 
-  const anchorDay = prep.anchorDay ? new Date(prep.anchorDay.getTime()) : new Date(prep.currentDay.getFullYear(), prep.currentDay.getMonth(), prep.currentDay.getDate() - 1);
+  const anchorDay = prep.anchorDay ? new Date(prep.anchorDay.getTime()) : addDays(dayKeyToDate_(prep.currentDayKey || prep.currentDay), -1);
+  const anchorDayKey = prep.anchorDayKey || parseLocalDayKey_(anchorDay);
 
   const filterTimer = fl2StageTimer_();
   const filteredScheduleRows = prep.scheduleRows.filter((r) => str_(r['Филиал']) === branchName);
@@ -1771,7 +1814,7 @@ function buildForwardLoadReportForBranch_(ss, selectedBranch, prep, options) {
   tick();
 
   const latestReqTimer = fl2StageTimer_();
-  const latestRequests = buildLatestRequests(filteredRequestRows, prep.excludedEmployees, prep.allowedEmployees, prep.unassignedEmployees, prep.rangeStart, prep.rangeEnd);
+  const latestRequests = buildLatestRequests(filteredRequestRows, prep.excludedEmployees, prep.allowedEmployees, prep.unassignedEmployees, prep.rangeStartKey, prep.rangeEndKey);
   stage('branch: buildLatestRequests done', `rows=${latestRequests.length}`, latestReqTimer);
   tick();
 
@@ -1791,12 +1834,12 @@ function buildForwardLoadReportForBranch_(ss, selectedBranch, prep, options) {
   );
 
   const h3Timer = fl2StageTimer_();
-  const horizon3 = computeWindowMetrics(anchorDay, 3, doctorScheduleByDoctorDay, latestRequests);
+  const horizon3 = computeWindowMetrics(anchorDayKey, 3, doctorScheduleByDoctorDay, latestRequests);
   stage('branch: computeWindowMetrics(3) done', `byBranch=${horizon3.byBranch.size}, byDoctor=${horizon3.byDoctor.size}`, h3Timer);
   tick();
 
   const h7Timer = fl2StageTimer_();
-  const horizon7 = computeWindowMetrics(anchorDay, 7, doctorScheduleByDoctorDay, latestRequests);
+  const horizon7 = computeWindowMetrics(anchorDayKey, 7, doctorScheduleByDoctorDay, latestRequests);
   stage('branch: computeWindowMetrics(7) done', `byBranch=${horizon7.byBranch.size}, byDoctor=${horizon7.byDoctor.size}`, h7Timer);
   tick();
 
@@ -1804,12 +1847,12 @@ function buildForwardLoadReportForBranch_(ss, selectedBranch, prep, options) {
   let baseline7;
 
   const h3AllTimer = fl2StageTimer_();
-  const horizon3All = computeWindowMetrics(anchorDay, 3, scheduleByDoctorDay, latestRequests, { includeAllNomenclature: true });
+  const horizon3All = computeWindowMetrics(anchorDayKey, 3, scheduleByDoctorDay, latestRequests, { includeAllNomenclature: true });
   stage('branch: computeWindowMetrics(3, all nomenclature) done', `byBranch=${horizon3All.byBranch.size}, byDoctor=${horizon3All.byDoctor.size}`, h3AllTimer);
   tick();
 
   const h7AllTimer = fl2StageTimer_();
-  const horizon7All = computeWindowMetrics(anchorDay, 7, scheduleByDoctorDay, latestRequests, { includeAllNomenclature: true });
+  const horizon7All = computeWindowMetrics(anchorDayKey, 7, scheduleByDoctorDay, latestRequests, { includeAllNomenclature: true });
   stage('branch: computeWindowMetrics(7, all nomenclature) done', `byBranch=${horizon7All.byBranch.size}, byDoctor=${horizon7All.byDoctor.size}`, h7AllTimer);
   tick();
 
@@ -1936,10 +1979,10 @@ function buildCurrentPlanDebugStats_(latestRequests, scheduleByDoctorDay, doctor
   const uniqueRequestKeys = new Set();
 
   (latestRequests || []).forEach((r) => {
-    if (!r || !r.startDate) return;
+    if (!r || !r.dayKey) return;
     if (!isActivePlannedStatus(r.status) || !r.isDoctorVisit) return;
     participatingRequests += 1;
-    const key = `${dateKey_(r.startDate)}|${str_(r.branch)}|${str_(r.doctor)}`;
+    const key = `${str_(r.dayKey)}|${str_(r.branch)}|${str_(r.doctor)}`;
     if (uniqueRequestKeys.has(key)) return;
     uniqueRequestKeys.add(key);
     if (scheduleKeys.has(key)) matchedRequestScheduleKeys += 1;
@@ -2141,7 +2184,7 @@ function collectBranches(scheduleRows, requestRows) {
   return [...set].sort((a, b) => a.localeCompare(b, 'ru'));
 }
 function detectCurrentDayFromRawRequests_(rows, allowedEmployees, excludedEmployees, unassignedSet) {
-  let maxDate = null;
+  let maxDayKey = '';
   rows.forEach((row) => {
     if (!isCompletedStatus(str_(row['Состояние']))) return;
     const doctor = str_(row['Сотрудник']);
@@ -2150,26 +2193,24 @@ function detectCurrentDayFromRawRequests_(rows, allowedEmployees, excludedEmploy
       if (unassignedSet) unassignedSet.add(doctor);
       return;
     }
-    const d = dayKeyToDate_(parseLocalDayKey_(row['ДатаНачала']));
-    if (!d) return;
-    if (!maxDate || d > maxDate) maxDate = d;
+    const dKey = parseLocalDayKey_(row['ДатаНачала']);
+    if (!dKey) return;
+    if (!maxDayKey || dKey > maxDayKey) maxDayKey = dKey;
   });
-  if (!maxDate) return null;
-  return new Date(maxDate.getFullYear(), maxDate.getMonth(), maxDate.getDate());
+  return maxDayKey || null;
 }
 
 function detectCurrentDayFromSourceRequestsRows_(rows) {
-  let maxDate = null;
+  let maxDayKey = '';
   const list = Array.isArray(rows) ? rows : [];
   list.forEach((row) => {
     const status = str_(row['Состояние']);
     if (!isCompletedStatus(status)) return;
-    const startedAt = dayKeyToDate_(parseLocalDayKey_(row['ДатаНачала']));
-    if (!startedAt) return;
-    if (!maxDate || startedAt > maxDate) maxDate = startedAt;
+    const dKey = parseLocalDayKey_(row['ДатаНачала']);
+    if (!dKey) return;
+    if (!maxDayKey || dKey > maxDayKey) maxDayKey = dKey;
   });
-  if (!maxDate) return null;
-  return new Date(maxDate.getFullYear(), maxDate.getMonth(), maxDate.getDate());
+  return maxDayKey || null;
 }
 
 function detectLatestCompletedRequestMoment_(requests) {
@@ -2182,7 +2223,7 @@ function detectLatestCompletedRequestMoment_(requests) {
 function detectCurrentDay(requests) {
   const latestMoment = detectLatestCompletedRequestMoment_(requests);
   if (!latestMoment) return null;
-  return new Date(latestMoment.getFullYear(), latestMoment.getMonth(), latestMoment.getDate());
+  return parseLocalDayKey_(latestMoment) || null;
 }
 function buildReceptionScheduleIndex(scheduleRows, excludedEmployees, allowedEmployees) {
   const map = new Map();
@@ -2227,7 +2268,7 @@ function buildReceptionScheduleIndex(scheduleRows, excludedEmployees, allowedEmp
   });
   return map;
 }
-function buildLatestRequests(rows, excludedEmployees, allowedEmployees, unassignedSet, rangeStart, rangeEnd) {
+function buildLatestRequests(rows, excludedEmployees, allowedEmployees, unassignedSet, rangeStartKey, rangeEndKey) {
   const latest = new Map();
   const logDoctorRequest = (stage, payload) => {
     const doctor = str_(payload && payload.doctor);
@@ -2269,7 +2310,7 @@ function buildLatestRequests(rows, excludedEmployees, allowedEmployees, unassign
         status,
         doctor,
         branch,
-        date: intervalParts.date,
+        date: intervalParts.dateText || dayKeyToDateText_(intervalParts.dayKey),
         startTime: intervalParts.startTime,
         endTime: intervalParts.endTime,
         nomenclature,
@@ -2292,7 +2333,7 @@ function buildLatestRequests(rows, excludedEmployees, allowedEmployees, unassign
         status,
         doctor,
         branch,
-        date: intervalParts.date,
+        date: intervalParts.dateText || dayKeyToDateText_(intervalParts.dayKey),
         startTime: intervalParts.startTime,
         endTime: intervalParts.endTime,
         nomenclature,
@@ -2310,8 +2351,8 @@ function buildLatestRequests(rows, excludedEmployees, allowedEmployees, unassign
         status,
         doctor,
         branch: str_(row['Филиал']),
-        startDate: intervalParts.date,
-        endDate: intervalParts.date,
+        startDate: dayKeyToDate_(intervalParts.dayKey),
+        endDate: dayKeyToDate_(intervalParts.dayKey),
         dayKey: intervalParts.dayKey,
         startMin: intervalParts.startMin,
         endMin: intervalParts.endMin,
@@ -2339,7 +2380,7 @@ function buildLatestRequests(rows, excludedEmployees, allowedEmployees, unassign
         status,
         doctor,
         branch,
-        date: intervalParts.date,
+        date: intervalParts.dateText || dayKeyToDateText_(intervalParts.dayKey),
         startTime: intervalParts.startTime,
         endTime: intervalParts.endTime,
         nomenclature,
@@ -2393,7 +2434,7 @@ function buildLatestRequests(rows, excludedEmployees, allowedEmployees, unassign
       });
       return false;
     }
-    if (rangeStart && rangeEnd && !isDateInRangeInclusive_(r.startDate, rangeStart, rangeEnd)) {
+    if (rangeStartKey && rangeEndKey && !isDayKeyInRangeInclusive_(r.dayKey, rangeStartKey, rangeEndKey)) {
       logDoctorRequest('DEBUG buildLatestRequests doctor request', {
         id: r.id,
         status: r.status,
@@ -2430,9 +2471,9 @@ function buildLatestRequests(rows, excludedEmployees, allowedEmployees, unassign
     return true;
   });
 }
-function computeWindowMetrics(anchorDate, horizonDays, scheduleByDoctorDay, requests, options) {
-  const startDate = addDays(anchorDate, 1);
-  const endDate = addDays(anchorDate, horizonDays);
+function computeWindowMetrics(anchorDayKey, horizonDays, scheduleByDoctorDay, requests, options) {
+  const startDayKey = addDaysToDayKey_(anchorDayKey, 1);
+  const endDayKey = addDaysToDayKey_(anchorDayKey, horizonDays);
   const byBranch = new Map();
   const byDoctor = new Map();
 
@@ -2441,16 +2482,16 @@ function computeWindowMetrics(anchorDate, horizonDays, scheduleByDoctorDay, requ
   const scheduleKeysInWindow = new Set();
   scheduleByDoctorDay.forEach((_, key) => {
     const [dKey] = key.split('|');
-    const day = dayKeyToDate_(dKey);
-    if (!day || day < startDate || day > endDate) return;
+    if (!isDayKeyInRangeInclusive_(dKey, startDayKey, endDayKey)) return;
     scheduleKeysInWindow.add(key);
   });
 
   const requestIndex = new Map();
   requests.forEach((r) => {
-    if (!isActivePlannedStatus(r.status) || !r.startDate) return;
+    if (!isActivePlannedStatus(r.status)) return;
     if (!includeAllNomenclature && !r.isDoctorVisit) return;
-    const requestDayKey = str_(r.dayKey) || dateKey_(r.startDate);
+    const requestDayKey = str_(r.dayKey);
+    if (!isDayKeyInRangeInclusive_(requestDayKey, startDayKey, endDayKey)) return;
     const key = `${requestDayKey}|${r.branch}|${r.doctor}`;
     if (!scheduleKeysInWindow.has(key)) {
       if (str_(r.doctor) === FL2_DEBUG_TRACE_DOCTOR && str_(r.branch) === FL2_DEBUG_TRACE_BRANCH) {
@@ -2460,7 +2501,7 @@ function computeWindowMetrics(anchorDate, horizonDays, scheduleByDoctorDay, requ
           key,
           requestId: r.id,
           status: r.status,
-          date: r.startDate,
+          dayKey: requestDayKey,
         });
       }
       return;
@@ -2474,8 +2515,7 @@ function computeWindowMetrics(anchorDate, horizonDays, scheduleByDoctorDay, requ
 
   scheduleByDoctorDay.forEach((intervals, key) => {
     const [dKey, branch, doctor] = key.split('|');
-    const day = dayKeyToDate_(dKey);
-    if (!day || day < startDate || day > endDate) return;
+    if (!isDayKeyInRangeInclusive_(dKey, startDayKey, endDayKey)) return;
 
     const req = requestIndex.get(key) || { intervals: [], reqCount: 0, primaryCount: 0 };
     const reception = mergeIntervals_(intervals.filter((i) => i.type === 'Приемные часы'));
@@ -5182,27 +5222,27 @@ function applyProcessedRequestsIntervalColumnFormat_(sheet, headers) {
     if (colIdx < 0) return;
     const columnRange = sheet.getRange(2, colIdx + 1, dataRowCount, 1);
     columnRange.clearFormat();
-    columnRange.setNumberFormat('dd.mm.yyyy');
+    columnRange.setNumberFormat('@');
   });
   timeHeaders.forEach((header) => {
     const colIdx = headers.indexOf(header);
     if (colIdx < 0) return;
     const columnRange = sheet.getRange(2, colIdx + 1, dataRowCount, 1);
     columnRange.clearFormat();
-    columnRange.setNumberFormat('hh:mm');
+    columnRange.setNumberFormat('@');
   });
 }
 
 function splitRequestDateTimeParts_(startDisplay, endDisplay, startRaw, endRaw) {
   const start = extractDateTimeTokenParts_(startDisplay) || extractDateTimeTokenParts_(startRaw);
   const end = extractDateTimeTokenParts_(endDisplay) || extractDateTimeTokenParts_(endRaw);
-  if (!start || !end || !start.date || !start.time || !end.time) {
+  if (!start || !end || !start.dateText || !start.timeText || !end.timeText) {
     return { date: '', startTime: '', endTime: '' };
   }
   return {
-    date: start.date,
-    startTime: start.time,
-    endTime: end.time,
+    date: start.dateText,
+    startTime: start.timeText,
+    endTime: end.timeText,
   };
 }
 
@@ -5212,28 +5252,27 @@ function normalizeRequestIntervalParts_(row, startDateRaw, endDateRaw) {
   const dayKey = parseLocalDayKey_(row['Дата'])
     || (startExtracted && startExtracted.dayKey)
     || parseLocalDayKey_(startDateRaw);
-  const normalizedDate = dayKeyToDate_(dayKey);
   const startCandidate = row['Время начала'] !== undefined && row['Время начала'] !== null && row['Время начала'] !== ''
     ? row['Время начала']
-    : (startExtracted && startExtracted.time ? startExtracted.time : '');
+    : (startExtracted && startExtracted.timeText ? startExtracted.timeText : '');
   const endCandidate = row['Время окончания'] !== undefined && row['Время окончания'] !== null && row['Время окончания'] !== ''
     ? row['Время окончания']
-    : (endExtracted && endExtracted.time ? endExtracted.time : '');
+    : (endExtracted && endExtracted.timeText ? endExtracted.timeText : '');
 
   const startMin = parseTimeToMinutes_(startCandidate);
   const endMin = parseTimeToMinutes_(endCandidate);
 
-  if (!dayKey || !normalizedDate || startMin === null || endMin === null) {
-    return { date: normalizedDate, dayKey, startMin, endMin, startTime: str_(startCandidate), endTime: str_(endCandidate), error: 'Не удалось определить Дату/Время начала/Время окончания' };
+  if (!dayKey || startMin === null || endMin === null) {
+    return { dayKey, startMin, endMin, startTime: str_(startCandidate), endTime: str_(endCandidate), dateText: dayKeyToDateText_(dayKey), error: 'Не удалось определить Дату/Время начала/Время окончания' };
   }
   if (endMin <= startMin) {
     return {
-      date: normalizedDate,
       dayKey,
       startMin,
       endMin,
       startTime: minutesToTimeString_(startMin),
       endTime: minutesToTimeString_(endMin),
+      dateText: dayKeyToDateText_(dayKey),
       error: `Время окончания (${minutesToTimeString_(endMin)}) <= времени начала (${minutesToTimeString_(startMin)})`,
     };
   }
@@ -5241,23 +5280,23 @@ function normalizeRequestIntervalParts_(row, startDateRaw, endDateRaw) {
   const endDayKey = (endExtracted && endExtracted.dayKey) || parseLocalDayKey_(endDateRaw);
   if (startDayKey && endDayKey && startDayKey !== endDayKey) {
     return {
-      date: normalizedDate,
       dayKey,
       startMin,
       endMin,
       startTime: minutesToTimeString_(startMin),
       endTime: minutesToTimeString_(endMin),
+      dateText: dayKeyToDateText_(dayKey),
       error: `Интервал выходит за границы суток (${formatDateDDMMYYYY_(startDateRaw)} ${minutesToTimeString_(startMin)} -> ${formatDateDDMMYYYY_(endDateRaw)} ${minutesToTimeString_(endMin)})`,
     };
   }
 
   return {
-    date: new Date(normalizedDate.getFullYear(), normalizedDate.getMonth(), normalizedDate.getDate()),
     dayKey,
     startMin,
     endMin,
     startTime: minutesToTimeString_(startMin),
     endTime: minutesToTimeString_(endMin),
+    dateText: dayKeyToDateText_(dayKey),
     error: '',
   };
 }
@@ -5276,9 +5315,9 @@ function extractDateTimeTokenParts_(value) {
       if (day >= 1 && day <= 31 && month >= 1 && month <= 12 && hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) {
         const dayKey = `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
         return {
-          date: new Date(year, month - 1, day),
+          dateText: `${String(day).padStart(2, '0')}.${String(month).padStart(2, '0')}.${String(year).padStart(4, '0')}`,
           dayKey,
-          time: `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`,
+          timeText: `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`,
         };
       }
     }
@@ -5288,9 +5327,9 @@ function extractDateTimeTokenParts_(value) {
   if (!date) return null;
   const dayKey = parseLocalDayKey_(date);
   return {
-    date: new Date(date.getFullYear(), date.getMonth(), date.getDate()),
+    dateText: dayKeyToDateText_(dayKey),
     dayKey,
-    time: Utilities.formatDate(date, FL2_TIMEZONE, 'HH:mm'),
+    timeText: Utilities.formatDate(date, FL2_TIMEZONE, 'HH:mm'),
   };
 }
 function sumIntervalsMin(intervals) {
