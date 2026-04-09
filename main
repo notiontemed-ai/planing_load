@@ -8,7 +8,7 @@ const SHEET_EXCLUSIONS = 'Исключения';
 const SHEET_DISCOUNTS = 'Скидки';
 const MENU_NAME = 'TEMED';
 const REPORT_PERIOD_ROLLOVER_HOUR = 16;
-const SOURCE_EMAIL_SUBJECT_PREFIX = 'Выгрузка графика и заявок клиника "Темед" ';
+const SOURCE_EMAIL_SUBJECT_PREFIX = 'Выгрузка графика и заявок клиника "Темед"';
 const SOURCE_SCHEDULE_ATTACHMENT_PREFIX = 'Графики ';
 const SOURCE_REQUESTS_ATTACHMENT_PREFIX = 'Заявки ';
 const SOURCE_ATTACHMENT_EXT = '.XLSX';
@@ -106,7 +106,7 @@ function findSingleSourceMessageForToday_() {
   const todayLabel = Utilities.formatDate(new Date(), FL2_TIMEZONE, 'dd.MM.yyyy');
 
   messages.forEach((message) => {
-    const subject = str_(message.getSubject());
+    const subject = str_(message.getSubject()).replace(/\s+/g, ' ').trim();
     if (!subject.startsWith(SOURCE_EMAIL_SUBJECT_PREFIX)) return;
     if (!message.getAttachments() || !message.getAttachments().length) return;
     const messageDateLabel = Utilities.formatDate(message.getDate(), FL2_TIMEZONE, 'dd.MM.yyyy');
