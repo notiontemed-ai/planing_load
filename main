@@ -957,6 +957,33 @@ function dateKey_(date) {
   return Utilities.formatDate(date, FL2_TIMEZONE, 'yyyy-MM-dd');
 }
 
+function parseLocalDayKey_(value) {
+  if (value === '' || value === null || value === undefined) return '';
+  const text = str_(value);
+  if (text) {
+    const ruMatch = text.match(/(\d{1,2})\.(\d{1,2})\.(\d{4})/);
+    if (ruMatch) {
+      const day = Number(ruMatch[1]);
+      const month = Number(ruMatch[2]);
+      const year = Number(ruMatch[3]);
+      if (day >= 1 && day <= 31 && month >= 1 && month <= 12) {
+        return `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+      }
+    }
+    const isoMatch = text.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (isoMatch) return `${isoMatch[1]}-${isoMatch[2]}-${isoMatch[3]}`;
+  }
+  const parsed = toDate_(value);
+  if (!parsed) return '';
+  return Utilities.formatDate(parsed, FL2_TIMEZONE, 'yyyy-MM-dd');
+}
+
+function dayKeyToDate_(dayKey) {
+  const m = str_(dayKey).match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return null;
+  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+}
+
 function monthKey_(date) {
   if (!date) return '';
   return Utilities.formatDate(date, FL2_TIMEZONE, 'yyyy-MM');
@@ -1577,7 +1604,7 @@ function prepareForwardLoadInput_(ss, options) {
   const filterScheduleTimer = fl2StageTimer_();
   const scheduleRows = scheduleSourceRows
     .filter((r) => {
-      const d = toDate_(r['Дата']);
+      const d = dayKeyToDate_(parseLocalDayKey_(r['Дата']));
       const emp = str_(r['Сотрудник']);
       const branch = str_(r['Филиал']);
       const cabinetType = detectCabinetType_(r['Кабинет']);
@@ -1637,7 +1664,7 @@ function prepareForwardLoadInput_(ss, options) {
 
   const filterRequestsTimer = fl2StageTimer_();
   const requestRowsRaw = requestSourceRows.filter((r) => {
-    const d = toDate_(r['Дата']) || toDate_(r['ДатаНачала']);
+    const d = dayKeyToDate_(parseLocalDayKey_(r['Дата']) || parseLocalDayKey_(r['ДатаНачала']));
     const branch = str_(r['Филиал']);
     if (selectedBranch && branch !== selectedBranch) return false;
     return isDateInRangeInclusive_(d, rangeStart, rangeEnd);
@@ -2123,7 +2150,7 @@ function detectCurrentDayFromRawRequests_(rows, allowedEmployees, excludedEmploy
       if (unassignedSet) unassignedSet.add(doctor);
       return;
     }
-    const d = toDate_(row['ДатаНачала']);
+    const d = dayKeyToDate_(parseLocalDayKey_(row['ДатаНачала']));
     if (!d) return;
     if (!maxDate || d > maxDate) maxDate = d;
   });
@@ -2137,7 +2164,7 @@ function detectCurrentDayFromSourceRequestsRows_(rows) {
   list.forEach((row) => {
     const status = str_(row['Состояние']);
     if (!isCompletedStatus(status)) return;
-    const startedAt = toDate_(row['ДатаНачала']);
+    const startedAt = dayKeyToDate_(parseLocalDayKey_(row['ДатаНачала']));
     if (!startedAt) return;
     if (!maxDate || startedAt > maxDate) maxDate = startedAt;
   });
@@ -2161,7 +2188,7 @@ function buildReceptionScheduleIndex(scheduleRows, excludedEmployees, allowedEmp
   const map = new Map();
   const rawByKey = new Map();
   scheduleRows.forEach((row) => {
-    const date = toDate_(row['Дата']);
+    const dayKey = parseLocalDayKey_(row['Дата']);
     const doctor = str_(row['Сотрудник']);
     if (!doctor || (excludedEmployees && excludedEmployees.has(doctor)) || hasStandaloneTestWord_(doctor)) return;
     if (allowedEmployees && !allowedEmployees.has(doctor)) return;
@@ -2169,8 +2196,8 @@ function buildReceptionScheduleIndex(scheduleRows, excludedEmployees, allowedEmp
     const type = str_(row['Тип времени']);
     const start = parseTimeToMinutes_(row['Время начала']);
     const end = parseTimeToMinutes_(row['Время окончания']);
-    if (!date || !doctor || !branch || !type || start === null || end === null || end <= start) return;
-    const key = `${dateKey_(date)}|${branch}|${doctor}`;
+    if (!dayKey || !doctor || !branch || !type || start === null || end === null || end <= start) return;
+    const key = `${dayKey}|${branch}|${doctor}`;
     if (!map.has(key)) map.set(key, []);
     const interval = { type, start, end };
     map.get(key).push(interval);
@@ -2232,7 +2259,8 @@ function buildLatestRequests(rows, excludedEmployees, allowedEmployees, unassign
         : (excludedEmployees && excludedEmployees.has(doctor))
           ? 'excluded_employee'
           : 'skip_by_name';
-    const nomenclature = str_(row['Номенклатура']).toLowerCase();
+    const nomenclatureRaw = str_(row['Номенклатура']);
+    const nomenclature = nomenclatureRaw.toLowerCase();
     const isDoctorVisit = nomenclature.includes('врача');
     const isPrimary = nomenclature.includes('первичный');
     if (!isAllowedProcessedRequestStatus(status)) {
@@ -2284,8 +2312,12 @@ function buildLatestRequests(rows, excludedEmployees, allowedEmployees, unassign
         branch: str_(row['Филиал']),
         startDate: intervalParts.date,
         endDate: intervalParts.date,
+        dayKey: intervalParts.dayKey,
+        startMin: intervalParts.startMin,
+        endMin: intervalParts.endMin,
         startTime: intervalParts.startTime,
         endTime: intervalParts.endTime,
+        nomenclature: nomenclatureRaw,
         isDoctorVisit,
         isPrimary,
         cabinet,
@@ -2294,6 +2326,13 @@ function buildLatestRequests(rows, excludedEmployees, allowedEmployees, unassign
         skipReason,
         intervalError: intervalParts.error,
       });
+      const inserted = latest.get(id);
+      if (prev) {
+        const prevNomenclature = str_(prev.nomenclature);
+        if (!inserted.nomenclature && prevNomenclature) inserted.nomenclature = prevNomenclature;
+        if (!inserted.nomenclature && prev.isDoctorVisit) inserted.isDoctorVisit = true;
+        if (!inserted.nomenclature && prev.isPrimary) inserted.isPrimary = true;
+      }
     } else {
       logDoctorRequest('DEBUG buildLatestRequests doctor request', {
         id,
@@ -2402,7 +2441,7 @@ function computeWindowMetrics(anchorDate, horizonDays, scheduleByDoctorDay, requ
   const scheduleKeysInWindow = new Set();
   scheduleByDoctorDay.forEach((_, key) => {
     const [dKey] = key.split('|');
-    const day = toDate_(dKey);
+    const day = dayKeyToDate_(dKey);
     if (!day || day < startDate || day > endDate) return;
     scheduleKeysInWindow.add(key);
   });
@@ -2411,7 +2450,8 @@ function computeWindowMetrics(anchorDate, horizonDays, scheduleByDoctorDay, requ
   requests.forEach((r) => {
     if (!isActivePlannedStatus(r.status) || !r.startDate) return;
     if (!includeAllNomenclature && !r.isDoctorVisit) return;
-    const key = `${dateKey_(r.startDate)}|${r.branch}|${r.doctor}`;
+    const requestDayKey = str_(r.dayKey) || dateKey_(r.startDate);
+    const key = `${requestDayKey}|${r.branch}|${r.doctor}`;
     if (!scheduleKeysInWindow.has(key)) {
       if (str_(r.doctor) === FL2_DEBUG_TRACE_DOCTOR && str_(r.branch) === FL2_DEBUG_TRACE_BRANCH) {
         fl2DebugTrace_('DEBUG computeWindowMetrics request_without_schedule_key', {
@@ -2434,7 +2474,7 @@ function computeWindowMetrics(anchorDate, horizonDays, scheduleByDoctorDay, requ
 
   scheduleByDoctorDay.forEach((intervals, key) => {
     const [dKey, branch, doctor] = key.split('|');
-    const day = toDate_(dKey);
+    const day = dayKeyToDate_(dKey);
     if (!day || day < startDate || day > endDate) return;
 
     const req = requestIndex.get(key) || { intervals: [], reqCount: 0, primaryCount: 0 };
@@ -5121,11 +5161,11 @@ function numOrZero_(value) {
 }
 
 function requestInterval(req) {
-  if (!req || !req.startDate) {
+  if (!req) {
     return { start: 0, end: 1 };
   }
-  const start = parseTimeToMinutes_(req.startTime || req['Время начала']);
-  const end = parseTimeToMinutes_(req.endTime || req['Время окончания']);
+  const start = req.startMin !== undefined ? toIntOrNull_(req.startMin) : parseTimeToMinutes_(req.startTime || req['Время начала']);
+  const end = req.endMin !== undefined ? toIntOrNull_(req.endMin) : parseTimeToMinutes_(req.endTime || req['Время окончания']);
   if (start === null || end === null || end <= start) {
     return { start: 0, end: 1 };
   }
@@ -5169,12 +5209,10 @@ function splitRequestDateTimeParts_(startDisplay, endDisplay, startRaw, endRaw) 
 function normalizeRequestIntervalParts_(row, startDateRaw, endDateRaw) {
   const startExtracted = extractDateTimeTokenParts_(row['ДатаНачала']);
   const endExtracted = extractDateTimeTokenParts_(row['ДатаОкончания']);
-  const dateFromRow = toDate_(row['Дата']);
-  const normalizedDate = dateFromRow
-    ? new Date(dateFromRow.getFullYear(), dateFromRow.getMonth(), dateFromRow.getDate())
-    : (startExtracted && startExtracted.date
-      ? startExtracted.date
-      : (startDateRaw ? new Date(startDateRaw.getFullYear(), startDateRaw.getMonth(), startDateRaw.getDate()) : null));
+  const dayKey = parseLocalDayKey_(row['Дата'])
+    || (startExtracted && startExtracted.dayKey)
+    || parseLocalDayKey_(startDateRaw);
+  const normalizedDate = dayKeyToDate_(dayKey);
   const startCandidate = row['Время начала'] !== undefined && row['Время начала'] !== null && row['Время начала'] !== ''
     ? row['Время начала']
     : (startExtracted && startExtracted.time ? startExtracted.time : '');
@@ -5185,20 +5223,28 @@ function normalizeRequestIntervalParts_(row, startDateRaw, endDateRaw) {
   const startMin = parseTimeToMinutes_(startCandidate);
   const endMin = parseTimeToMinutes_(endCandidate);
 
-  if (!normalizedDate || startMin === null || endMin === null) {
-    return { date: normalizedDate, startTime: str_(startCandidate), endTime: str_(endCandidate), error: 'Не удалось определить Дату/Время начала/Время окончания' };
+  if (!dayKey || !normalizedDate || startMin === null || endMin === null) {
+    return { date: normalizedDate, dayKey, startMin, endMin, startTime: str_(startCandidate), endTime: str_(endCandidate), error: 'Не удалось определить Дату/Время начала/Время окончания' };
   }
   if (endMin <= startMin) {
     return {
       date: normalizedDate,
+      dayKey,
+      startMin,
+      endMin,
       startTime: minutesToTimeString_(startMin),
       endTime: minutesToTimeString_(endMin),
       error: `Время окончания (${minutesToTimeString_(endMin)}) <= времени начала (${minutesToTimeString_(startMin)})`,
     };
   }
-  if (startDateRaw && endDateRaw && dateKey_(startDateRaw) !== dateKey_(endDateRaw)) {
+  const startDayKey = (startExtracted && startExtracted.dayKey) || parseLocalDayKey_(startDateRaw);
+  const endDayKey = (endExtracted && endExtracted.dayKey) || parseLocalDayKey_(endDateRaw);
+  if (startDayKey && endDayKey && startDayKey !== endDayKey) {
     return {
       date: normalizedDate,
+      dayKey,
+      startMin,
+      endMin,
       startTime: minutesToTimeString_(startMin),
       endTime: minutesToTimeString_(endMin),
       error: `Интервал выходит за границы суток (${formatDateDDMMYYYY_(startDateRaw)} ${minutesToTimeString_(startMin)} -> ${formatDateDDMMYYYY_(endDateRaw)} ${minutesToTimeString_(endMin)})`,
@@ -5207,6 +5253,9 @@ function normalizeRequestIntervalParts_(row, startDateRaw, endDateRaw) {
 
   return {
     date: new Date(normalizedDate.getFullYear(), normalizedDate.getMonth(), normalizedDate.getDate()),
+    dayKey,
+    startMin,
+    endMin,
     startTime: minutesToTimeString_(startMin),
     endTime: minutesToTimeString_(endMin),
     error: '',
@@ -5225,8 +5274,10 @@ function extractDateTimeTokenParts_(value) {
       const hh = Number(timeMatch[1]);
       const mm = Number(timeMatch[2]);
       if (day >= 1 && day <= 31 && month >= 1 && month <= 12 && hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) {
+        const dayKey = `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
         return {
           date: new Date(year, month - 1, day),
+          dayKey,
           time: `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`,
         };
       }
@@ -5235,8 +5286,10 @@ function extractDateTimeTokenParts_(value) {
 
   const date = toDate_(value);
   if (!date) return null;
+  const dayKey = parseLocalDayKey_(date);
   return {
     date: new Date(date.getFullYear(), date.getMonth(), date.getDate()),
+    dayKey,
     time: Utilities.formatDate(date, FL2_TIMEZONE, 'HH:mm'),
   };
 }
