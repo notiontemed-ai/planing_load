@@ -360,7 +360,7 @@ function buildProcessedRequestsSheet_(ss, requestsSheet, allowedEmployees, exclu
   const idxEnd = headers.indexOf('ДатаОкончания');
   const idxBranch = headers.indexOf('Филиал');
 
-  const excludedOutputHeaders = new Set(['Клиент', 'Примечание', 'ДатаНачала', 'ДатаОкончания']);
+  const excludedOutputHeaders = new Set(['Клиент', 'Примечание']);
   const sourceColumnIndexes = [];
   const outHeaders = [];
   headers.forEach((header, idx) => {
@@ -368,7 +368,7 @@ function buildProcessedRequestsSheet_(ss, requestsSheet, allowedEmployees, exclu
     sourceColumnIndexes.push(idx);
     outHeaders.push(header);
   });
-  const extraHeaders = ['Дата', 'Время начала', 'Время окончания'];
+  const extraHeaders = ['НачалоМин', 'ОкончаниеМин', 'ДлительностьМин'];
   extraHeaders.forEach((h) => {
     if (outHeaders.indexOf(h) < 0) outHeaders.push(h);
   });
@@ -409,11 +409,13 @@ function buildProcessedRequestsSheet_(ss, requestsSheet, allowedEmployees, exclu
   });
 
   const outRows = rows.map((row) => {
-    const parts = splitRequestDateTimeParts_(row[idxStart], row[idxEnd]);
+    const startDate = toDate_(row[idxStart]);
+    const endDate = toDate_(row[idxEnd]);
+    const timing = computeRequestTiming_(startDate, endDate);
     const item = sourceColumnIndexes.map((idx) => row[idx]);
-    item[outHeaders.indexOf('Дата')] = parts.date || '';
-    item[outHeaders.indexOf('Время начала')] = parts.startTime || '';
-    item[outHeaders.indexOf('Время окончания')] = parts.endTime || '';
+    item[outHeaders.indexOf('НачалоМин')] = timing.startMin;
+    item[outHeaders.indexOf('ОкончаниеМин')] = timing.endMin;
+    item[outHeaders.indexOf('ДлительностьМин')] = timing.durationMin;
     return item;
   });
 
@@ -423,7 +425,7 @@ function buildProcessedRequestsSheet_(ss, requestsSheet, allowedEmployees, exclu
   if (outRows.length) {
     target.getRange(2, 1, outRows.length, outHeaders.length).setValues(outRows);
   }
-  applyProcessedRequestsIntervalColumnFormat_(target, outHeaders);
+  applyProcessedRequestsMinuteColumnFormat_(target, outHeaders);
 }
 
 
@@ -1986,7 +1988,10 @@ function buildLatestRequests(rows, excludedEmployees, allowedEmployees, unassign
     if (!prev || statusSort > prev.statusSort || (statusSort === prev.statusSort && idx > prev.idx)) {
       const startDate = toDate_(row['ДатаНачала']);
       const endDate = toDate_(row['ДатаОкончания']);
-      const intervalParts = normalizeRequestIntervalParts_(row, startDate, endDate);
+      const timing = computeRequestTiming_(startDate, endDate);
+      const startMinStored = minuteOfDayFromValue_(row['НачалоМин']);
+      const endMinStored = minuteOfDayFromValue_(row['ОкончаниеМин']);
+      const durationMinStored = minuteOfDayFromValue_(row['ДлительностьМин']);
       const doctor = str_(row['Сотрудник']);
       const client = str_(row['Клиент']);
       const cabinet = str_(row['Кабинет']);
@@ -2007,26 +2012,20 @@ function buildLatestRequests(rows, excludedEmployees, allowedEmployees, unassign
         status,
         doctor,
         branch: str_(row['Филиал']),
-        startDate: intervalParts.date,
-        endDate: intervalParts.date,
-        startTime: intervalParts.startTime,
-        endTime: intervalParts.endTime,
+        startDate,
+        endDate,
+        startMin: startMinStored !== null ? startMinStored : timing.startMin,
+        endMin: endMinStored !== null ? endMinStored : timing.endMin,
+        durationMin: durationMinStored !== null ? durationMinStored : timing.durationMin,
         isDoctorVisit,
         isPrimary,
         cabinet,
         cabinetType,
         skipByName,
-        intervalError: intervalParts.error,
       });
     }
   });
-  return [...latest.values()].filter((r) => {
-    if (r.intervalError) {
-      fl2Log_('WARN', 'Заявка пропущена: некорректный интервал', `${r.id}: ${r.intervalError}`);
-      return false;
-    }
-    return !r.skipByName && (!rangeStart || !rangeEnd || isDateInRangeInclusive_(r.startDate, rangeStart, rangeEnd));
-  });
+  return [...latest.values()].filter((r) => !r.skipByName && (!rangeStart || !rangeEnd || isDateInRangeInclusive_(r.startDate, rangeStart, rangeEnd)));
 }
 function computeWindowMetrics(anchorDate, horizonDays, scheduleByDoctorDay, requests, options) {
   const startDate = addDays(anchorDate, 1);
@@ -4698,99 +4697,108 @@ function toIntOrNull_(value) {
   return Math.trunc(num);
 }
 
+function minuteOfDayFromValue_(value) {
+  if (value === '' || value === null || value === undefined) return null;
+
+  if (Object.prototype.toString.call(value) === '[object Date]' && !Number.isNaN(value.getTime())) {
+    return value.getHours() * 60 + value.getMinutes();
+  }
+
+  if (typeof value === 'number') {
+    if (Number.isFinite(value) && Math.abs(value) < 2) {
+      return ((Math.round(value * 24 * 60) % 1440) + 1440) % 1440;
+    }
+    if (Number.isFinite(value) && value >= 0 && value <= 1440) {
+      return Math.trunc(value);
+    }
+    const parsedAsDate = toDate_(value);
+    if (parsedAsDate) return parsedAsDate.getHours() * 60 + parsedAsDate.getMinutes();
+    return null;
+  }
+
+  const text = str_(value).trim();
+  if (!text) return null;
+  if (/^-?\d+(?:[.,]\d+)?$/.test(text)) {
+    const normalized = Number(text.replace(',', '.'));
+    if (Number.isFinite(normalized)) {
+      if (Math.abs(normalized) < 2) {
+        return ((Math.round(normalized * 24 * 60) % 1440) + 1440) % 1440;
+      }
+      if (normalized >= 0 && normalized <= 1440) {
+        return Math.trunc(normalized);
+      }
+    }
+  }
+
+  const timeMinutes = parseTimeToMinutes_(text);
+  if (timeMinutes !== null) return timeMinutes;
+
+  const parsedDate = toDate_(text);
+  if (!parsedDate) return null;
+  return parsedDate.getHours() * 60 + parsedDate.getMinutes();
+}
+
+function hasExplicitTime_(dateValue) {
+  if (!dateValue || Object.prototype.toString.call(dateValue) !== '[object Date]' || Number.isNaN(dateValue.getTime())) return false;
+  return dateValue.getHours() !== 0
+    || dateValue.getMinutes() !== 0
+    || dateValue.getSeconds() !== 0
+    || dateValue.getMilliseconds() !== 0;
+}
+
 function numOrZero_(value) {
   const num = Number(value);
   return Number.isFinite(num) ? num : 0;
 }
 
+function computeRequestTiming_(startDate, endDate) {
+  if (!startDate || !endDate) {
+    return { startMin: null, endMin: null, durationMin: null };
+  }
+  if (!hasExplicitTime_(startDate) && !hasExplicitTime_(endDate)) {
+    return { startMin: null, endMin: null, durationMin: null };
+  }
+  const startMin = startDate.getHours() * 60 + startDate.getMinutes();
+  let endMin = endDate.getHours() * 60 + endDate.getMinutes();
+  let durationMin = endMin - startMin;
+  if (durationMin <= 0) {
+    durationMin += 24 * 60;
+    endMin = startMin + durationMin;
+  }
+  return { startMin, endMin, durationMin };
+}
+
 function requestInterval(req) {
-  if (!req || !req.startDate) {
+  if (req && Number.isFinite(req.startMin) && Number.isFinite(req.durationMin) && req.durationMin > 0) {
+    return { start: req.startMin, end: req.startMin + req.durationMin };
+  }
+  if (req && Number.isFinite(req.startMin) && Number.isFinite(req.endMin) && req.endMin > req.startMin) {
+    return { start: req.startMin, end: req.endMin };
+  }
+  if (!req || !req.startDate || !req.endDate) {
     return { start: 0, end: 1 };
   }
-  const start = parseTimeToMinutes_(req.startTime || req['Время начала']);
-  const end = parseTimeToMinutes_(req.endTime || req['Время окончания']);
-  if (start === null || end === null || end <= start) {
+  if (!hasExplicitTime_(req.startDate) && !hasExplicitTime_(req.endDate)) {
     return { start: 0, end: 1 };
   }
-  return { start, end };
+  const timing = computeRequestTiming_(req.startDate, req.endDate);
+  if (!Number.isFinite(timing.startMin) || !Number.isFinite(timing.durationMin) || timing.durationMin <= 0) {
+    return { start: 0, end: 1 };
+  }
+  return { start: timing.startMin, end: timing.startMin + timing.durationMin };
 }
 
-function applyProcessedRequestsIntervalColumnFormat_(sheet, headers) {
+function applyProcessedRequestsMinuteColumnFormat_(sheet, headers) {
   if (!sheet || !Array.isArray(headers) || !headers.length) return;
-  const dateHeaders = ['Дата'];
-  const timeHeaders = ['Время начала', 'Время окончания'];
+  const minuteHeaders = ['НачалоМин', 'ОкончаниеМин', 'ДлительностьМин'];
   const dataRowCount = Math.max(1, sheet.getMaxRows() - 1);
-  dateHeaders.forEach((header) => {
+  minuteHeaders.forEach((header) => {
     const colIdx = headers.indexOf(header);
     if (colIdx < 0) return;
     const columnRange = sheet.getRange(2, colIdx + 1, dataRowCount, 1);
     columnRange.clearFormat();
-    columnRange.setNumberFormat('dd.mm.yyyy');
+    columnRange.setNumberFormat('0');
   });
-  timeHeaders.forEach((header) => {
-    const colIdx = headers.indexOf(header);
-    if (colIdx < 0) return;
-    const columnRange = sheet.getRange(2, colIdx + 1, dataRowCount, 1);
-    columnRange.clearFormat();
-    columnRange.setNumberFormat('hh:mm');
-  });
-}
-
-function splitRequestDateTimeParts_(startValue, endValue) {
-  const startDate = toDate_(startValue);
-  const endDate = toDate_(endValue);
-  const startMin = parseTimeToMinutes_(startValue);
-  const endMin = parseTimeToMinutes_(endValue);
-  if (!startDate || !endDate || startMin === null || endMin === null) {
-    return { date: '', startTime: '', endTime: '' };
-  }
-  const startDateLabel = Utilities.formatDate(startDate, FL2_TIMEZONE, 'yyyy-MM-dd');
-  const dateParts = startDateLabel.split('-').map((v) => Number(v));
-  return {
-    date: new Date(dateParts[0], dateParts[1] - 1, dateParts[2]),
-    startTime: minutesToTimeString_(startMin),
-    endTime: minutesToTimeString_(endMin),
-  };
-}
-
-function normalizeRequestIntervalParts_(row, startDateRaw, endDateRaw) {
-  const normalizedDate = toDate_(row['Дата']) || (startDateRaw ? new Date(startDateRaw.getFullYear(), startDateRaw.getMonth(), startDateRaw.getDate()) : null);
-  const startCandidate = row['Время начала'] !== undefined && row['Время начала'] !== null && row['Время начала'] !== ''
-    ? row['Время начала']
-    : (row['ДатаНачала'] !== undefined ? row['ДатаНачала'] : '');
-  const endCandidate = row['Время окончания'] !== undefined && row['Время окончания'] !== null && row['Время окончания'] !== ''
-    ? row['Время окончания']
-    : (row['ДатаОкончания'] !== undefined ? row['ДатаОкончания'] : '');
-
-  const startMin = parseTimeToMinutes_(startCandidate);
-  const endMin = parseTimeToMinutes_(endCandidate);
-
-  if (!normalizedDate || startMin === null || endMin === null) {
-    return { date: normalizedDate, startTime: startCandidate, endTime: endCandidate, error: 'Не удалось определить Дату/Время начала/Время окончания' };
-  }
-  if (endMin <= startMin) {
-    return {
-      date: normalizedDate,
-      startTime: minutesToTimeString_(startMin),
-      endTime: minutesToTimeString_(endMin),
-      error: `Время окончания (${minutesToTimeString_(endMin)}) <= времени начала (${minutesToTimeString_(startMin)})`,
-    };
-  }
-  if (startDateRaw && endDateRaw && dateKey_(startDateRaw) !== dateKey_(endDateRaw)) {
-    return {
-      date: normalizedDate,
-      startTime: minutesToTimeString_(startMin),
-      endTime: minutesToTimeString_(endMin),
-      error: `Интервал выходит за границы суток (${formatDateDDMMYYYY_(startDateRaw)} ${minutesToTimeString_(startMin)} -> ${formatDateDDMMYYYY_(endDateRaw)} ${minutesToTimeString_(endMin)})`,
-    };
-  }
-
-  return {
-    date: new Date(normalizedDate.getFullYear(), normalizedDate.getMonth(), normalizedDate.getDate()),
-    startTime: minutesToTimeString_(startMin),
-    endTime: minutesToTimeString_(endMin),
-    error: '',
-  };
 }
 function sumIntervalsMin(intervals) {
   return intervals.reduce((acc, i) => acc + (i.end - i.start), 0);
