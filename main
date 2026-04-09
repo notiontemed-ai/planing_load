@@ -772,7 +772,7 @@ function computeReportPeriodFromReferenceMoment_(referenceMoment) {
   const referenceDate = normalizeDateToTimezoneStart_(timestamp);
   if (!referenceDate) return null;
   const referenceHour = Number(Utilities.formatDate(timestamp, FL2_TIMEZONE, 'H'));
-  const startDate = referenceHour >= REPORT_PERIOD_ROLLOVER_HOUR ? addDays(referenceDate, 1) : referenceDate;
+  const startDate = referenceHour > REPORT_PERIOD_ROLLOVER_HOUR ? addDays(referenceDate, 1) : referenceDate;
   const endDate = addDays(startDate, 6);
   return {
     referenceMoment: timestamp,
