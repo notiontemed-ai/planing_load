@@ -38,9 +38,8 @@ function onOpen() {
     .addSubMenu(
       SpreadsheetApp.getUi()
         .createMenu('Триггеры')
-        .addItem('Агрегаторы: план без baseline + скидки + письмо', 'triggerBuildAggregatorDiscountsAndSend')
-        .addItem('Скидки без агрегаторов: план без baseline + письмо', 'triggerBuildNonAggregatorDiscountsAndSend')
-        .addItem('План с baseline + общий план + письма', 'triggerBuildBaselinePlansAndSend')
+        .addItem('Агрегаторы: скидки + письмо', 'triggerBuildAggregatorDiscountsAndSend')
+        .addItem('Полный цикл: планы + общий план + скидки + письма', 'triggerBuildBaselinePlansAndSend')
     )
     .addSeparator()
     .addItem('Архивировать план (ежедневно)', 'archivePlanReportsDaily')
@@ -2018,39 +2017,10 @@ function triggerBuildAggregatorDiscountsAndSend() {
   try {
     fl2LogTriggerSourceEmailPreview_();
     loadAndProcessSourceDataFromEmail();
-
-    runForwardLoadReportsDirect_({
-      includeBaseline: false,
-      sendEmails: false,
-    });
-
     updateDiscountsByPlan({ silent: true });
 
     sendDiscountsEmailsByMode_({
       targetMode: 'aggregators',
-      silent: true,
-    });
-  } catch (e) {
-    const message = e && e.message ? e.message : String(e);
-    const details = e && e.stack ? e.stack : (e && e.message ? e.message : String(e));
-    throw e;
-  }
-}
-
-function triggerBuildNonAggregatorDiscountsAndSend() {
-  try {
-    fl2LogTriggerSourceEmailPreview_();
-    loadAndProcessSourceDataFromEmail();
-
-    runForwardLoadReportsDirect_({
-      includeBaseline: false,
-      sendEmails: false,
-    });
-
-    updateDiscountsByPlan({ silent: true });
-
-    sendDiscountsEmailsByMode_({
-      targetMode: 'non_aggregators',
       silent: true,
     });
   } catch (e) {
@@ -2074,6 +2044,9 @@ function triggerBuildBaselinePlansAndSend() {
       sendEmail: true,
       refreshDiscountsAfter: false,
     });
+
+    updateDiscountsByPlan({ silent: true });
+    sendDiscountsEmails({ silent: true });
   } catch (e) {
     const message = e && e.message ? e.message : String(e);
     const details = e && e.stack ? e.stack : (e && e.message ? e.message : String(e));
@@ -2379,7 +2352,7 @@ function sendDiscountsEmailsByMode_(options) {
   let subject = `Сводка по скидкам на ${formatDateDDMMYYYY_(new Date())}`;
 
   if (targetMode === 'aggregators') {
-    mailingBranchName = 'Агрегатор';
+    mailingBranchName = 'Агрегаторы';
     allowedSectionKeys = ['aggregators'];
     subject = `Скидки для агрегаторов на ${formatDateDDMMYYYY_(new Date())}`;
   } else if (targetMode === 'non_aggregators') {
