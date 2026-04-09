@@ -1004,16 +1004,6 @@ function runForwardLoadReportsDirect_(options) {
   }
   ensureDoctorScheduleFresh(ss);
 
-  const builtAt = detectDoctorScheduleBuiltAtFallback(doctorScheduleSheet);
-  const graphSheet = ss.getSheetByName(SHEET_SCHEDULE_SOURCE);
-  const sourceMaxGraphCreated = graphSheet ? getSourceGraphMaxCreatedAt_(graphSheet) : new Date(0);
-  if (!builtAt) {
-    throw new Error('Сначала сформируйте лист "Обработанный график" (в последней строке нет системного timestamp)');
-  }
-  if (sourceMaxGraphCreated > builtAt) {
-    throw new Error(`"Обработанный график" неактуален по timestamp (последняя сборка: ${formatDateTimeDDMMYYYY_(builtAt)}). Обновите его перед запуском.`);
-  }
-
   const prep = prepareForwardLoadInput_(ss, { persistUnassigned: false });
   const currentDay = opts.currentDay ? new Date(Number(opts.currentDay)) : prep.currentDay;
   const branches = prep.branches || [];
@@ -1081,17 +1071,6 @@ function runForwardLoadReportAllBranchesCore_(options) {
     throw new Error('Проверьте наличие листов: Обработанный график, Обработанные заявки');
   }
   ensureDoctorScheduleFresh(ss);
-
-  const builtAt = detectDoctorScheduleBuiltAtFallback(doctorScheduleSheet);
-  const graphSheet = ss.getSheetByName(SHEET_SCHEDULE_SOURCE);
-  const sourceMaxGraphCreated = graphSheet ? getSourceGraphMaxCreatedAt_(graphSheet) : new Date(0);
-  if (!builtAt) {
-    throw new Error('Сначала сформируйте лист "Обработанный график" (в последней строке нет системного timestamp)');
-  }
-  if (sourceMaxGraphCreated > builtAt) {
-    throw new Error(`"Обработанный график" неактуален по timestamp (последняя сборка: ${formatDateTimeDDMMYYYY_(builtAt)}). Обновите его перед запуском.`);
-  }
-  fl2Log_('INFO', 'Пакетный план: проверка актуальности графика', `scheduleTimestamp=${formatDateTimeDDMMYYYY_(builtAt)}, sourceMaxCreated=${formatDateTimeDDMMYYYY_(sourceMaxGraphCreated)}`);
 
   const prep = prepareForwardLoadInput_(ss, { persistUnassigned: false });
   const currentDay = opts.currentDay ? new Date(Number(opts.currentDay)) : prep.currentDay;
@@ -4069,22 +4048,10 @@ function renderOverallCabinetTypeTable_(sheet, row, clinicRows, title) {
   return row;
 }
 
-function getSourceGraphMaxCreatedAt_(graphSheet) {
-  if (!graphSheet) return new Date(0);
-  const graphRows = getSheetObjects_(graphSheet);
-  let sourceMaxGraphCreated = new Date(0);
-  graphRows.forEach((row) => {
-    const d = toDate_(row['Дата создания']);
-    if (d && d > sourceMaxGraphCreated) sourceMaxGraphCreated = d;
-  });
-  return sourceMaxGraphCreated;
-}
-
 function ensureDoctorScheduleFresh(ss) {
-  const graphSheet = ss.getSheetByName(SHEET_SCHEDULE_SOURCE);
   const doctorScheduleSheet = ss.getSheetByName(SHEET_DOCTOR_SCHEDULE);
-  if (!graphSheet || !doctorScheduleSheet) {
-    throw new Error('Проверьте наличие листов: График, Обработанный график');
+  if (!doctorScheduleSheet) {
+    throw new Error('Проверьте наличие листа: Обработанный график');
   }
   const builtAt = detectDoctorScheduleBuiltAtFallback(doctorScheduleSheet);
   if (!builtAt) {
@@ -4095,10 +4062,6 @@ function ensureDoctorScheduleFresh(ss) {
       throw new Error('Сначала сформируйте лист "Обработанный график" (в последней строке нет системного timestamp)');
     }
     return ensureDoctorScheduleFresh(ss);
-  }
-  const sourceMaxGraphCreated = getSourceGraphMaxCreatedAt_(graphSheet);
-  if (sourceMaxGraphCreated > builtAt) {
-    throw new Error(`"Обработанный график" неактуален (последняя сборка: ${formatDateTimeDDMMYYYY_(builtAt)}). Обновите его перед запуском.`);
   }
 }
 
