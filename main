@@ -9,7 +9,6 @@ const MENU_NAME = 'TEMED';
 const SOURCE_EMAIL_SUBJECT_PREFIX = 'Выгрузка графика и заявок клиника "Темед"';
 const SOURCE_SCHEDULE_ATTACHMENT_PREFIX = 'Графики ';
 const SOURCE_REQUESTS_ATTACHMENT_PREFIX = 'Заявки ';
-const SOURCE_ATTACHMENT_EXT = '.XLSX';
 const FL2_SYSTEM_MARKER = '__SYSTEM_TIMESTAMP__';
 const FL2_PROCESSED_REQUESTS_CURRENT_DAY_HEADER = 'CurrentDate';
 
@@ -89,18 +88,16 @@ function findSingleSourceMessageForToday_() {
     messages.push(...thread.getMessages());
   });
 
-  const todayMatches = [];
-  const todayLabel = Utilities.formatDate(new Date(), FL2_TIMEZONE, 'dd.MM.yyyy');
+  const subjectMatches = [];
 
   messages.forEach((message) => {
     const subject = str_(message.getSubject()).replace(/\s+/g, ' ').trim();
     if (!subject.startsWith(SOURCE_EMAIL_SUBJECT_PREFIX)) return;
     if (!message.getAttachments() || !message.getAttachments().length) return;
-    const messageDateLabel = Utilities.formatDate(message.getDate(), FL2_TIMEZONE, 'dd.MM.yyyy');
-    if (messageDateLabel === todayLabel) todayMatches.push(message);
+    subjectMatches.push(message);
   });
 
-  if (!todayMatches.length) {
+  if (!subjectMatches.length) {
     const checkedCount = messages.length;
     const examples = messages
       .slice()
@@ -114,11 +111,11 @@ function findSingleSourceMessageForToday_() {
       });
     const examplesText = examples.length ? examples.join(' ; ') : 'нет писем';
     throw new Error(
-      `Не найдено письмо за текущую дату с темой, начинающейся на "${SOURCE_EMAIL_SUBJECT_PREFIX}". ` +
+      `Не найдено письмо с темой, начинающейся на "${SOURCE_EMAIL_SUBJECT_PREFIX}". ` +
       `Проверено сообщений: ${checkedCount}. Примеры найденных писем: ${examplesText}`
     );
   }
-  return pickLatestMessageByDate_(todayMatches);
+  return pickLatestMessageByDate_(subjectMatches);
 }
 
 function pickLatestMessageByDate_(messages) {
@@ -134,13 +131,17 @@ function pickLatestMessageByDate_(messages) {
 
 function pickSourceAttachments_(attachments) {
   const list = Array.isArray(attachments) ? attachments : [];
+  if (list.length !== 2) {
+    throw new Error('В письме должно быть ровно 2 вложения: "Заявки*" и "Графики*"');
+  }
+
   const scheduleMatches = list.filter((attachment) => {
     const fileName = str_(attachment.getName());
-    return fileName.startsWith(SOURCE_SCHEDULE_ATTACHMENT_PREFIX) && fileName.endsWith(SOURCE_ATTACHMENT_EXT);
+    return fileName.startsWith(SOURCE_SCHEDULE_ATTACHMENT_PREFIX);
   });
   const requestsMatches = list.filter((attachment) => {
     const fileName = str_(attachment.getName());
-    return fileName.startsWith(SOURCE_REQUESTS_ATTACHMENT_PREFIX) && fileName.endsWith(SOURCE_ATTACHMENT_EXT);
+    return fileName.startsWith(SOURCE_REQUESTS_ATTACHMENT_PREFIX);
   });
 
   if (scheduleMatches.length !== 1) {
