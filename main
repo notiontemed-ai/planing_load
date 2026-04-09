@@ -38,8 +38,9 @@ function onOpen() {
     .addSubMenu(
       SpreadsheetApp.getUi()
         .createMenu('Триггеры')
-        .addItem('Агрегаторы: скидки + письмо', 'triggerBuildAggregatorDiscountsAndSend')
-        .addItem('Полный цикл: планы + общий план + скидки + письма', 'triggerBuildBaselinePlansAndSend')
+        .addItem('Агрегаторы: план без baseline + скидки + письмо', 'triggerBuildAggregatorDiscountsAndSend')
+        .addItem('Скидки без агрегаторов: план без baseline + письмо', 'triggerBuildNonAggregatorDiscountsAndSend')
+        .addItem('План с baseline + общий план + письма', 'triggerBuildBaselinePlansAndSend')
     )
     .addSeparator()
     .addItem('Архивировать план (ежедневно)', 'archivePlanReportsDaily')
@@ -2015,7 +2016,14 @@ function sendForwardReportEmail(ss, selectedBranch, currentDay) {
 
 function triggerBuildAggregatorDiscountsAndSend() {
   try {
+    fl2LogTriggerSourceEmailPreview_();
     loadAndProcessSourceDataFromEmail();
+
+    runForwardLoadReportsDirect_({
+      includeBaseline: false,
+      sendEmails: false,
+    });
+
     updateDiscountsByPlan({ silent: true });
 
     sendDiscountsEmailsByMode_({
@@ -2029,8 +2037,32 @@ function triggerBuildAggregatorDiscountsAndSend() {
   }
 }
 
+function triggerBuildNonAggregatorDiscountsAndSend() {
+  try {
+    fl2LogTriggerSourceEmailPreview_();
+    loadAndProcessSourceDataFromEmail();
+
+    runForwardLoadReportsDirect_({
+      includeBaseline: false,
+      sendEmails: false,
+    });
+
+    updateDiscountsByPlan({ silent: true });
+
+    sendDiscountsEmailsByMode_({
+      targetMode: 'non_aggregators',
+      silent: true,
+    });
+  } catch (e) {
+    const message = e && e.message ? e.message : String(e);
+    const details = e && e.stack ? e.stack : (e && e.message ? e.message : String(e));
+    throw e;
+  }
+}
+
 function triggerBuildBaselinePlansAndSend() {
   try {
+    fl2LogTriggerSourceEmailPreview_();
     loadAndProcessSourceDataFromEmail();
 
     runForwardLoadReportsDirect_({
@@ -2042,9 +2074,6 @@ function triggerBuildBaselinePlansAndSend() {
       sendEmail: true,
       refreshDiscountsAfter: false,
     });
-
-    updateDiscountsByPlan({ silent: true });
-    sendDiscountsEmails({ silent: true });
   } catch (e) {
     const message = e && e.message ? e.message : String(e);
     const details = e && e.stack ? e.stack : (e && e.message ? e.message : String(e));
@@ -2350,7 +2379,7 @@ function sendDiscountsEmailsByMode_(options) {
   let subject = `Сводка по скидкам на ${formatDateDDMMYYYY_(new Date())}`;
 
   if (targetMode === 'aggregators') {
-    mailingBranchName = 'Агрегаторы';
+    mailingBranchName = 'Агрегатор';
     allowedSectionKeys = ['aggregators'];
     subject = `Скидки для агрегаторов на ${formatDateDDMMYYYY_(new Date())}`;
   } else if (targetMode === 'non_aggregators') {
