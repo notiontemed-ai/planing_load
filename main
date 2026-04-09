@@ -243,8 +243,8 @@ function buildDoctorSchedule() {
   const employeeRegistry = getEmployeeRegistry_(ss);
   const currentDay = detectCurrentDayFromRawRequests_(requestRows, employeeRegistry.allowed, excludedEmployees, employeeRegistry.unassignedFound);
   if (!currentDay) throw new Error('Не найдены выполненные заявки для определения актуальной даты');
-  const rangeStart = addDays(currentDay, -2);
-  const rangeEnd = addDays(currentDay, 8);
+  const rangeStart = addDays(currentDay, -42);
+  const rangeEnd = addDays(currentDay, 7);
   const requestsRangeEnd = addDays(currentDay, 8);
 
   const grouped = new Map();
@@ -1463,8 +1463,10 @@ function prepareForwardLoadInput_(ss, options) {
   const anchorDay = reportPeriod && reportPeriod.anchorDate
     ? new Date(reportPeriod.anchorDate.getTime())
     : new Date(currentDay.getFullYear(), currentDay.getMonth(), currentDay.getDate() - 1);
-  const rangeStart = addDays(anchorDay, -2);
-  const rangeEnd = addDays(anchorDay, 8);
+  const rangeStart = addDays(anchorDay, -42);
+  const rangeEnd = reportPeriod && reportPeriod.endDate
+    ? new Date(reportPeriod.endDate.getTime())
+    : addDays(anchorDay, 7);
 
   const readScheduleTimer = fl2StageTimer_();
   const scheduleSourceRows = selectedBranch
@@ -1596,6 +1598,21 @@ function buildForwardLoadReportForBranch_(ss, selectedBranch, prep, options) {
   stage('branch: buildLatestRequests done', `rows=${latestRequests.length}`, latestReqTimer);
   tick();
 
+  const currentPlanDebug = buildCurrentPlanDebugStats_(latestRequests, scheduleByDoctorDay, doctorScheduleByDoctorDay);
+  fl2Log_(
+    'INFO',
+    'Диагностика текущего плана по филиалу',
+    [
+      `Филиал=${branchName}`,
+      `filteredScheduleRows=${filteredScheduleRows.length}`,
+      `filteredRequestRows=${filteredRequestRows.length}`,
+      `latestRequests=${latestRequests.length}`,
+      `scheduleByDoctorDay.keys=${scheduleByDoctorDay.size}`,
+      `doctorScheduleByDoctorDay.keys=${doctorScheduleByDoctorDay.size}`,
+      `matchedRequestScheduleKeys=${currentPlanDebug.matchedRequestScheduleKeys}`,
+    ].join(', ')
+  );
+
   const h3Timer = fl2StageTimer_();
   const horizon3 = computeWindowMetrics(anchorDay, 3, doctorScheduleByDoctorDay, latestRequests);
   stage('branch: computeWindowMetrics(3) done', `byBranch=${horizon3.byBranch.size}, byDoctor=${horizon3.byDoctor.size}`, h3Timer);
@@ -1675,6 +1692,22 @@ function buildForwardLoadReportForBranch_(ss, selectedBranch, prep, options) {
   stage('branch: filtered doctors rows', `rowsDoctor=${rowsDoctor.length}`, doctorFilterTimer);
   tick();
 
+  const occupiedDoctorsCount = rowsDoctor.filter((r) => (numOrZero_(r && r.c3 && r.c3.occupiedMin) > 0) || (numOrZero_(r && r.c7 && r.c7.occupiedMin) > 0)).length;
+  const zeroDoctorsCount = rowsDoctor.filter((r) => numOrZero_(r && r.c3 && r.c3.occupiedMin) === 0 && numOrZero_(r && r.c7 && r.c7.occupiedMin) === 0).length;
+  fl2Log_(
+    'INFO',
+    'Диагностика занятости врачей по филиалу',
+    `Филиал=${branchName}, doctorsOccupiedPositive=${occupiedDoctorsCount}, doctorsOccupiedZeroBoth=${zeroDoctorsCount}`
+  );
+
+  if (currentPlanDebug.participatingRequests > 0 && rowsDoctor.length > 0 && zeroDoctorsCount === rowsDoctor.length) {
+    fl2Log_(
+      'ERROR',
+      'План рассчитан аномально: заявки есть, но занятость по всем врачам = 0',
+      `Филиал=${branchName}, participatingRequests=${currentPlanDebug.participatingRequests}, rowsDoctor=${rowsDoctor.length}`
+    );
+  }
+
   const massageSummary = aggregateForwardCategorySummary_(rowsAllNomenclature, massageSet);
   const ftSummary = aggregateForwardCategorySummary_(rowsAllNomenclature, ftSet);
   const cabinetSummary = buildCabinetTypeSummary_(anchorDay, filteredScheduleRows, latestRequests, {
@@ -1694,6 +1727,30 @@ function buildForwardLoadReportForBranch_(ss, selectedBranch, prep, options) {
   tick();
 
   return prep.currentDay;
+}
+
+function buildCurrentPlanDebugStats_(latestRequests, scheduleByDoctorDay, doctorScheduleByDoctorDay) {
+  const scheduleKeys = new Set(doctorScheduleByDoctorDay ? doctorScheduleByDoctorDay.keys() : []);
+  let matchedRequestScheduleKeys = 0;
+  let participatingRequests = 0;
+  const uniqueRequestKeys = new Set();
+
+  (latestRequests || []).forEach((r) => {
+    if (!r || !r.startDate) return;
+    if (!isActivePlannedStatus(r.status) || !r.isDoctorVisit) return;
+    participatingRequests += 1;
+    const key = `${dateKey_(r.startDate)}|${str_(r.branch)}|${str_(r.doctor)}`;
+    if (uniqueRequestKeys.has(key)) return;
+    uniqueRequestKeys.add(key);
+    if (scheduleKeys.has(key)) matchedRequestScheduleKeys += 1;
+  });
+
+  return {
+    matchedRequestScheduleKeys,
+    participatingRequests,
+    scheduleKeys: scheduleByDoctorDay ? scheduleByDoctorDay.size : 0,
+    doctorScheduleKeys: doctorScheduleByDoctorDay ? doctorScheduleByDoctorDay.size : 0,
+  };
 }
 
 function clearForwardLoadBatchTriggers_() {
@@ -4667,6 +4724,11 @@ function toIntOrNull_(value) {
   const num = Number(value);
   if (!Number.isFinite(num)) return null;
   return Math.trunc(num);
+}
+
+function numOrZero_(value) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : 0;
 }
 
 function computeRequestTiming_(startDate, endDate) {
