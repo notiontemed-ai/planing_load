@@ -38,6 +38,14 @@ function onOpen() {
     .addSeparator()
     .addItem('Собрать общий план', 'buildOverallForecastReport')
     .addSeparator()
+    .addSubMenu(
+      SpreadsheetApp.getUi()
+        .createMenu('Триггеры')
+        .addItem('Агрегаторы: план без baseline + скидки + письмо', 'triggerBuildAggregatorDiscountsAndSend')
+        .addItem('Скидки без агрегаторов: план без baseline + письмо', 'triggerBuildNonAggregatorDiscountsAndSend')
+        .addItem('План с baseline + общий план + письма', 'triggerBuildBaselinePlansAndSend')
+    )
+    .addSeparator()
     .addItem('Архивировать план (ежедневно)', 'archivePlanReportsDaily')
     .addToUi();
 
@@ -997,6 +1005,8 @@ function runForwardLoadReportAllBranchesCore_(options) {
   const opts = options || {};
   const ss = SpreadsheetApp.getActive();
   const sendEmails = opts.sendEmails !== false;
+  const includeBaseline = opts.includeBaseline !== false;
+  const refreshDiscountsAfter = opts.refreshDiscountsAfter === true;
   const props = PropertiesService.getScriptProperties();
   const existing = props.getProperty(FL2_PROP_FORWARD_BATCH_STATE);
   if (existing) {
@@ -1059,7 +1069,9 @@ function runForwardLoadReportAllBranchesCore_(options) {
         massageSet: sharedMassageSet,
         ftSet: sharedFtSet,
       });
-      buildForwardLoadReportForBranch_(ss, branch, branchPrep);
+      buildForwardLoadReportForBranch_(ss, branch, branchPrep, {
+        includeBaseline,
+      });
 
       if (sendEmails) {
         sendForwardReportEmail(ss, branch, currentDay);
@@ -1077,7 +1089,9 @@ function runForwardLoadReportAllBranchesCore_(options) {
     ? `Пакетный план завершён с ошибками: ${errors.slice(0, 3).join(' | ')}`
     : 'Пакетный план по клиникам завершён';
 
-  refreshDiscountsAfterPlanUpdate_();
+  if (refreshDiscountsAfter) {
+    refreshDiscountsAfterPlanUpdate_();
+  }
   SpreadsheetApp.getActive().toast(doneMsg, MENU_NAME, 8);
 }
 
@@ -1322,14 +1336,6 @@ function confirmAndSendForwardBatchEmails() {
     }
   });
 
-  try {
-    sendDiscountsEmails({ silent: true });
-    fl2Log_('INFO', 'Пакетный план: отправлены письма по скидкам', 'Рассылка по группам из листа "Отправка"');
-  } catch (e) {
-    errors.push(`Рассылка скидок: ${e && e.message ? e.message : String(e)}`);
-    fl2Log_('ERROR', 'Пакетный план: ошибка рассылки скидок', e && e.message ? e.message : String(e));
-  }
-
   props.deleteProperty(FL2_PROP_FORWARD_BATCH_PENDING_EMAIL);
   const doneMsg = errors.length
     ? `Рассылка завершена с ошибками: ${errors.slice(0, 3).join(' | ')}`
@@ -1495,9 +1501,11 @@ function prepareForwardLoadInput_(ss, options) {
   };
 }
 
-function buildForwardLoadReportForBranch_(ss, selectedBranch, prep) {
+function buildForwardLoadReportForBranch_(ss, selectedBranch, prep, options) {
   const branchName = str_(selectedBranch);
   if (!branchName) throw new Error('Филиал не задан для пакетного расчета');
+  const opts = options || {};
+  const includeBaseline = opts.includeBaseline !== false;
 
   const logCtx = prep && prep.logCtx ? prep.logCtx : null;
   const hb = prep && typeof prep.onHeartbeat === 'function' ? prep.onHeartbeat : null;
@@ -1549,15 +1557,8 @@ function buildForwardLoadReportForBranch_(ss, selectedBranch, prep) {
   stage('branch: computeWindowMetrics(7) done', `byBranch=${horizon7.byBranch.size}, byDoctor=${horizon7.byDoctor.size}`, h7Timer);
   tick();
 
-  const b3Timer = fl2StageTimer_();
-  const baseline3 = computeBaselineMetrics(anchorDay, 3, doctorScheduleByDoctorDay, latestRequests, { category: 'doctor' });
-  stage('branch: computeBaselineMetrics(3) done', `byBranch=${baseline3.byBranch.size}, byDoctor=${baseline3.byDoctor.size}`, b3Timer);
-  tick();
-
-  const b7Timer = fl2StageTimer_();
-  const baseline7 = computeBaselineMetrics(anchorDay, 7, doctorScheduleByDoctorDay, latestRequests, { category: 'doctor' });
-  stage('branch: computeBaselineMetrics(7) done', `byBranch=${baseline7.byBranch.size}, byDoctor=${baseline7.byDoctor.size}`, b7Timer);
-  tick();
+  let baseline3;
+  let baseline7;
 
   const h3AllTimer = fl2StageTimer_();
   const horizon3All = computeWindowMetrics(anchorDay, 3, scheduleByDoctorDay, latestRequests, { includeAllNomenclature: true });
@@ -1569,29 +1570,49 @@ function buildForwardLoadReportForBranch_(ss, selectedBranch, prep) {
   stage('branch: computeWindowMetrics(7, all nomenclature) done', `byBranch=${horizon7All.byBranch.size}, byDoctor=${horizon7All.byDoctor.size}`, h7AllTimer);
   tick();
 
-  const b3AllTimer = fl2StageTimer_();
-  const baseline3All = computeBaselineMetrics(anchorDay, 3, scheduleByDoctorDay, latestRequests, {
-    includeAllNomenclature: true,
-    categoryResolver: (employee) => {
-      if (massageSet.has(str_(employee))) return 'massage';
-      if (ftSet.has(str_(employee))) return 'ft';
-      return 'doctor';
-    },
-  });
-  stage('branch: computeBaselineMetrics(3, all nomenclature) done', `byBranch=${baseline3All.byBranch.size}, byDoctor=${baseline3All.byDoctor.size}`, b3AllTimer);
-  tick();
+  let baseline3All;
+  let baseline7All;
 
-  const b7AllTimer = fl2StageTimer_();
-  const baseline7All = computeBaselineMetrics(anchorDay, 7, scheduleByDoctorDay, latestRequests, {
-    includeAllNomenclature: true,
-    categoryResolver: (employee) => {
-      if (massageSet.has(str_(employee))) return 'massage';
-      if (ftSet.has(str_(employee))) return 'ft';
-      return 'doctor';
-    },
-  });
-  stage('branch: computeBaselineMetrics(7, all nomenclature) done', `byBranch=${baseline7All.byBranch.size}, byDoctor=${baseline7All.byDoctor.size}`, b7AllTimer);
-  tick();
+  if (includeBaseline) {
+    const b3Timer = fl2StageTimer_();
+    baseline3 = computeBaselineMetrics(anchorDay, 3, doctorScheduleByDoctorDay, latestRequests, { category: 'doctor' });
+    stage('branch: computeBaselineMetrics(3) done', `byBranch=${baseline3.byBranch.size}, byDoctor=${baseline3.byDoctor.size}`, b3Timer);
+    tick();
+
+    const b7Timer = fl2StageTimer_();
+    baseline7 = computeBaselineMetrics(anchorDay, 7, doctorScheduleByDoctorDay, latestRequests, { category: 'doctor' });
+    stage('branch: computeBaselineMetrics(7) done', `byBranch=${baseline7.byBranch.size}, byDoctor=${baseline7.byDoctor.size}`, b7Timer);
+    tick();
+
+    const b3AllTimer = fl2StageTimer_();
+    baseline3All = computeBaselineMetrics(anchorDay, 3, scheduleByDoctorDay, latestRequests, {
+      includeAllNomenclature: true,
+      categoryResolver: (employee) => {
+        if (massageSet.has(str_(employee))) return 'massage';
+        if (ftSet.has(str_(employee))) return 'ft';
+        return 'doctor';
+      },
+    });
+    stage('branch: computeBaselineMetrics(3, all nomenclature) done', `byBranch=${baseline3All.byBranch.size}, byDoctor=${baseline3All.byDoctor.size}`, b3AllTimer);
+    tick();
+
+    const b7AllTimer = fl2StageTimer_();
+    baseline7All = computeBaselineMetrics(anchorDay, 7, scheduleByDoctorDay, latestRequests, {
+      includeAllNomenclature: true,
+      categoryResolver: (employee) => {
+        if (massageSet.has(str_(employee))) return 'massage';
+        if (ftSet.has(str_(employee))) return 'ft';
+        return 'doctor';
+      },
+    });
+    stage('branch: computeBaselineMetrics(7, all nomenclature) done', `byBranch=${baseline7All.byBranch.size}, byDoctor=${baseline7All.byDoctor.size}`, b7AllTimer);
+    tick();
+  } else {
+    baseline3 = { byBranch: new Map(), byDoctor: new Map() };
+    baseline7 = { byBranch: new Map(), byDoctor: new Map() };
+    baseline3All = { byBranch: new Map(), byDoctor: new Map() };
+    baseline7All = { byBranch: new Map(), byDoctor: new Map() };
+  }
 
   const mergeTimer = fl2StageTimer_();
   const rowsBranch = mergeForwardRows(horizon3.byBranch, horizon7.byBranch, baseline3.byBranch, baseline7.byBranch);
@@ -1607,13 +1628,19 @@ function buildForwardLoadReportForBranch_(ss, selectedBranch, prep) {
 
   const massageSummary = aggregateForwardCategorySummary_(rowsAllNomenclature, massageSet);
   const ftSummary = aggregateForwardCategorySummary_(rowsAllNomenclature, ftSet);
-  const cabinetSummary = buildCabinetTypeSummary_(anchorDay, filteredScheduleRows, latestRequests);
+  const cabinetSummary = buildCabinetTypeSummary_(anchorDay, filteredScheduleRows, latestRequests, {
+    includeBaseline,
+  });
   const massageRows = rowsAllNomenclature.filter((r) => massageSet.has(str_(r.doctor)));
   const ftRows = rowsAllNomenclature.filter((r) => ftSet.has(str_(r.doctor)));
-  const cabinetRows = buildCabinetRowsByName_(anchorDay, filteredScheduleRows, latestRequests);
+  const cabinetRows = buildCabinetRowsByName_(anchorDay, filteredScheduleRows, latestRequests, {
+    includeBaseline,
+  });
 
   const renderTimer = fl2StageTimer_();
-  renderForwardLoadSheet(ss, anchorDay, prep.reportPeriod, branchName, rowsBranch, rowsDoctor, massageSummary, ftSummary, cabinetSummary, massageRows, ftRows, cabinetRows);
+  renderForwardLoadSheet(ss, anchorDay, prep.reportPeriod, branchName, rowsBranch, doctorRows, massageSummary, ftSummary, cabinetSummary, massageRows, ftRows, cabinetRows, {
+    includeBaseline,
+  });
   stage('branch: renderForwardLoadSheet done', `rowsBranch=${rowsBranch.length}, rowsDoctor=${rowsDoctor.length}`, renderTimer);
   tick();
 
@@ -2065,7 +2092,9 @@ function mergeForwardRows(current3, current7, base3, base7) {
   });
   return rows;
 }
-function renderForwardLoadSheet(ss, currentDay, reportPeriod, selectedBranch, branchRows, doctorRows, massageSummary, ftSummary, cabinetSummary, massageRows, ftRows, cabinetRows) {
+function renderForwardLoadSheet(ss, currentDay, reportPeriod, selectedBranch, branchRows, doctorRows, massageSummary, ftSummary, cabinetSummary, massageRows, ftRows, cabinetRows, options) {
+  const opts = options || {};
+  const includeBaseline = opts.includeBaseline !== false;
   const sheet = getOrCreateSheet_(ss, selectedBranch);
   resetSheetForRender_(sheet);
   let row = 1;
@@ -2112,6 +2141,7 @@ function renderForwardLoadSheet(ss, currentDay, reportPeriod, selectedBranch, br
     cabinetRows,
     horizon: '3d',
     tableBase: 1,
+    includeBaseline,
   });
 
   row += 1;
@@ -2126,6 +2156,7 @@ function renderForwardLoadSheet(ss, currentDay, reportPeriod, selectedBranch, br
     cabinetRows,
     horizon: '7d',
     tableBase: 5,
+    includeBaseline,
   });
 
   sheet.autoResizeColumns(1, 8);
@@ -2133,6 +2164,7 @@ function renderForwardLoadSheet(ss, currentDay, reportPeriod, selectedBranch, br
 
 function renderPlanBlockByHorizon_(sheet, row, horizonLabel, periodLabel, ctx) {
   const h = ctx.horizon;
+  const includeBaseline = ctx.includeBaseline !== false;
   const summaryHeader = ['Категория', 'Приемные (ч)', 'Занятые (ч)', 'Загрузка (%)', 'Свободные (ч)', 'Заявки (шт)', 'Заявки на ПП (шт)', 'Свободные слоты под ПП'];
   const titleRowRange = sheet.getRange(row, 1, 1, summaryHeader.length);
   const titleRange = sheet.getRange(row, 1, 1, 4);
@@ -2153,34 +2185,36 @@ function renderPlanBlockByHorizon_(sheet, row, horizonLabel, periodLabel, ctx) {
   styleForecastHeaderRow(sheet, row, summaryHeader.length);
   row += 1;
 
-  row = renderSummaryCategoryRow_(sheet, row, 'Врачи', ctx.doctorsSummary.current, ctx.doctorsSummary.baseline, h, summaryHeader.length, true);
-  row = renderSummaryCategoryRow_(sheet, row, 'Массажисты', ctx.massageSummary.current, ctx.massageSummary.baseline, h, summaryHeader.length, false);
-  row = renderSummaryCategoryRow_(sheet, row, 'ФТ', ctx.ftSummary.current, ctx.ftSummary.baseline, h, summaryHeader.length, false);
-  row = renderSummaryCategoryRow_(sheet, row, 'Физиотерапия', ctx.physioSummary.current, ctx.physioSummary.baseline, h, summaryHeader.length, false);
+  row = renderSummaryCategoryRow_(sheet, row, 'Врачи', ctx.doctorsSummary.current, ctx.doctorsSummary.baseline, h, summaryHeader.length, true, includeBaseline);
+  row = renderSummaryCategoryRow_(sheet, row, 'Массажисты', ctx.massageSummary.current, ctx.massageSummary.baseline, h, summaryHeader.length, false, includeBaseline);
+  row = renderSummaryCategoryRow_(sheet, row, 'ФТ', ctx.ftSummary.current, ctx.ftSummary.baseline, h, summaryHeader.length, false, includeBaseline);
+  row = renderSummaryCategoryRow_(sheet, row, 'Физиотерапия', ctx.physioSummary.current, ctx.physioSummary.baseline, h, summaryHeader.length, false, includeBaseline);
 
   row += 1;
-  row = renderForwardDetailsTable_(sheet, row, `Таблица ${ctx.tableBase} — Врачи (${horizonLabel})`, 'Врач', ctx.doctorRows, h, true);
+  row = renderForwardDetailsTable_(sheet, row, `Таблица ${ctx.tableBase} — Врачи (${horizonLabel})`, 'Врач', ctx.doctorRows, h, true, includeBaseline);
   row += 1;
-  row = renderForwardDetailsTable_(sheet, row, `Таблица ${ctx.tableBase + 1} — Массажисты (${horizonLabel})`, 'Сотрудник', ctx.massageRows, h, false);
+  row = renderForwardDetailsTable_(sheet, row, `Таблица ${ctx.tableBase + 1} — Массажисты (${horizonLabel})`, 'Сотрудник', ctx.massageRows, h, false, includeBaseline);
   row += 1;
-  row = renderForwardDetailsTable_(sheet, row, `Таблица ${ctx.tableBase + 2} — ФТ (${horizonLabel})`, 'Сотрудник', ctx.ftRows, h, false);
+  row = renderForwardDetailsTable_(sheet, row, `Таблица ${ctx.tableBase + 2} — ФТ (${horizonLabel})`, 'Сотрудник', ctx.ftRows, h, false, includeBaseline);
   row += 1;
-  row = renderCabinetDetailsTable_(sheet, row, `Таблица ${ctx.tableBase + 3} — Кабинеты физиотерапии (${horizonLabel})`, ctx.cabinetRows, h);
+  row = renderCabinetDetailsTable_(sheet, row, `Таблица ${ctx.tableBase + 3} — Кабинеты физиотерапии (${horizonLabel})`, ctx.cabinetRows, h, includeBaseline);
 
   return row;
 }
 
-function renderSummaryCategoryRow_(sheet, row, name, current, baseline, horizon, columns, includePrimaryCols) {
+function renderSummaryCategoryRow_(sheet, row, name, current, baseline, horizon, columns, includePrimaryCols, includeBaseline) {
   const loadCur = current.receptionMin ? (current.occupiedMin / current.receptionMin) * 100 : 0;
   const loadBase = baseline.receptionMin ? (baseline.occupiedMin / baseline.receptionMin) * 100 : 0;
   const values = [
     name,
     round1_(current.receptionMin / 60),
-    `${round1_(current.occupiedMin / 60)} (${round1_(baseline.occupiedMin / 60)})`,
-    `${round0(loadCur)} (${round0(loadBase)})`,
+    formatMetricWithOptionalBaseline_(current.occupiedMin / 60, baseline.occupiedMin / 60, includeBaseline),
+    formatPercentWithOptionalBaseline_(loadCur, loadBase, includeBaseline),
     round1_(current.freeMin / 60),
     round1_(current.reqCount),
-    includePrimaryCols ? round1_(current.primaryCount) : '',
+    includePrimaryCols
+      ? formatMetricWithOptionalBaseline_(current.primaryCount, baseline.primaryCount, includeBaseline)
+      : '',
     includePrimaryCols ? round1_(current.freePP) : '',
   ];
   sheet.getRange(row, 1, 1, columns).setValues([values]);
@@ -2189,7 +2223,7 @@ function renderSummaryCategoryRow_(sheet, row, name, current, baseline, horizon,
   return row + 1;
 }
 
-function renderForwardDetailsTable_(sheet, row, title, firstColTitle, rows, horizon, includePrimaryCols) {
+function renderForwardDetailsTable_(sheet, row, title, firstColTitle, rows, horizon, includePrimaryCols, includeBaseline) {
   const includePrimary = includePrimaryCols !== false;
   const header = [firstColTitle, 'Приемные (ч)', 'Занятые (ч)', 'Загрузка (%)', 'Свободные (ч)', 'Заявки (шт)'];
   if (includePrimary) {
@@ -2211,13 +2245,16 @@ function renderForwardDetailsTable_(sheet, row, title, firstColTitle, rows, hori
     const values = [
       str_(r.doctor),
       round1_(current.receptionMin / 60),
-      `${round1_(current.occupiedMin / 60)} (${round1_(baseline.occupiedMin / 60)})`,
-      `${round0(loadCur)} (${round0(loadBase)})`,
+      formatMetricWithOptionalBaseline_(current.occupiedMin / 60, baseline.occupiedMin / 60, includeBaseline),
+      formatPercentWithOptionalBaseline_(loadCur, loadBase, includeBaseline),
       round1_(current.freeMin / 60),
       round1_(current.reqCount),
     ];
     if (includePrimary) {
-      values.push(round1_(current.primaryCount), round1_(current.freePP));
+      values.push(
+        formatMetricWithOptionalBaseline_(current.primaryCount, baseline.primaryCount, includeBaseline),
+        round1_(current.freePP)
+      );
     }
     sheet.getRange(row, 1, 1, columns).setValues([values]);
     styleForecastDataRow(sheet, row, columns);
@@ -2228,7 +2265,7 @@ function renderForwardDetailsTable_(sheet, row, title, firstColTitle, rows, hori
   return row;
 }
 
-function renderCabinetDetailsTable_(sheet, row, title, rows, horizon) {
+function renderCabinetDetailsTable_(sheet, row, title, rows, horizon, includeBaseline) {
   const columns = 6;
   const header = ['Кабинет', 'Приемные (ч)', 'Занятые (ч)', 'Загрузка (%)', 'Свободные (ч)', 'Заявки (шт)'];
   sheet.getRange(row, 1, 1, columns).merge().setValue(title).setFontWeight('bold').setBackground('#cfe2f3');
@@ -2246,8 +2283,8 @@ function renderCabinetDetailsTable_(sheet, row, title, rows, horizon) {
     const values = [
       str_(r.cabinet),
       round1_(current.receptionMin / 60),
-      `${round1_(current.occupiedMin / 60)} (${round1_(baseline.occupiedMin / 60)})`,
-      `${round0(loadCur)} (${round0(loadBase)})`,
+      formatMetricWithOptionalBaseline_(current.occupiedMin / 60, baseline.occupiedMin / 60, includeBaseline),
+      formatPercentWithOptionalBaseline_(loadCur, loadBase, includeBaseline),
       round1_(current.freeMin / 60),
       round1_(current.reqCount),
     ];
@@ -2258,6 +2295,18 @@ function renderCabinetDetailsTable_(sheet, row, title, rows, horizon) {
   });
 
   return row;
+}
+
+function formatMetricWithOptionalBaseline_(currentValue, baselineValue, includeBaseline) {
+  const current = round1_(Number(currentValue) || 0);
+  const baseline = round1_(Number(baselineValue) || 0);
+  return includeBaseline ? `${current} (${baseline})` : `${current}`;
+}
+
+function formatPercentWithOptionalBaseline_(currentValue, baselineValue, includeBaseline) {
+  const current = round0(Number(currentValue) || 0);
+  const baseline = round0(Number(baselineValue) || 0);
+  return includeBaseline ? `${current} (${baseline})` : `${current}`;
 }
 
 function renderForwardRowsSingle(sheet, startRow, rows, horizon) {
@@ -2353,20 +2402,71 @@ function sendForwardReportEmail(ss, selectedBranch, currentDay) {
   });
 }
 
-function scheduledBuildForwardLoadAllBranchesAndSend() {
-  fl2Log_('INFO', 'scheduledBuildForwardLoadAllBranchesAndSend: старт', '');
+function triggerBuildAggregatorDiscountsAndSend() {
+  fl2Log_('INFO', 'triggerBuildAggregatorDiscountsAndSend: старт', '');
   try {
-    runForwardLoadReportAllBranchesCore_({ sendEmails: true });
-    fl2Log_('INFO', 'scheduledBuildForwardLoadAllBranchesAndSend: успех', '');
+    runForwardLoadReportAllBranchesCore_({
+      includeBaseline: false,
+      sendEmails: false,
+      refreshDiscountsAfter: false,
+    });
+    updateDiscountsByPlan({ silent: true });
+    sendDiscountsEmailsByMode_({
+      targetMode: 'aggregators',
+      silent: true,
+    });
+    fl2Log_('INFO', 'triggerBuildAggregatorDiscountsAndSend: успех', '');
   } catch (e) {
     const message = e && e.message ? e.message : String(e);
-    fl2Log_('ERROR', 'scheduledBuildForwardLoadAllBranchesAndSend: ошибка', message);
+    fl2Log_('ERROR', 'triggerBuildAggregatorDiscountsAndSend: ошибка', message);
+    throw e;
+  }
+}
+
+function triggerBuildNonAggregatorDiscountsAndSend() {
+  fl2Log_('INFO', 'triggerBuildNonAggregatorDiscountsAndSend: старт', '');
+  try {
+    runForwardLoadReportAllBranchesCore_({
+      includeBaseline: false,
+      sendEmails: false,
+      refreshDiscountsAfter: false,
+    });
+    updateDiscountsByPlan({ silent: true });
+    sendDiscountsEmailsByMode_({
+      targetMode: 'non_aggregators',
+      silent: true,
+    });
+    fl2Log_('INFO', 'triggerBuildNonAggregatorDiscountsAndSend: успех', '');
+  } catch (e) {
+    const message = e && e.message ? e.message : String(e);
+    fl2Log_('ERROR', 'triggerBuildNonAggregatorDiscountsAndSend: ошибка', message);
+    throw e;
+  }
+}
+
+function triggerBuildBaselinePlansAndSend() {
+  fl2Log_('INFO', 'triggerBuildBaselinePlansAndSend: старт', '');
+  try {
+    runForwardLoadReportAllBranchesCore_({
+      includeBaseline: true,
+      sendEmails: true,
+      refreshDiscountsAfter: false,
+    });
+    buildOverallForecastCore_({
+      sendEmail: true,
+      refreshDiscountsAfter: false,
+    });
+    fl2Log_('INFO', 'triggerBuildBaselinePlansAndSend: успех', '');
+  } catch (e) {
+    const message = e && e.message ? e.message : String(e);
+    fl2Log_('ERROR', 'triggerBuildBaselinePlansAndSend: ошибка', message);
     throw e;
   }
 }
 
 function buildOverallForecastCore_(options) {
   const opts = options || {};
+  const refreshDiscountsAfter = opts.refreshDiscountsAfter === true;
   const ss = SpreadsheetApp.getActive();
   ensureDoctorScheduleFresh(ss);
   const sheets = ss.getSheets();
@@ -2391,7 +2491,9 @@ function buildOverallForecastCore_(options) {
   if (opts.sendEmail) {
     sendOverallForecastEmail(ss, effectivePeriodLabel);
   }
-  refreshDiscountsAfterPlanUpdate_();
+  if (refreshDiscountsAfter) {
+    refreshDiscountsAfterPlanUpdate_();
+  }
   return effectivePeriodLabel;
 }
 
@@ -2403,18 +2505,6 @@ function buildOverallForecastReport() {
     sendOverallForecastEmail(SpreadsheetApp.getActive(), reportPeriodLabel);
   }
   SpreadsheetApp.getActive().toast('Общий план собран', MENU_NAME, 5);
-}
-
-function scheduledBuildOverallForecastAndSend() {
-  fl2Log_('INFO', 'scheduledBuildOverallForecastAndSend: старт', '');
-  try {
-    buildOverallForecastCore_({ sendEmail: true });
-    fl2Log_('INFO', 'scheduledBuildOverallForecastAndSend: успех', '');
-  } catch (e) {
-    const message = e && e.message ? e.message : String(e);
-    fl2Log_('ERROR', 'scheduledBuildOverallForecastAndSend: ошибка', message);
-    throw e;
-  }
 }
 
 function updateDiscountsByPlan(options) {
@@ -2653,8 +2743,9 @@ function writeColumnBatch_(sheet, startRow, columns, rows) {
   });
 }
 
-function sendDiscountsEmails(options) {
+function sendDiscountsEmailsByMode_(options) {
   const opts = options || {};
+  const targetMode = str_(opts.targetMode);
   const silent = Boolean(opts.silent);
   const ss = SpreadsheetApp.getActive();
   const discountsSheet = ss.getSheetByName(SHEET_DISCOUNTS);
@@ -2665,15 +2756,32 @@ function sendDiscountsEmails(options) {
 
   const discountRows = getSheetObjects_(discountsSheet).map((row) => normalizeDiscountMailRow_(row));
   const mailingRows = getSheetObjects_(mailingSheet);
-  const mailingTarget = mailingRows.find((r) => str_(r['Филиал']) === 'Скидки');
+
+  let mailingBranchName = 'Скидки';
+  let allowedSectionKeys = ['pp_discount', 'p_discount', 'smm', 'site', 'aggregators'];
+  let subject = `Сводка по скидкам на ${formatDateDDMMYYYY_(new Date())}`;
+
+  if (targetMode === 'aggregators') {
+    mailingBranchName = 'Агрегатор';
+    allowedSectionKeys = ['aggregators'];
+    subject = `Скидки для агрегаторов на ${formatDateDDMMYYYY_(new Date())}`;
+  } else if (targetMode === 'non_aggregators') {
+    mailingBranchName = 'Скидки';
+    allowedSectionKeys = ['pp_discount', 'p_discount', 'smm', 'site'];
+    subject = `Сводка по скидкам на ${formatDateDDMMYYYY_(new Date())}`;
+  } else {
+    throw new Error(`Неизвестный режим отправки скидок: ${targetMode}`);
+  }
+
+  const mailingTarget = mailingRows.find((r) => str_(r['Филиал']) === mailingBranchName);
   if (!mailingTarget) {
-    throw new Error('В листе "Отправка" не найдена строка "Скидки"');
+    throw new Error(`В листе "Отправка" не найдена строка "${mailingBranchName}"`);
   }
 
   const to = parseEmailList(mailingTarget['Кому']);
   const cc = parseEmailList(mailingTarget['Копия']);
   if (!to.length) {
-    if (!silent) SpreadsheetApp.getActive().toast('Для рассылки скидок не заполнена колонка "Кому"', MENU_NAME, 5);
+    if (!silent) SpreadsheetApp.getActive().toast(`Для рассылки "${mailingBranchName}" не заполнено поле "Кому"`, MENU_NAME, 5);
     return;
   }
 
@@ -2723,7 +2831,9 @@ function sendDiscountsEmails(options) {
   const previousState = readDiscountsEmailState_(ss);
   const changeDiff = diffDiscountDoctorsBySection_(previousState, currentState);
 
-  const sectionsForSend = sections.filter((section) => sectionHasDiscountDiff_(section, changeDiff));
+  const sectionsForSend = sections
+    .filter((section) => sectionHasDiscountDiff_(section, changeDiff))
+    .filter((section) => allowedSectionKeys.includes(section.key));
   if (!sectionsForSend.length) {
     if (!silent) SpreadsheetApp.getActive().toast('Нет данных для отправки скидок', MENU_NAME, 5);
     return;
@@ -2733,7 +2843,7 @@ function sendDiscountsEmails(options) {
   MailApp.sendEmail({
     to: to.join(','),
     cc: cc.join(','),
-    subject: `Сводка по скидкам на ${formatDateDDMMYYYY_(new Date())}`,
+    subject,
     htmlBody,
   });
 
@@ -2744,46 +2854,11 @@ function sendDiscountsEmails(options) {
   }
 }
 
-function scheduledUpdateDiscountsAndSend() {
-  fl2Log_('INFO', 'scheduledUpdateDiscountsAndSend: старт', '');
-  try {
-    updateDiscountsByPlan({ silent: true });
-    sendDiscountsEmails({ silent: true });
-    fl2Log_('INFO', 'scheduledUpdateDiscountsAndSend: успех', '');
-  } catch (e) {
-    const message = e && e.message ? e.message : String(e);
-    fl2Log_('ERROR', 'scheduledUpdateDiscountsAndSend: ошибка', message);
-    throw e;
-  }
-}
-
-function scheduledRunDailyReportsPipeline() {
-  fl2Log_('INFO', 'scheduledRunDailyReportsPipeline: старт', '');
-  const stages = [
-    { name: 'scheduledBuildForwardLoadAllBranchesAndSend', fn: scheduledBuildForwardLoadAllBranchesAndSend },
-    { name: 'scheduledBuildOverallForecastAndSend', fn: scheduledBuildOverallForecastAndSend },
-    { name: 'scheduledUpdateDiscountsAndSend', fn: scheduledUpdateDiscountsAndSend },
-  ];
-  const errors = [];
-
-  stages.forEach((stage) => {
-    fl2Log_('INFO', 'scheduledRunDailyReportsPipeline: старт этапа', stage.name);
-    try {
-      stage.fn();
-      fl2Log_('INFO', 'scheduledRunDailyReportsPipeline: этап завершен', stage.name);
-    } catch (e) {
-      const message = e && e.message ? e.message : String(e);
-      errors.push(`${stage.name}: ${message}`);
-      fl2Log_('ERROR', 'scheduledRunDailyReportsPipeline: ошибка этапа', `${stage.name}: ${message}`);
-    }
+function sendDiscountsEmails(options) {
+  return sendDiscountsEmailsByMode_({
+    targetMode: 'non_aggregators',
+    silent: options && options.silent,
   });
-
-  if (errors.length) {
-    const summary = `scheduledRunDailyReportsPipeline завершен с ошибками (${errors.length}): ${errors.join(' | ')}`;
-    fl2Log_('ERROR', 'scheduledRunDailyReportsPipeline: итог', summary);
-    throw new Error(summary);
-  }
-  fl2Log_('INFO', 'scheduledRunDailyReportsPipeline: итог', 'успех');
 }
 
 function buildDiscountsDigestHtmlBody_(sections, changeDiff, previousState, currentState) {
@@ -3091,6 +3166,7 @@ function parseClinicForecastSheet(data) {
   const pushRow = (category, horizon, reception, occupiedVal, loadVal, free, requests, cabinetType, primaryCount, freePP) => {
     const occupied = parseCombinedMetric(occupiedVal);
     const load = parseCombinedMetric(loadVal);
+    const primary = parseCombinedMetricOrSingle_(primaryCount);
     rows.push({
       category,
       branch,
@@ -3104,7 +3180,8 @@ function parseClinicForecastSheet(data) {
       free: parseLocaleNumber(free),
       freePP: parseLocaleNumber(freePP),
       requests: parseLocaleNumber(requests),
-      primaryCount: parseLocaleNumber(primaryCount),
+      primaryCount: primary.current,
+      primaryCountUsual: primary.usual,
     });
   };
 
@@ -3165,6 +3242,7 @@ function parseClinicForecastSheet(data) {
     if (currentCategory === 'doctor') {
       const occupied = parseCombinedMetric(row[2]);
       const load = parseCombinedMetric(row[4]);
+      const primary = parseCombinedMetricOrSingle_(row[8]);
       rows.push({
         category: currentCategory,
         branch,
@@ -3177,7 +3255,8 @@ function parseClinicForecastSheet(data) {
         free: parseLocaleNumber(row[5]),
         freePP: parseLocaleNumber(row[6]),
         requests: parseLocaleNumber(row[7]),
-        primaryCount: parseLocaleNumber(row[8]),
+        primaryCount: primary.current,
+        primaryCountUsual: primary.usual,
       });
       return;
     }
@@ -3196,6 +3275,10 @@ function parseCombinedMetric(value) {
     current: parseLocaleNumber(m[1]),
     usual: parseLocaleNumber(m[2]),
   };
+}
+
+function parseCombinedMetricOrSingle_(value) {
+  return parseCombinedMetric(value);
 }
 function parseLocaleNumber(value) {
   const normalized = str_(value).replace(/\s/g, '').replace(',', '.');
@@ -3356,7 +3439,7 @@ function renderOverallHorizonTable(sheet, row, clinicRows, horizonLabel, title) 
       `${round0(r.loadCur)} (${round0(r.loadUsual)})`,
       round1_(r.free),
       round1_(r.requests),
-      round1_(r.primaryCount),
+      formatMetricWithOptionalBaseline_(r.primaryCount, r.primaryCountUsual, true),
       round1_(r.freePP),
     ];
     sheet.getRange(row, 1, 1, columns).setValues([values]);
@@ -3372,6 +3455,7 @@ function renderOverallHorizonTable(sheet, row, clinicRows, horizonLabel, title) 
   const free = subset.reduce((a, r) => a + r.free, 0);
   const requests = subset.reduce((a, r) => a + r.requests, 0);
   const primaryCount = subset.reduce((a, r) => a + (r.primaryCount || 0), 0);
+  const primaryCountUsual = subset.reduce((a, r) => a + (r.primaryCountUsual || 0), 0);
   const freePP = subset.reduce((a, r) => a + r.freePP, 0);
   const totalValues = [
     'ИТОГО',
@@ -3380,7 +3464,7 @@ function renderOverallHorizonTable(sheet, row, clinicRows, horizonLabel, title) 
     `${round0(weightedCur)} (${round0(weightedUsual)})`,
     round1_(free),
     round1_(requests),
-    round1_(primaryCount),
+    formatMetricWithOptionalBaseline_(primaryCount, primaryCountUsual, true),
     round1_(freePP),
   ];
   sheet.getRange(row, 1, 1, columns).setValues([totalValues]);
@@ -3500,11 +3584,17 @@ function mergeCabinetTypeSummary_(summary) {
   return out;
 }
 
-function buildCabinetRowsByName_(currentDay, scheduleRows, requests) {
+function buildCabinetRowsByName_(currentDay, scheduleRows, requests, options) {
+  const opts = options || {};
+  const includeBaseline = opts.includeBaseline !== false;
   const c3 = computeCabinetByNameWindowMetrics_(currentDay, 3, scheduleRows, requests);
   const c7 = computeCabinetByNameWindowMetrics_(currentDay, 7, scheduleRows, requests);
-  const b3 = computeCabinetByNameBaselineMetrics_(currentDay, 3, scheduleRows, requests);
-  const b7 = computeCabinetByNameBaselineMetrics_(currentDay, 7, scheduleRows, requests);
+  const b3 = includeBaseline
+    ? computeCabinetByNameBaselineMetrics_(currentDay, 3, scheduleRows, requests)
+    : new Map();
+  const b7 = includeBaseline
+    ? computeCabinetByNameBaselineMetrics_(currentDay, 7, scheduleRows, requests)
+    : new Map();
   const keys = new Set([...c3.keys(), ...c7.keys(), ...b3.keys(), ...b7.keys()]);
   return [...keys].map((cabinet) => ({
     cabinet,
@@ -3744,11 +3834,17 @@ function computeCabinetTypeBaselineMetrics_(currentDay, horizonDays, scheduleRow
   return out;
 }
 
-function buildCabinetTypeSummary_(currentDay, scheduleRows, requests) {
+function buildCabinetTypeSummary_(currentDay, scheduleRows, requests, options) {
+  const opts = options || {};
+  const includeBaseline = opts.includeBaseline !== false;
   const c3 = computeCabinetTypeWindowMetrics_(currentDay, 3, scheduleRows, requests);
   const c7 = computeCabinetTypeWindowMetrics_(currentDay, 7, scheduleRows, requests);
-  const b3 = computeCabinetTypeBaselineMetrics_(currentDay, 3, scheduleRows, requests);
-  const b7 = computeCabinetTypeBaselineMetrics_(currentDay, 7, scheduleRows, requests);
+  const b3 = includeBaseline
+    ? computeCabinetTypeBaselineMetrics_(currentDay, 3, scheduleRows, requests)
+    : new Map();
+  const b7 = includeBaseline
+    ? computeCabinetTypeBaselineMetrics_(currentDay, 7, scheduleRows, requests)
+    : new Map();
 
   const getSummary = (type) => ({
     c3: c3.get(type) ? c3.get(type).metrics : emptyForwardMetric(),
