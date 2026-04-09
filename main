@@ -425,6 +425,7 @@ function buildProcessedRequestsSheet_(ss, requestsSheet, allowedEmployees, exclu
   if (outRows.length) {
     target.getRange(2, 1, outRows.length, outHeaders.length).setValues(outRows);
   }
+  applyProcessedRequestsMinuteColumnFormat_(target, outHeaders);
 }
 
 
@@ -1988,9 +1989,9 @@ function buildLatestRequests(rows, excludedEmployees, allowedEmployees, unassign
       const startDate = toDate_(row['ДатаНачала']);
       const endDate = toDate_(row['ДатаОкончания']);
       const timing = computeRequestTiming_(startDate, endDate);
-      const startMinStored = toIntOrNull_(row['НачалоМин']);
-      const endMinStored = toIntOrNull_(row['ОкончаниеМин']);
-      const durationMinStored = toIntOrNull_(row['ДлительностьМин']);
+      const startMinStored = minuteOfDayFromValue_(row['НачалоМин']);
+      const endMinStored = minuteOfDayFromValue_(row['ОкончаниеМин']);
+      const durationMinStored = minuteOfDayFromValue_(row['ДлительностьМин']);
       const doctor = str_(row['Сотрудник']);
       const client = str_(row['Клиент']);
       const cabinet = str_(row['Кабинет']);
@@ -4696,6 +4697,55 @@ function toIntOrNull_(value) {
   return Math.trunc(num);
 }
 
+function minuteOfDayFromValue_(value) {
+  if (value === '' || value === null || value === undefined) return null;
+
+  if (Object.prototype.toString.call(value) === '[object Date]' && !Number.isNaN(value.getTime())) {
+    return value.getHours() * 60 + value.getMinutes();
+  }
+
+  if (typeof value === 'number') {
+    if (Number.isFinite(value) && Math.abs(value) < 2) {
+      return ((Math.round(value * 24 * 60) % 1440) + 1440) % 1440;
+    }
+    if (Number.isFinite(value) && value >= 0 && value <= 1440) {
+      return Math.trunc(value);
+    }
+    const parsedAsDate = toDate_(value);
+    if (parsedAsDate) return parsedAsDate.getHours() * 60 + parsedAsDate.getMinutes();
+    return null;
+  }
+
+  const text = str_(value).trim();
+  if (!text) return null;
+  if (/^-?\d+(?:[.,]\d+)?$/.test(text)) {
+    const normalized = Number(text.replace(',', '.'));
+    if (Number.isFinite(normalized)) {
+      if (Math.abs(normalized) < 2) {
+        return ((Math.round(normalized * 24 * 60) % 1440) + 1440) % 1440;
+      }
+      if (normalized >= 0 && normalized <= 1440) {
+        return Math.trunc(normalized);
+      }
+    }
+  }
+
+  const timeMinutes = parseTimeToMinutes_(text);
+  if (timeMinutes !== null) return timeMinutes;
+
+  const parsedDate = toDate_(text);
+  if (!parsedDate) return null;
+  return parsedDate.getHours() * 60 + parsedDate.getMinutes();
+}
+
+function hasExplicitTime_(dateValue) {
+  if (!dateValue || Object.prototype.toString.call(dateValue) !== '[object Date]' || Number.isNaN(dateValue.getTime())) return false;
+  return dateValue.getHours() !== 0
+    || dateValue.getMinutes() !== 0
+    || dateValue.getSeconds() !== 0
+    || dateValue.getMilliseconds() !== 0;
+}
+
 function numOrZero_(value) {
   const num = Number(value);
   return Number.isFinite(num) ? num : 0;
@@ -4703,6 +4753,9 @@ function numOrZero_(value) {
 
 function computeRequestTiming_(startDate, endDate) {
   if (!startDate || !endDate) {
+    return { startMin: null, endMin: null, durationMin: null };
+  }
+  if (!hasExplicitTime_(startDate) && !hasExplicitTime_(endDate)) {
     return { startMin: null, endMin: null, durationMin: null };
   }
   const startMin = startDate.getHours() * 60 + startDate.getMinutes();
@@ -4725,11 +4778,27 @@ function requestInterval(req) {
   if (!req || !req.startDate || !req.endDate) {
     return { start: 0, end: 1 };
   }
+  if (!hasExplicitTime_(req.startDate) && !hasExplicitTime_(req.endDate)) {
+    return { start: 0, end: 1 };
+  }
   const timing = computeRequestTiming_(req.startDate, req.endDate);
   if (!Number.isFinite(timing.startMin) || !Number.isFinite(timing.durationMin) || timing.durationMin <= 0) {
     return { start: 0, end: 1 };
   }
   return { start: timing.startMin, end: timing.startMin + timing.durationMin };
+}
+
+function applyProcessedRequestsMinuteColumnFormat_(sheet, headers) {
+  if (!sheet || !Array.isArray(headers) || !headers.length) return;
+  const minuteHeaders = ['НачалоМин', 'ОкончаниеМин', 'ДлительностьМин'];
+  const dataRowCount = Math.max(1, sheet.getMaxRows() - 1);
+  minuteHeaders.forEach((header) => {
+    const colIdx = headers.indexOf(header);
+    if (colIdx < 0) return;
+    const columnRange = sheet.getRange(2, colIdx + 1, dataRowCount, 1);
+    columnRange.clearFormat();
+    columnRange.setNumberFormat('0');
+  });
 }
 function sumIntervalsMin(intervals) {
   return intervals.reduce((acc, i) => acc + (i.end - i.start), 0);
