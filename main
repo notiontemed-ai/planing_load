@@ -262,8 +262,8 @@ function buildDoctorSchedule() {
   const employeeRegistry = getEmployeeRegistry_(ss);
   const currentDay = detectCurrentDayFromRawRequests_(requestRows, employeeRegistry.allowed, excludedEmployees, employeeRegistry.unassignedFound);
   if (!currentDay) throw new Error('Не найдены выполненные заявки для определения актуальной даты');
-  const rangeStart = addDays(currentDay, -42);
-  const rangeEnd = addDays(currentDay, 7);
+  const rangeStart = addDays(currentDay, -2);
+  const rangeEnd = addDays(currentDay, 8);
   const requestsRangeEnd = addDays(currentDay, 8);
 
   const grouped = new Map();
@@ -908,6 +908,13 @@ var FL2_BATCH_MAX_BRANCHES_PER_RUN = 1;
 var FL2_ENABLE_LOG = false;
 var FL2_PLAN_ARCHIVE_SPREADSHEET_ID = '1w9PLSlkxbJX6kigWtxYZElTyCLTM1ceDriA29yeFBgc';
 var FL2_TIMEZONE = 'Europe/Moscow';
+var FL2_ARCHIVE_CATEGORY_SHEET_MAP = {
+  doctor: 'Архив Врачи',
+  massage: 'Архив Массажисты',
+  ft: 'Архив ФТ',
+  physio: 'Архив Физиотерапия',
+};
+var FL2_ARCHIVE_BASELINE_CACHE = null;
 
 function fl2Log_(level, message, details) {
   if (!FL2_ENABLE_LOG) return;
@@ -1400,8 +1407,8 @@ function prepareForwardLoadInput_(ss, options) {
   const anchorDay = reportPeriod && reportPeriod.anchorDate
     ? new Date(reportPeriod.anchorDate.getTime())
     : new Date(currentDay.getFullYear(), currentDay.getMonth(), currentDay.getDate() - 1);
-  const rangeStart = addDays(anchorDay, -42);
-  const rangeEnd = reportPeriod && reportPeriod.endDate ? new Date(reportPeriod.endDate.getTime()) : addDays(anchorDay, 7);
+  const rangeStart = addDays(anchorDay, -2);
+  const rangeEnd = addDays(anchorDay, 8);
 
   const readScheduleTimer = fl2StageTimer_();
   const scheduleSourceRows = selectedBranch
@@ -1543,12 +1550,12 @@ function buildForwardLoadReportForBranch_(ss, selectedBranch, prep) {
   tick();
 
   const b3Timer = fl2StageTimer_();
-  const baseline3 = computeBaselineMetrics(anchorDay, 3, doctorScheduleByDoctorDay, latestRequests);
+  const baseline3 = computeBaselineMetrics(anchorDay, 3, doctorScheduleByDoctorDay, latestRequests, { category: 'doctor' });
   stage('branch: computeBaselineMetrics(3) done', `byBranch=${baseline3.byBranch.size}, byDoctor=${baseline3.byDoctor.size}`, b3Timer);
   tick();
 
   const b7Timer = fl2StageTimer_();
-  const baseline7 = computeBaselineMetrics(anchorDay, 7, doctorScheduleByDoctorDay, latestRequests);
+  const baseline7 = computeBaselineMetrics(anchorDay, 7, doctorScheduleByDoctorDay, latestRequests, { category: 'doctor' });
   stage('branch: computeBaselineMetrics(7) done', `byBranch=${baseline7.byBranch.size}, byDoctor=${baseline7.byDoctor.size}`, b7Timer);
   tick();
 
@@ -1563,12 +1570,26 @@ function buildForwardLoadReportForBranch_(ss, selectedBranch, prep) {
   tick();
 
   const b3AllTimer = fl2StageTimer_();
-  const baseline3All = computeBaselineMetrics(anchorDay, 3, scheduleByDoctorDay, latestRequests, { includeAllNomenclature: true });
+  const baseline3All = computeBaselineMetrics(anchorDay, 3, scheduleByDoctorDay, latestRequests, {
+    includeAllNomenclature: true,
+    categoryResolver: (employee) => {
+      if (massageSet.has(str_(employee))) return 'massage';
+      if (ftSet.has(str_(employee))) return 'ft';
+      return 'doctor';
+    },
+  });
   stage('branch: computeBaselineMetrics(3, all nomenclature) done', `byBranch=${baseline3All.byBranch.size}, byDoctor=${baseline3All.byDoctor.size}`, b3AllTimer);
   tick();
 
   const b7AllTimer = fl2StageTimer_();
-  const baseline7All = computeBaselineMetrics(anchorDay, 7, scheduleByDoctorDay, latestRequests, { includeAllNomenclature: true });
+  const baseline7All = computeBaselineMetrics(anchorDay, 7, scheduleByDoctorDay, latestRequests, {
+    includeAllNomenclature: true,
+    categoryResolver: (employee) => {
+      if (massageSet.has(str_(employee))) return 'massage';
+      if (ftSet.has(str_(employee))) return 'ft';
+      return 'doctor';
+    },
+  });
   stage('branch: computeBaselineMetrics(7, all nomenclature) done', `byBranch=${baseline7All.byBranch.size}, byDoctor=${baseline7All.byDoctor.size}`, b7AllTimer);
   tick();
 
@@ -1964,24 +1985,41 @@ function computeWindowMetrics(anchorDate, horizonDays, scheduleByDoctorDay, requ
 }
 
 function computeBaselineMetrics(currentDay, horizonDays, scheduleByDoctorDay, requests, options) {
-  const byBranchSeries = new Map();
-  const byDoctorSeries = new Map();
-  const baselineRequests = requests.map((r) => ({
-    ...r,
-    status: isCompletedStatus(r.status) ? 'Запланирована' : r.status,
-  }));
+  const opts = options || {};
+  const categoryResolver = typeof opts.categoryResolver === 'function'
+    ? opts.categoryResolver
+    : () => str_(opts.category || 'doctor');
+  const horizonLabel = Number(horizonDays) === 7 ? '7 дней' : '3 дня';
 
-  for (let i = 1; i <= 42; i += 1) {
-    const ref = addDays(currentDay, -i);
-    if (ref.getDay() !== currentDay.getDay()) continue;
-    const res = computeWindowMetrics(ref, horizonDays, scheduleByDoctorDay, baselineRequests, options);
-    res.byBranch.forEach((v, k) => pushSeries(byBranchSeries, k, v, v.branch, ''));
-    res.byDoctor.forEach((v, k) => pushSeries(byDoctorSeries, k, v, v.branch, v.doctor));
-  }
-  return {
-    byBranch: finalizeSeriesAverage(byBranchSeries),
-    byDoctor: finalizeSeriesAverage(byDoctorSeries),
-  };
+  const byBranch = new Map();
+  const byDoctor = new Map();
+  const index = loadArchiveBaselineIndex_();
+  const seen = new Set();
+
+  scheduleByDoctorDay.forEach((intervals, key) => {
+    const parts = str_(key).split('|');
+    const branch = str_(parts[1]);
+    const doctor = str_(parts[2]);
+    if (!branch || !doctor) return;
+    const uniq = `${branch}|${doctor}`;
+    if (seen.has(uniq)) return;
+    seen.add(uniq);
+
+    const category = str_(categoryResolver(doctor, branch)) || 'doctor';
+    const metric = getArchiveBaselineMetric_(index, {
+      category,
+      branch,
+      object: doctor,
+      horizon: horizonLabel,
+      reportDate: currentDay,
+      maxObservations: 6,
+    });
+
+    byDoctor.set(uniq, { branch, doctor, metrics: metric });
+    accumulateForward(byBranch, branch, metric, branch, '');
+  });
+
+  return { byBranch, byDoctor };
 }
 function pushSeries(seriesMap, key, value, branch, doctor) {
   if (!seriesMap.has(key)) seriesMap.set(key, { branch, doctor, values: [] });
@@ -3558,67 +3596,30 @@ function computeCabinetByNameWindowMetrics_(anchorDate, horizonDays, scheduleRow
 }
 
 function computeCabinetByNameBaselineMetrics_(currentDay, horizonDays, scheduleRows, requests) {
-  const scheduleIndex = buildCabinetScheduleByNameIndex_(scheduleRows);
-  const baselineRequests = (requests || []).map((r) => ({ ...r, status: isCompletedStatus(r.status) ? 'Запланирована' : r.status }));
-  const series = new Map();
-
-  for (let i = 1; i <= 42; i += 1) {
-    const ref = addDays(currentDay, -i);
-    if (ref.getDay() !== currentDay.getDay()) continue;
-    const startDate = addDays(ref, 1);
-    const endDate = addDays(ref, horizonDays);
-    const reqIndex = buildCabinetRequestByNameIndex_(baselineRequests, startDate, endDate);
-    const win = new Map();
-    const touched = new Set();
-
-    scheduleIndex.forEach((workIntervals, key) => {
-      const [dKey, cabinet] = key.split('|');
-      const day = toDate_(dKey);
-      if (!day || day < startDate || day > endDate) return;
-      const req = reqIndex.get(key) || { intervals: [], reqCount: 0 };
-      touched.add(key);
-      const occupied = mergeIntervals_(req.intervals);
-      const occupiedWithinWork = intersectIntervals(occupied, workIntervals);
-      const free = subtractIntervals(workIntervals, occupiedWithinWork);
-      if (!win.has(cabinet)) win.set(cabinet, emptyForwardMetric());
-      addForwardMetric(win.get(cabinet), {
-        receptionMin: sumIntervalsMin(workIntervals),
-        occupiedMin: sumIntervalsMin(occupiedWithinWork),
-        freeMin: sumIntervalsMin(free),
-        freePP: 0,
-        reqCount: req.reqCount,
-        primaryCount: 0,
-      });
-    });
-
-    reqIndex.forEach((req, key) => {
-      if (touched.has(key)) return;
-      const [, cabinet] = key.split('|');
-      if (!win.has(cabinet)) win.set(cabinet, emptyForwardMetric());
-      addForwardMetric(win.get(cabinet), {
-        receptionMin: 0,
-        occupiedMin: sumIntervalsMin(mergeIntervals_(req.intervals)),
-        freeMin: 0,
-        freePP: 0,
-        reqCount: req.reqCount,
-        primaryCount: 0,
-      });
-    });
-
-    win.forEach((m, cabinet) => {
-      if (!series.has(cabinet)) series.set(cabinet, []);
-      series.get(cabinet).push(m);
-    });
-  }
-
+  const horizonLabel = Number(horizonDays) === 7 ? '7 дней' : '3 дня';
+  const index = loadArchiveBaselineIndex_();
   const out = new Map();
-  series.forEach((arr, cabinet) => {
-    const avg = emptyForwardMetric();
-    arr.forEach((m) => addForwardMetric(avg, m));
-    const n = arr.length || 1;
-    Object.keys(avg).forEach((k) => { avg[k] /= n; });
-    out.set(cabinet, avg);
+  const seen = new Set();
+
+  (scheduleRows || []).forEach((row) => {
+    const cabinet = str_(row['Кабинет']);
+    const branch = str_(row['Филиал']);
+    const type = detectCabinetType_(cabinet);
+    if (!cabinet || !branch || !type) return;
+    const key = `${branch}|${cabinet}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+
+    out.set(cabinet, getArchiveBaselineMetric_(index, {
+      category: 'physio',
+      branch,
+      object: cabinet,
+      horizon: horizonLabel,
+      reportDate: currentDay,
+      maxObservations: 6,
+    }));
   });
+
   return out;
 }
 
@@ -3714,72 +3715,32 @@ function computeCabinetTypeWindowMetrics_(anchorDate, horizonDays, scheduleRows,
 }
 
 function computeCabinetTypeBaselineMetrics_(currentDay, horizonDays, scheduleRows, requests) {
-  const scheduleIndex = buildCabinetScheduleIndex_(scheduleRows);
-  const baselineRequests = (requests || []).map((r) => ({
-    ...r,
-    status: isCompletedStatus(r.status) ? 'Запланирована' : r.status,
-  }));
-
-  const series = new Map();
-  for (let i = 1; i <= 42; i += 1) {
-    const ref = addDays(currentDay, -i);
-    if (ref.getDay() !== currentDay.getDay()) continue;
-
-    const startDate = addDays(ref, 1);
-    const endDate = addDays(ref, horizonDays);
-    const reqIndex = buildCabinetRequestIndex_(baselineRequests, startDate, endDate);
-
-    const winByType = new Map();
-    const touchedReq = new Set();
-    scheduleIndex.forEach((workIntervals, key) => {
-      const [dKey, type] = key.split('|');
-      const day = toDate_(dKey);
-      if (!day || day < startDate || day > endDate) return;
-
-      const req = reqIndex.get(key) || { intervals: [], reqCount: 0 };
-      touchedReq.add(key);
-      const occupied = mergeIntervals_(req.intervals);
-      const occupiedWithinWork = intersectIntervals(occupied, workIntervals);
-      const free = subtractIntervals(workIntervals, occupiedWithinWork);
-      if (!winByType.has(type)) winByType.set(type, emptyForwardMetric());
-      addForwardMetric(winByType.get(type), {
-        receptionMin: sumIntervalsMin(workIntervals),
-        occupiedMin: sumIntervalsMin(occupiedWithinWork),
-        freeMin: sumIntervalsMin(free),
-        freePP: 0,
-        reqCount: req.reqCount,
-        primaryCount: 0,
-      });
-    });
-
-    reqIndex.forEach((req, key) => {
-      if (touchedReq.has(key)) return;
-      const [, type] = key.split('|');
-      if (!winByType.has(type)) winByType.set(type, emptyForwardMetric());
-      addForwardMetric(winByType.get(type), {
-        receptionMin: 0,
-        occupiedMin: sumIntervalsMin(mergeIntervals_(req.intervals)),
-        freeMin: 0,
-        freePP: 0,
-        reqCount: req.reqCount,
-        primaryCount: 0,
-      });
-    });
-
-    winByType.forEach((m, type) => {
-      if (!series.has(type)) series.set(type, []);
-      series.get(type).push(m);
-    });
-  }
-
+  const horizonLabel = Number(horizonDays) === 7 ? '7 дней' : '3 дня';
+  const index = loadArchiveBaselineIndex_();
   const out = new Map();
-  series.forEach((arr, type) => {
-    const n = arr.length || 1;
-    const avg = emptyForwardMetric();
-    arr.forEach((m) => addForwardMetric(avg, m));
-    Object.keys(avg).forEach((k) => { avg[k] /= n; });
-    out.set(type, avg);
+  const seen = new Set();
+
+  (scheduleRows || []).forEach((row) => {
+    const cabinet = str_(row['Кабинет']);
+    const branch = str_(row['Филиал']);
+    const type = detectCabinetType_(cabinet);
+    if (!cabinet || !branch || !type) return;
+    const key = `${branch}|${cabinet}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+
+    const metric = getArchiveBaselineMetric_(index, {
+      category: 'physio',
+      branch,
+      object: cabinet,
+      horizon: horizonLabel,
+      reportDate: currentDay,
+      maxObservations: 6,
+    });
+    if (!out.has(type)) out.set(type, emptyForwardMetric());
+    addForwardMetric(out.get(type), metric);
   });
+
   return out;
 }
 
@@ -4053,6 +4014,104 @@ function computeSheetDisplayHash_(sheet) {
   const serialized = JSON.stringify(values);
   const digest = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, serialized, Utilities.Charset.UTF_8);
   return digest.map((b) => (b + 256).toString(16).slice(-2)).join('');
+}
+
+function getArchiveSpreadsheet_() {
+  return SpreadsheetApp.openById(FL2_PLAN_ARCHIVE_SPREADSHEET_ID);
+}
+
+function toArchiveHorizonLabel_(value) {
+  const raw = str_(value).toLowerCase();
+  if (raw === '3 дня' || raw === '3') return '3 дня';
+  if (raw === '7 дней' || raw === '7') return '7 дней';
+  return '';
+}
+
+function toArchiveMetricFromRow_(row) {
+  const receptionHours = Number(str_(row['Приемные (ч)']).replace(',', '.')) || 0;
+  const occupiedHours = Number(str_(row['Занятые (ч) текущее']).replace(',', '.')) || 0;
+  const freeHours = Number(str_(row['Свободные (ч)']).replace(',', '.')) || 0;
+  return {
+    receptionMin: receptionHours * 60,
+    occupiedMin: occupiedHours * 60,
+    freeMin: freeHours * 60,
+    reqCount: Number(str_(row['Заявки (шт)']).replace(',', '.')) || 0,
+    primaryCount: Number(str_(row['Заявки на ПП (шт)']).replace(',', '.')) || 0,
+    freePP: Number(str_(row['Свободные слоты под ПП']).replace(',', '.')) || 0,
+  };
+}
+
+function archiveBaselineKey_(category, branch, objectName, horizon) {
+  return [str_(category), str_(branch), str_(objectName), toArchiveHorizonLabel_(horizon)].join('|');
+}
+
+function loadArchiveBaselineIndex_() {
+  if (FL2_ARCHIVE_BASELINE_CACHE && FL2_ARCHIVE_BASELINE_CACHE.index) return FL2_ARCHIVE_BASELINE_CACHE.index;
+
+  const timer = fl2StageTimer_();
+  const archive = getArchiveSpreadsheet_();
+  const index = new Map();
+
+  Object.keys(FL2_ARCHIVE_CATEGORY_SHEET_MAP).forEach((category) => {
+    const sheetName = FL2_ARCHIVE_CATEGORY_SHEET_MAP[category];
+    const sheet = archive.getSheetByName(sheetName);
+    if (!sheet) return;
+    const rows = getSheetObjectsDisplay_(sheet);
+    rows.forEach((row) => {
+      const rowType = str_(row['ТипСтроки']);
+      if (rowType !== 'Детализация') return;
+      const branch = str_(row['Филиал']);
+      const objectName = str_(row['Объект']);
+      const horizon = toArchiveHorizonLabel_(row['Горизонт']);
+      const reportDate = toDate_(row['ОтчетДата']);
+      if (!branch || !objectName || !horizon || !reportDate) return;
+
+      const key = archiveBaselineKey_(category, branch, objectName, horizon);
+      if (!index.has(key)) index.set(key, []);
+      index.get(key).push({
+        reportDate,
+        metric: toArchiveMetricFromRow_(row),
+      });
+    });
+  });
+
+  index.forEach((arr, key) => {
+    arr.sort((a, b) => b.reportDate.getTime() - a.reportDate.getTime());
+  });
+
+  FL2_ARCHIVE_BASELINE_CACHE = {
+    builtAt: new Date(),
+    index,
+  };
+  fl2Log_('INFO', 'Baseline архив: индекс построен', `keys=${index.size}, elapsedMs=${timer.ms()}`);
+  return index;
+}
+
+function getArchiveBaselineMetric_(index, params) {
+  const p = params || {};
+  const maxObs = Number(p.maxObservations) > 0 ? Number(p.maxObservations) : 6;
+  const key = archiveBaselineKey_(p.category, p.branch, p.object, p.horizon);
+  const arr = index && index.get(key) ? index.get(key) : [];
+  const reportDate = toDate_(p.reportDate);
+  const filtered = arr.filter((item) => !reportDate || item.reportDate.getTime() < reportDate.getTime());
+  const used = filtered.slice(0, maxObs);
+
+  const logPrefix = `cat=${str_(p.category)}, branch=${str_(p.branch)}, object=${str_(p.object)}, horizon=${str_(p.horizon)}`;
+  fl2Log_('INFO', 'Baseline архив: найдено наблюдений', `${logPrefix}, found=${filtered.length}, used=${used.length}`);
+  if (filtered.length < maxObs) {
+    fl2Log_('INFO', 'Baseline архив: наблюдений меньше лимита', `${logPrefix}, max=${maxObs}, found=${filtered.length}`);
+  }
+  if (!used.length) {
+    fl2Log_('INFO', 'Baseline архив: наблюдения отсутствуют', logPrefix);
+    return emptyForwardMetric();
+  }
+
+  const out = emptyForwardMetric();
+  used.forEach((item) => addForwardMetric(out, item.metric));
+  Object.keys(out).forEach((k) => {
+    out[k] /= used.length;
+  });
+  return out;
 }
 
 function archivePlanReportsDaily() {
