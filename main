@@ -361,14 +361,16 @@ function buildProcessedRequestsSheet_(ss, requestsSheet, allowedEmployees, exclu
   const idxStart = headers.indexOf('ДатаНачала');
   const idxEnd = headers.indexOf('ДатаОкончания');
   const idxBranch = headers.indexOf('Филиал');
+  const idxCreatedAt = headers.indexOf('Дата');
 
   const excludedOutputHeaders = new Set(['Клиент', 'Примечание', 'ДатаНачала', 'ДатаОкончания']);
-  const sourceColumnIndexes = [];
+  const sourceColumns = [];
   const outHeaders = [];
   headers.forEach((header, idx) => {
     if (excludedOutputHeaders.has(header)) return;
-    sourceColumnIndexes.push(idx);
-    outHeaders.push(header);
+    const outHeader = header === 'Дата' ? 'Дата создания' : header;
+    sourceColumns.push({ idx, outHeader });
+    outHeaders.push(outHeader);
   });
   const extraHeaders = ['Дата', 'Время начала', 'Время окончания'];
   extraHeaders.forEach((h) => {
@@ -410,14 +412,24 @@ function buildProcessedRequestsSheet_(ss, requestsSheet, allowedEmployees, exclu
     return (da ? da.getTime() : 0) - (db ? db.getTime() : 0);
   });
 
+  const idxCreatedAtOut = outHeaders.indexOf('Дата создания');
+  const idxDateOut = outHeaders.indexOf('Дата');
+  const idxStartTimeOut = outHeaders.indexOf('Время начала');
+  const idxEndTimeOut = outHeaders.indexOf('Время окончания');
+
   const outRows = rows.map((row) => {
     const sourceRowIdx = values.indexOf(row);
     const displayRow = sourceRowIdx >= 0 ? displayValues[sourceRowIdx] : [];
     const parts = splitRequestDateTimeParts_(displayRow[idxStart], displayRow[idxEnd], row[idxStart], row[idxEnd]);
-    const item = sourceColumnIndexes.map((idx) => row[idx]);
-    item[outHeaders.indexOf('Дата')] = parts.date || '';
-    item[outHeaders.indexOf('Время начала')] = parts.startTime || '';
-    item[outHeaders.indexOf('Время окончания')] = parts.endTime || '';
+    const item = new Array(outHeaders.length).fill('');
+    sourceColumns.forEach((col) => {
+      const outIdx = outHeaders.indexOf(col.outHeader);
+      if (outIdx >= 0) item[outIdx] = row[col.idx];
+    });
+    if (idxCreatedAtOut >= 0) item[idxCreatedAtOut] = idxCreatedAt >= 0 ? row[idxCreatedAt] : '';
+    if (idxDateOut >= 0) item[idxDateOut] = parts.date || '';
+    if (idxStartTimeOut >= 0) item[idxStartTimeOut] = parts.startTime || '';
+    if (idxEndTimeOut >= 0) item[idxEndTimeOut] = parts.endTime || '';
     return item;
   });
 
@@ -1503,7 +1515,7 @@ function prepareForwardLoadInput_(ss, options) {
 
   const filterRequestsTimer = fl2StageTimer_();
   const requestRowsRaw = requestSourceRows.filter((r) => {
-    const d = toDate_(r['ДатаНачала']);
+    const d = toDate_(r['Дата']) || toDate_(r['ДатаНачала']);
     const branch = str_(r['Филиал']);
     if (selectedBranch && branch !== selectedBranch) return false;
     return isDateInRangeInclusive_(d, rangeStart, rangeEnd);
@@ -1984,7 +1996,7 @@ function buildLatestRequests(rows, excludedEmployees, allowedEmployees, unassign
     const status = str_(row['Состояние']);
     if (!isAllowedProcessedRequestStatus(status)) return;
     const id = str_(row['Номер заявки']) || str_(row['Номер']) || str_(row['ID']) || `ROW-${idx}`;
-    const statusDate = toDate_(row['Дата']) || toDate_(row['ДатаНачала']) || new Date(0);
+    const statusDate = toDate_(row['Дата создания']) || toDate_(row['Дата']) || toDate_(row['ДатаНачала']) || new Date(0);
     const statusSort = Number(Utilities.formatDate(statusDate, FL2_TIMEZONE, 'yyyyMMddHHmmss'));
     const prev = latest.get(id);
     if (!prev || statusSort > prev.statusSort || (statusSort === prev.statusSort && idx > prev.idx)) {
