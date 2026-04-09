@@ -983,10 +983,6 @@ function buildForwardLoadReport() {
   const ui = SpreadsheetApp.getUi();
 
   const precheckPrep = prepareForwardLoadInput_(ss, { persistUnassigned: false });
-  if (!warnIfPlanDateDiffersFromActualData_(ui, precheckPrep.currentDay)) {
-    SpreadsheetApp.getActive().toast('Построение плана отменено пользователем', MENU_NAME, 5);
-    return;
-  }
 
   const branches = getBranchesFromEmployeesSheet_(ss);
   const promptText = `Введите филиал (точно как в данных):
@@ -1011,10 +1007,6 @@ ${branches.join('\n')}`;
 function buildForwardLoadReportAllBranches() {
   const ui = SpreadsheetApp.getUi();
   const prep = prepareForwardLoadInput_(SpreadsheetApp.getActive(), { persistUnassigned: false });
-  if (!warnIfPlanDateDiffersFromActualData_(ui, prep.currentDay)) {
-    SpreadsheetApp.getActive().toast('Пакетный план отменен пользователем', MENU_NAME, 5);
-    return;
-  }
   const sendAnswer = ui.alert('Пакетный план по клиникам', 'После завершения очереди отправить письма автоматически?', ui.ButtonSet.YES_NO);
   const sendEmails = sendAnswer === ui.Button.YES;
   runForwardLoadReportAllBranchesCore_({ sendEmails, currentDay: prep.currentDay });
@@ -1143,30 +1135,6 @@ function refreshDiscountsAfterPlanUpdate_() {
     updateDiscountsByPlan({ silent: true });
   } catch (e) {
   }
-}
-
-function warnIfPlanDateDiffersFromActualData_(ui, actualDataDay) {
-  const actual = toDate_(actualDataDay);
-  const formedAt = new Date();
-  if (!actual) return true;
-  const actualDate = new Date(actual.getFullYear(), actual.getMonth(), actual.getDate());
-  const formedDate = new Date(formedAt.getFullYear(), formedAt.getMonth(), formedAt.getDate());
-  if (actualDate.getTime() === formedDate.getTime()) return true;
-
-  const message = [
-    'Внимание: дата формирования не совпадает с актуальной датой данных.',
-    `Дата формирования: ${formatDateDDMMYYYY_(formedDate)}`,
-    `Актуальная дата данных (последняя выполненная заявка): ${formatDateDDMMYYYY_(actualDate)}`,
-    '',
-    'Продолжить построение плана?',
-  ].join('\n');
-
-  let shouldContinue = true;
-  if (ui) {
-    const answer = ui.alert('План загрузки: предупреждение по дате', message, ui.ButtonSet.YES_NO);
-    shouldContinue = answer === ui.Button.YES;
-  }
-  return shouldContinue;
 }
 
 function detectProcessedRequestsMeta_(sheet) {
