@@ -90,8 +90,8 @@ function loadSourceDataFromEmail() {
 }
 
 function findSingleSourceMessageForToday_() {
-  const query = `from:${SOURCE_EMAIL_ADDRESS} subject:"${SOURCE_EMAIL_SUBJECT_PREFIX}" has:attachment`;
-  const threads = GmailApp.search(query, 0, 20);
+  const query = `from:${SOURCE_EMAIL_ADDRESS} has:attachment newer_than:2d`;
+  const threads = GmailApp.search(query, 0, 100);
   const messages = [];
   threads.forEach((thread) => {
     messages.push(...thread.getMessages());
@@ -110,7 +110,22 @@ function findSingleSourceMessageForToday_() {
   });
 
   if (!todayMatches.length) {
-    throw new Error(`Не найдено письмо за текущую дату от ${SOURCE_EMAIL_ADDRESS} с нужной темой`);
+    const checkedCount = messages.length;
+    const examples = messages
+      .slice()
+      .sort((a, b) => b.getDate().getTime() - a.getDate().getTime())
+      .slice(0, 5)
+      .map((message) => {
+        const date = Utilities.formatDate(message.getDate(), FL2_TIMEZONE, 'dd.MM.yyyy HH:mm:ss');
+        const from = str_(message.getFrom());
+        const subject = str_(message.getSubject());
+        return `${date} | ${from} | ${subject}`;
+      });
+    const examplesText = examples.length ? examples.join(' ; ') : 'нет писем';
+    throw new Error(
+      `Не найдено письмо за текущую дату от ${SOURCE_EMAIL_ADDRESS} с нужной темой. ` +
+      `Проверено сообщений: ${checkedCount}. Примеры найденных писем: ${examplesText}`
+    );
   }
   return pickLatestMessageByDate_(todayMatches);
 }
