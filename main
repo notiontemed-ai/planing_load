@@ -236,7 +236,7 @@ function buildDoctorSchedule() {
     throw new Error(`Не найден лист "${SHEET_SCHEDULE_SOURCE}"`);
   }
 
-  const rows = getSheetObjects_(source);
+  const rows = getSheetObjectsDisplay_(source);
   const requestsSheet = ss.getSheetByName(SHEET_REQUESTS);
   const requestRows = requestsSheet ? getSheetObjects_(requestsSheet) : [];
   const excludedEmployees = getExcludedEmployeesSet_(ss);
@@ -360,8 +360,15 @@ function buildProcessedRequestsSheet_(ss, requestsSheet, allowedEmployees, exclu
   const idxEnd = headers.indexOf('ДатаОкончания');
   const idxBranch = headers.indexOf('Филиал');
 
+  const excludedOutputHeaders = new Set(['Номер', 'Клиент', 'Примечание']);
+  const sourceColumnIndexes = [];
+  const outHeaders = [];
+  headers.forEach((header, idx) => {
+    if (excludedOutputHeaders.has(header)) return;
+    sourceColumnIndexes.push(idx);
+    outHeaders.push(header);
+  });
   const extraHeaders = ['НачалоМин', 'ОкончаниеМин', 'ДлительностьМин'];
-  const outHeaders = [...headers];
   extraHeaders.forEach((h) => {
     if (outHeaders.indexOf(h) < 0) outHeaders.push(h);
   });
@@ -405,7 +412,7 @@ function buildProcessedRequestsSheet_(ss, requestsSheet, allowedEmployees, exclu
     const startDate = toDate_(row[idxStart]);
     const endDate = toDate_(row[idxEnd]);
     const timing = computeRequestTiming_(startDate, endDate);
-    const item = row.slice();
+    const item = sourceColumnIndexes.map((idx) => row[idx]);
     item[outHeaders.indexOf('НачалоМин')] = timing.startMin;
     item[outHeaders.indexOf('ОкончаниеМин')] = timing.endMin;
     item[outHeaders.indexOf('ДлительностьМин')] = timing.durationMin;
@@ -4713,11 +4720,11 @@ function isPlannedStatus(status) {
 }
 
 function isAllowedProcessedRequestStatus(status) {
-  return isCompletedStatus(status) || isPlannedStatus(status);
+  return isPlannedStatus(status);
 }
 
 function isActivePlannedStatus(status) {
-  return isPlannedStatus(status) || isCompletedStatus(status);
+  return isPlannedStatus(status);
 }
 function toIntOrNull_(value) {
   if (value === '' || value === null || value === undefined) return null;
