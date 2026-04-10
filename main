@@ -25,6 +25,7 @@ function onOpen() {
     .createMenu(MENU_NAME)
     .addItem('Загрузить исходные XLSX на диск', 'importLatestLabeledXlsxToSheets')
     .addItem('Обработать исходные данные', 'processSourceData')
+    .addItem('Обработать данные с диска', 'processSourceDataFromDrive')
     .addSeparator()
     .addItem('Сформировать план загрузки 3/7 дней', 'buildForwardLoadReport')
     .addItem('Сформировать план загрузки 3/7 дней по всем клиникам', 'buildForwardLoadReportAllBranches')
@@ -49,6 +50,27 @@ function onOpen() {
 function processSourceData() {
   buildDoctorSchedule();
   SpreadsheetApp.getActive().toast('Исходные данные (график + заявки) обработаны', MENU_NAME, 5);
+}
+
+function processSourceDataFromDrive() {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+
+  try {
+    const imported = importLatestSourceSheetsFromDrive_(TARGET_FOLDER_ID);
+    processSourceData();
+    SpreadsheetApp.getUi().alert(
+      'Готово.\n' +
+      `Обновлен лист "${SHEET_REQUESTS}" из файла: ${imported.requestsFileName}\n` +
+      `Обновлен лист "${SHEET_SCHEDULE_SOURCE}" из файла: ${imported.scheduleFileName}`
+    );
+  } catch (error) {
+    Logger.log(error && error.stack ? error.stack : error);
+    SpreadsheetApp.getUi().alert('Ошибка: ' + error.message);
+    throw error;
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 function importLatestLabeledXlsxToSheets() {
@@ -137,6 +159,67 @@ function findLatestMessage_(query, batchSize) {
   }
 
   return latestMessage;
+}
+
+function importLatestSourceSheetsFromDrive_(folderId) {
+  const requestsFile = findLatestSpreadsheetFileByKeywords_(folderId, ['заявк']);
+  const scheduleFile = findLatestSpreadsheetFileByKeywords_(folderId, ['график']);
+
+  if (!requestsFile) {
+    throw new Error('Не найден актуальный файл "Заявки" в папке Google Drive.');
+  }
+  if (!scheduleFile) {
+    throw new Error('Не найден актуальный файл "Графики" в папке Google Drive.');
+  }
+
+  const ss = SpreadsheetApp.getActive();
+  copySheetDataFromFileToActiveSheet_(ss, requestsFile.id, SHEET_REQUESTS);
+  copySheetDataFromFileToActiveSheet_(ss, scheduleFile.id, SHEET_SCHEDULE_SOURCE);
+
+  return {
+    requestsFileName: requestsFile.name,
+    scheduleFileName: scheduleFile.name,
+  };
+}
+
+function findLatestSpreadsheetFileByKeywords_(folderId, keywords) {
+  const folder = DriveApp.getFolderById(folderId);
+  const files = folder.getFiles();
+  let latest = null;
+
+  while (files.hasNext()) {
+    const file = files.next();
+    const name = str_(file.getName());
+    const lowerName = name.toLowerCase();
+    const isSpreadsheet = str_(file.getMimeType()) === MimeType.GOOGLE_SHEETS;
+    const matchKeyword = keywords.some((kw) => lowerName.indexOf(str_(kw).toLowerCase()) >= 0);
+    if (!isSpreadsheet || !matchKeyword) continue;
+
+    const updated = file.getLastUpdated();
+    if (!latest || updated.getTime() > latest.updatedAt.getTime()) {
+      latest = {
+        id: file.getId(),
+        name,
+        updatedAt: updated,
+      };
+    }
+  }
+
+  return latest;
+}
+
+function copySheetDataFromFileToActiveSheet_(activeSpreadsheet, sourceFileId, targetSheetName) {
+  const sourceSpreadsheet = SpreadsheetApp.openById(sourceFileId);
+  const sourceSheet = sourceSpreadsheet.getSheetByName(targetSheetName) || sourceSpreadsheet.getSheets()[0];
+  if (!sourceSheet) {
+    throw new Error(`В файле ${sourceSpreadsheet.getName()} нет листов для импорта "${targetSheetName}"`);
+  }
+
+  const sourceValues = sourceSheet.getDataRange().getValues();
+  const targetSheet = getOrCreateSheet_(activeSpreadsheet, targetSheetName);
+  targetSheet.clearContents();
+  if (!sourceValues.length || !sourceValues[0].length) return;
+  targetSheet.getRange(1, 1, sourceValues.length, sourceValues[0].length).setValues(sourceValues);
 }
 
 function isXlsxAttachment_(attachment) {
@@ -619,8 +702,7 @@ function getExcludedEmployeesSet_(ss) {
 }
 
 function hasStandaloneTestWord_(value) {
-  const tokens = str_(value).toLowerCase().split(/[^a-zа-яё0-9]+/i).filter((t) => t);
-  return tokens.includes('тест');
+  return str_(value).toLowerCase().indexOf('тест') >= 0;
 }
 
 function formatDateDDMMYYYY_(value) {
