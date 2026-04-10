@@ -47,30 +47,45 @@ function onOpen() {
 
 }
 
-function processSourceData() {
+function processSourceData(options) {
+  const opts = options || {};
+  const silent = opts.silent === true;
   buildDoctorSchedule();
-  SpreadsheetApp.getActive().toast('Исходные данные (график + заявки) обработаны', MENU_NAME, 5);
+  if (!silent) {
+    SpreadsheetApp.getActive().toast('Исходные данные (график + заявки) обработаны', MENU_NAME, 5);
+  }
 }
 
-function processSourceDataFromDrive() {
+function processSourceDataFromDrive(options) {
+  const opts = options || {};
+  const interactive = opts.interactive !== false;
   const lock = LockService.getScriptLock();
   lock.waitLock(30000);
 
   try {
     const imported = importLatestSourceSheetsFromDrive_(TARGET_FOLDER_ID);
-    processSourceData();
-    SpreadsheetApp.getUi().alert(
+    processSourceData({ silent: !interactive });
+    notifyExecutionResult_(
       'Готово.\n' +
-      `Обновлен лист "${SHEET_REQUESTS}" из файла: ${imported.requestsFileName}\n` +
-      `Обновлен лист "${SHEET_SCHEDULE_SOURCE}" из файла: ${imported.scheduleFileName}`
+        `Обновлен лист "${SHEET_REQUESTS}" из файла: ${imported.requestsFileName}\n` +
+        `Обновлен лист "${SHEET_SCHEDULE_SOURCE}" из файла: ${imported.scheduleFileName}`,
+      interactive
     );
   } catch (error) {
     Logger.log(error && error.stack ? error.stack : error);
-    SpreadsheetApp.getUi().alert('Ошибка: ' + error.message);
+    notifyExecutionResult_('Ошибка: ' + error.message, interactive);
     throw error;
   } finally {
     lock.releaseLock();
   }
+}
+
+function notifyExecutionResult_(message, interactive) {
+  if (interactive) {
+    SpreadsheetApp.getUi().alert(message);
+    return;
+  }
+  Logger.log(message);
 }
 
 function importLatestLabeledXlsxToSheets() {
@@ -2034,7 +2049,7 @@ function sendForwardReportEmail(ss, selectedBranch, currentDay) {
 }
 
 function processSourceDataFromDriveTriggerAggregatorsPrepareData() {
-  processSourceDataFromDrive();
+  processSourceDataFromDrive({ interactive: false });
   updateDiscountsByPlan({ silent: true });
   sendDiscountsEmailsByMode_({
     targetMode: 'aggregators',
@@ -2043,7 +2058,7 @@ function processSourceDataFromDriveTriggerAggregatorsPrepareData() {
 }
 
 function processSourceDataFromDriveTriggerBranchesOverallAndDiscounts() {
-  processSourceDataFromDrive();
+  processSourceDataFromDrive({ interactive: false });
 
   runForwardLoadReportsDirect_({
     includeBaseline: true,
