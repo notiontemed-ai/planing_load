@@ -38,8 +38,8 @@ function onOpen() {
     .addSubMenu(
       SpreadsheetApp.getUi()
         .createMenu('Триггеры')
-        .addItem('Агрегаторы: подготовка данных', 'processSourceDataFromDriveTriggerAggregatorsPrepareData')
-        .addItem('Филиалы + общий план + скидки', 'processSourceDataFromDriveTriggerBranchesOverallAndDiscounts')
+        .addItem('Агрегаторы: скидки + письмо', 'processSourceDataFromDriveTriggerAggregatorsPrepareData')
+        .addItem('Филиалы + общий план + скидки + письма', 'processSourceDataFromDriveTriggerBranchesOverallAndDiscounts')
     )
     .addSeparator()
     .addItem('Архивировать план (ежедневно)', 'archivePlanReportsDaily')
@@ -2036,6 +2036,10 @@ function sendForwardReportEmail(ss, selectedBranch, currentDay) {
 function processSourceDataFromDriveTriggerAggregatorsPrepareData() {
   processSourceDataFromDrive();
   updateDiscountsByPlan({ silent: true });
+  sendDiscountsEmailsByMode_({
+    targetMode: 'aggregators',
+    silent: true,
+  });
 }
 
 function processSourceDataFromDriveTriggerBranchesOverallAndDiscounts() {
@@ -2043,23 +2047,16 @@ function processSourceDataFromDriveTriggerBranchesOverallAndDiscounts() {
 
   runForwardLoadReportsDirect_({
     includeBaseline: true,
-    sendEmails: false,
+    sendEmails: true,
   });
 
   buildOverallForecastCore_({
-    sendEmail: false,
+    sendEmail: true,
     refreshDiscountsAfter: false,
   });
 
   updateDiscountsByPlan({ silent: true });
-}
-
-function triggerBuildAggregatorDiscountsAndSend() {
-  processSourceDataFromDriveTriggerAggregatorsPrepareData();
-}
-
-function triggerBuildBaselinePlansAndSend() {
-  processSourceDataFromDriveTriggerBranchesOverallAndDiscounts();
+  sendDiscountsEmails({ silent: true });
 }
 
 function buildOverallForecastCore_(options) {
