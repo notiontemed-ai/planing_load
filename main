@@ -38,8 +38,8 @@ function onOpen() {
     .addSubMenu(
       SpreadsheetApp.getUi()
         .createMenu('Триггеры')
-        .addItem('Агрегаторы: скидки + письмо', 'triggerBuildAggregatorDiscountsAndSend')
-        .addItem('Полный цикл: планы + общий план + скидки + письма', 'triggerBuildBaselinePlansAndSend')
+        .addItem('Агрегаторы: скидки + письмо', 'processSourceDataFromDriveTriggerAggregatorsPrepareData')
+        .addItem('Филиалы + общий план + скидки + письма', 'processSourceDataFromDriveTriggerBranchesOverallAndDiscounts')
     )
     .addSeparator()
     .addItem('Архивировать план (ежедневно)', 'archivePlanReportsDaily')
@@ -2033,43 +2033,30 @@ function sendForwardReportEmail(ss, selectedBranch, currentDay) {
   });
 }
 
-function triggerBuildAggregatorDiscountsAndSend() {
-  try {
-    processSourceData();
-    updateDiscountsByPlan({ silent: true });
-
-    sendDiscountsEmailsByMode_({
-      targetMode: 'aggregators',
-      silent: true,
-    });
-  } catch (e) {
-    const message = e && e.message ? e.message : String(e);
-    const details = e && e.stack ? e.stack : (e && e.message ? e.message : String(e));
-    throw e;
-  }
+function processSourceDataFromDriveTriggerAggregatorsPrepareData() {
+  processSourceDataFromDrive();
+  updateDiscountsByPlan({ silent: true });
+  sendDiscountsEmailsByMode_({
+    targetMode: 'aggregators',
+    silent: true,
+  });
 }
 
-function triggerBuildBaselinePlansAndSend() {
-  try {
-    processSourceData();
+function processSourceDataFromDriveTriggerBranchesOverallAndDiscounts() {
+  processSourceDataFromDrive();
 
-    runForwardLoadReportsDirect_({
-      includeBaseline: true,
-      sendEmails: true,
-    });
+  runForwardLoadReportsDirect_({
+    includeBaseline: true,
+    sendEmails: true,
+  });
 
-    buildOverallForecastCore_({
-      sendEmail: true,
-      refreshDiscountsAfter: false,
-    });
+  buildOverallForecastCore_({
+    sendEmail: true,
+    refreshDiscountsAfter: false,
+  });
 
-    updateDiscountsByPlan({ silent: true });
-    sendDiscountsEmails({ silent: true });
-  } catch (e) {
-    const message = e && e.message ? e.message : String(e);
-    const details = e && e.stack ? e.stack : (e && e.message ? e.message : String(e));
-    throw e;
-  }
+  updateDiscountsByPlan({ silent: true });
+  sendDiscountsEmails({ silent: true });
 }
 
 function buildOverallForecastCore_(options) {
