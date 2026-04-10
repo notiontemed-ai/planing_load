@@ -6,9 +6,10 @@ const SHEET_PROCESSED_REQUESTS = 'Обработанные заявки';
 const SHEET_EXCLUSIONS = 'Исключения';
 const SHEET_DISCOUNTS = 'Скидки';
 const MENU_NAME = 'TEMED';
-const SOURCE_EMAIL_SUBJECT_PREFIX = 'Выгрузка графика и заявок клиника "Темед"';
-const SOURCE_SCHEDULE_ATTACHMENT_PREFIX = 'Графики ';
-const SOURCE_REQUESTS_ATTACHMENT_PREFIX = 'Заявки ';
+const GMAIL_QUERY = 'label:графики-и-заявки-из-1с';
+const TARGET_FOLDER_ID = '1LlZSRquXr11iSqLPg4OESmy883vuVpK1';
+const PROP_LAST_PROCESSED_MESSAGE_ID = 'LAST_IMPORTED_GMAIL_MESSAGE_ID';
+const SEARCH_BATCH_SIZE = 20;
 const FL2_SYSTEM_MARKER = '__SYSTEM_TIMESTAMP__';
 const FL2_PROCESSED_REQUESTS_CURRENT_DAY_HEADER = 'CurrentDate';
 
@@ -22,8 +23,7 @@ const TIME_TYPE_MAP = {
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu(MENU_NAME)
-    .addItem('Загрузить график и заявки из почты', 'loadSourceDataFromEmail')
-    .addItem('Загрузить из почты и обработать', 'loadAndProcessSourceDataFromEmail')
+    .addItem('Загрузить исходные XLSX на диск', 'importLatestLabeledXlsxToSheets')
     .addItem('Обработать исходные данные', 'processSourceData')
     .addSeparator()
     .addItem('Сформировать план загрузки 3/7 дней', 'buildForwardLoadReport')
@@ -51,136 +51,102 @@ function processSourceData() {
   SpreadsheetApp.getActive().toast('Исходные данные (график + заявки) обработаны', MENU_NAME, 5);
 }
 
-function loadAndProcessSourceDataFromEmail() {
-  loadSourceDataFromEmail();
-  processSourceData();
-  SpreadsheetApp.getActive().toast('Исходные данные загружены из почты и обработаны', MENU_NAME, 5);
-}
+function importLatestLabeledXlsxToSheets() {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
 
-function loadSourceDataFromEmail() {
-  const ss = SpreadsheetApp.getActive();
   try {
-    const sourceMessage = findSingleSourceMessageForToday_();
-    const subject = str_(sourceMessage.getSubject());
-
-    const sourceAttachments = pickSourceAttachments_(sourceMessage.getAttachments());
-
-    deleteSheetIfExists_(ss, SHEET_SCHEDULE_SOURCE);
-    deleteSheetIfExists_(ss, SHEET_REQUESTS);
-
-    importXlsxAttachmentToSheet_(sourceAttachments.schedule.copyBlob(), SHEET_SCHEDULE_SOURCE);
-
-    importXlsxAttachmentToSheet_(sourceAttachments.requests.copyBlob(), SHEET_REQUESTS);
-
-    ss.toast('Исходные данные загружены из почты', MENU_NAME, 5);
-  } catch (e) {
-    const message = e && e.message ? e.message : String(e);
-    ss.toast(message, MENU_NAME, 8);
-    throw e;
-  }
-}
-
-function findSingleSourceMessageForToday_() {
-  const query = 'label:графики-и-заявки-из-1с newer_than:2d';
-  const thread = GmailApp.search(query, 0, 1)[0];
-  if (!thread) {
-    throw new Error('Не найдено ни одного письма с меткой "графики-и-заявки-из-1с"');
-  }
-  return pickLatestMessageByDate_(thread.getMessages());
-}
-
-function pickLatestMessageByDate_(messages) {
-  const list = Array.isArray(messages) ? messages.slice() : [];
-  list.sort((a, b) => {
-    const at = a && a.getDate ? a.getDate().getTime() : 0;
-    const bt = b && b.getDate ? b.getDate().getTime() : 0;
-    if (at === bt) return 0;
-    return at - bt;
-  });
-  return list[list.length - 1] || null;
-}
-
-function pickSourceAttachments_(attachments) {
-  const list = Array.isArray(attachments) ? attachments : [];
-  if (list.length !== 2) {
-    throw new Error('В письме должно быть ровно 2 вложения: "Заявки*" и "Графики*"');
-  }
-
-  const scheduleMatches = list.filter((attachment) => {
-    const fileName = str_(attachment.getName());
-    return fileName.startsWith(SOURCE_SCHEDULE_ATTACHMENT_PREFIX);
-  });
-  const requestsMatches = list.filter((attachment) => {
-    const fileName = str_(attachment.getName());
-    return fileName.startsWith(SOURCE_REQUESTS_ATTACHMENT_PREFIX);
-  });
-
-  if (scheduleMatches.length !== 1) {
-    if (scheduleMatches.length === 0) throw new Error('В письме не найдено вложение "Графики *.XLSX"');
-    throw new Error('В письме найдено больше одного вложения "Графики *.XLSX"');
-  }
-  if (requestsMatches.length !== 1) {
-    if (requestsMatches.length === 0) throw new Error('В письме не найдено вложение "Заявки *.XLSX"');
-    throw new Error('В письме найдено больше одного вложения "Заявки *.XLSX"');
-  }
-  return {
-    schedule: scheduleMatches[0],
-    requests: requestsMatches[0],
-  };
-}
-
-function importXlsxAttachmentToSheet_(attachmentBlob, targetSheetName) {
-  const ss = SpreadsheetApp.getActive();
-  const target = getOrCreateSheet_(ss, targetSheetName);
-  let tempFileId = '';
-  try {
-    const importBlob = attachmentBlob.copyBlob();
-    if (!str_(importBlob.getName()).toLowerCase().endsWith('.xlsx')) {
-      importBlob.setName(`tmp_import_${targetSheetName}_${Date.now()}.xlsx`);
-    }
-    if (!str_(importBlob.getContentType())) {
-      importBlob.setContentType('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    const latestMessage = findLatestMessage_(GMAIL_QUERY, SEARCH_BATCH_SIZE);
+    if (!latestMessage) {
+      SpreadsheetApp.getUi().alert('Писем по запросу не найдено.');
+      return;
     }
 
-    const resource = {
-      title: `tmp_import_${targetSheetName}_${Date.now()}`,
-      mimeType: MimeType.GOOGLE_SHEETS,
-    };
-    const tempFile = Drive.Files.create(resource, importBlob);
-    if (!tempFile || !tempFile.id) throw new Error('Не удалось конвертировать XLSX во временную Google-таблицу');
-    tempFileId = tempFile.id;
+    const messageId = latestMessage.getId();
+    const props = PropertiesService.getScriptProperties();
+    const lastProcessedMessageId = props.getProperty(PROP_LAST_PROCESSED_MESSAGE_ID);
 
-    const tempSpreadsheet = SpreadsheetApp.openById(tempFileId);
-    const firstSheet = tempSpreadsheet.getSheets()[0];
-    if (!firstSheet) throw new Error('Импортированный файл пустой');
+    if (lastProcessedMessageId === messageId) {
+      SpreadsheetApp.getUi().alert('Последнее письмо уже обработано.');
+      return;
+    }
 
-    const dataRange = firstSheet.getDataRange();
-    const values = dataRange.getValues();
-    if (!hasAnyNonEmptyCell_(values)) throw new Error('Импортированный файл пустой');
+    const attachments = latestMessage.getAttachments({
+      includeInlineImages: false,
+      includeAttachments: true,
+    });
 
-    target.clear();
-    target.getRange(1, 1, values.length, values[0].length).setValues(values);
-  } catch (e) {
-    const rootCause = e && e.message ? e.message : String(e);
-    throw new Error(`Не удалось импортировать XLSX в лист "${targetSheetName}": ${rootCause}`);
+    const xlsxAttachments = attachments.filter(isXlsxAttachment_);
+
+    if (!xlsxAttachments.length) {
+      props.setProperty(PROP_LAST_PROCESSED_MESSAGE_ID, messageId);
+      SpreadsheetApp.getUi().alert('В последнем письме нет XLSX-вложений.');
+      return;
+    }
+
+    const createdFiles = [];
+
+    for (const attachment of xlsxAttachments) {
+      const originalName = attachment.getName() || 'attachment.xlsx';
+      const baseName = originalName.replace(/\.xlsx$/i, '');
+      const blob = attachment.copyBlob().setName(originalName);
+
+      const resource = {
+        name: baseName,
+        parents: [TARGET_FOLDER_ID],
+        mimeType: 'application/vnd.google-apps.spreadsheet',
+      };
+
+      const createdFile = Drive.Files.create(resource, blob, {
+        fields: 'id,name,webViewLink',
+      });
+
+      createdFiles.push(createdFile.name);
+    }
+
+    props.setProperty(PROP_LAST_PROCESSED_MESSAGE_ID, messageId);
+
+    SpreadsheetApp.getUi().alert(
+      'Готово.\n' +
+      'Импортировано файлов: ' + createdFiles.length + '\n\n' +
+      createdFiles.join('\n')
+    );
+  } catch (error) {
+    Logger.log(error && error.stack ? error.stack : error);
+    SpreadsheetApp.getUi().alert('Ошибка: ' + error.message);
+    throw error;
   } finally {
-    if (tempFileId) {
-      try {
-        Drive.Files.delete(tempFileId);
-      } catch (cleanupError) {
-        try {
-          DriveApp.getFileById(tempFileId).setTrashed(true);
-        } catch (fallbackCleanupError) {
-          // ignore cleanup errors
-        }
+    lock.releaseLock();
+  }
+}
+
+function findLatestMessage_(query, batchSize) {
+  const threads = GmailApp.search(query, 0, batchSize);
+  let latestMessage = null;
+  let latestTimestamp = -1;
+
+  for (const thread of threads) {
+    const messages = thread.getMessages();
+    for (const message of messages) {
+      const ts = message.getDate().getTime();
+      if (ts > latestTimestamp) {
+        latestTimestamp = ts;
+        latestMessage = message;
       }
     }
   }
+
+  return latestMessage;
 }
 
-function hasAnyNonEmptyCell_(values) {
-  if (!Array.isArray(values) || !values.length) return false;
-  return values.some((row) => Array.isArray(row) && row.some((cell) => cell !== '' && cell !== null));
+function isXlsxAttachment_(attachment) {
+  const name = String(attachment.getName() || '').toLowerCase();
+  const contentType = String(attachment.getContentType() || '').toLowerCase();
+
+  return (
+    name.endsWith('.xlsx') ||
+    contentType === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+  );
 }
 
 function buildDoctorSchedule() {
@@ -1987,7 +1953,7 @@ function sendForwardReportEmail(ss, selectedBranch, currentDay) {
 
 function triggerBuildAggregatorDiscountsAndSend() {
   try {
-    loadAndProcessSourceDataFromEmail();
+    processSourceData();
     updateDiscountsByPlan({ silent: true });
 
     sendDiscountsEmailsByMode_({
@@ -2003,7 +1969,7 @@ function triggerBuildAggregatorDiscountsAndSend() {
 
 function triggerBuildBaselinePlansAndSend() {
   try {
-    loadAndProcessSourceDataFromEmail();
+    processSourceData();
 
     runForwardLoadReportsDirect_({
       includeBaseline: true,
