@@ -23,7 +23,7 @@ const TIME_TYPE_MAP = {
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu(MENU_NAME)
-    .addItem('Загрузить исходные XLSX на диск', 'importLatestLabeledXlsxToSheets')
+    .addItem('Загрузить исходные XLSX на диск', 'importLatestLabeledXlsxToSheetsInteractive')
     .addItem('Обработать исходные данные', 'processSourceData')
     .addItem('Обработать данные с диска', 'processSourceDataFromDrive')
     .addSeparator()
@@ -45,6 +45,10 @@ function onOpen() {
     .addItem('Архивировать план (ежедневно)', 'archivePlanReportsDaily')
     .addToUi();
 
+}
+
+function importLatestLabeledXlsxToSheetsInteractive() {
+  return importLatestLabeledXlsxToSheets({ interactive: true, throwOnError: true });
 }
 
 function processSourceData(options) {
@@ -88,15 +92,18 @@ function notifyExecutionResult_(message, interactive) {
   Logger.log(message);
 }
 
-function importLatestLabeledXlsxToSheets() {
+function importLatestLabeledXlsxToSheets(options) {
+  const opts = options || {};
+  const interactive = opts.interactive === true;
+  const throwOnError = opts.throwOnError === true || interactive;
   const lock = LockService.getScriptLock();
   lock.waitLock(30000);
 
   try {
     const latestMessage = findLatestMessage_(GMAIL_QUERY, SEARCH_BATCH_SIZE);
     if (!latestMessage) {
-      SpreadsheetApp.getUi().alert('Писем по запросу не найдено.');
-      return;
+      notifyExecutionResult_('Писем по запросу не найдено.', interactive);
+      return { status: 'skipped', reason: 'no_messages' };
     }
 
     const messageId = latestMessage.getId();
@@ -104,8 +111,8 @@ function importLatestLabeledXlsxToSheets() {
     const lastProcessedMessageId = props.getProperty(PROP_LAST_PROCESSED_MESSAGE_ID);
 
     if (lastProcessedMessageId === messageId) {
-      SpreadsheetApp.getUi().alert('Последнее письмо уже обработано.');
-      return;
+      notifyExecutionResult_('Последнее письмо уже обработано.', interactive);
+      return { status: 'skipped', reason: 'already_processed' };
     }
 
     const attachments = latestMessage.getAttachments({
@@ -117,8 +124,8 @@ function importLatestLabeledXlsxToSheets() {
 
     if (!xlsxAttachments.length) {
       props.setProperty(PROP_LAST_PROCESSED_MESSAGE_ID, messageId);
-      SpreadsheetApp.getUi().alert('В последнем письме нет XLSX-вложений.');
-      return;
+      notifyExecutionResult_('В последнем письме нет XLSX-вложений.', interactive);
+      return { status: 'skipped', reason: 'no_xlsx_attachments' };
     }
 
     const createdFiles = [];
@@ -143,15 +150,20 @@ function importLatestLabeledXlsxToSheets() {
 
     props.setProperty(PROP_LAST_PROCESSED_MESSAGE_ID, messageId);
 
-    SpreadsheetApp.getUi().alert(
+    notifyExecutionResult_(
       'Готово.\n' +
       'Импортировано файлов: ' + createdFiles.length + '\n\n' +
-      createdFiles.join('\n')
+      createdFiles.join('\n'),
+      interactive
     );
+    return { status: 'imported', importedFiles: createdFiles.length };
   } catch (error) {
     Logger.log(error && error.stack ? error.stack : error);
-    SpreadsheetApp.getUi().alert('Ошибка: ' + error.message);
-    throw error;
+    notifyExecutionResult_('Ошибка: ' + error.message, interactive);
+    if (throwOnError) {
+      throw error;
+    }
+    return { status: 'error', errorMessage: error.message };
   } finally {
     lock.releaseLock();
   }
