@@ -2161,8 +2161,27 @@ function processSourceDataFromDriveTriggerBranchesOverallAndDiscounts() {
   sendDiscountsEmails({ silent: true });
 }
 
-function doGet(e) {
-  const action = str_(e && e.parameter && e.parameter.action).trim();
+function resolveWebAppAction_(e) {
+  const actionFromQuery = str_(e && e.parameter && e.parameter.action).trim();
+  if (actionFromQuery) {
+    return actionFromQuery;
+  }
+
+  const rawPostData = str_(e && e.postData && e.postData.contents).trim();
+  if (!rawPostData) {
+    return '';
+  }
+
+  try {
+    const parsed = JSON.parse(rawPostData);
+    return str_(parsed && parsed.action).trim();
+  } catch (error) {
+    return '';
+  }
+}
+
+function handleWebAppAction_(e) {
+  const action = resolveWebAppAction_(e);
   if (!action) {
     return ContentService.createTextOutput('OK');
   }
@@ -2178,6 +2197,14 @@ function doGet(e) {
   }
 
   return ContentService.createTextOutput(`UNKNOWN_ACTION: ${action}`);
+}
+
+function doGet(e) {
+  return handleWebAppAction_(e);
+}
+
+function doPost(e) {
+  return handleWebAppAction_(e);
 }
 
 function buildOverallForecastCore_(options) {
