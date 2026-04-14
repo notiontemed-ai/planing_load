@@ -14,7 +14,7 @@ const FL2_SYSTEM_MARKER = '__SYSTEM_TIMESTAMP__';
 const FL2_PROCESSED_REQUESTS_CURRENT_DAY_HEADER = 'CurrentDate';
 const BITRIX_WEBHOOK_URL = 'https://n8n-x3.tech.temed.ru/webhook/d90a3413-9505-4281-aa7d-49082ae3e1e8/rozxjWwnHbUByCltdXLLfntCxzxNGqGnonwTIHVBaRHYKd/v1/message';
 const BITRIX_CHAT_ID_DEFAULT = 228956;
-const WEB_APP_EXEC_URL = 'https://script.google.com/macros/s/AKfycbwdqMgb5ru80hQ_2JSz6iULVAIGVwUVejKfKjaO7vdTnlziKorvjD9tUxuxJsDOMgoggw/exec';
+const WEB_APP_EXEC_URL = 'https://script.google.com/macros/s/AKfycbzroexjrG4i89d-zK8KhxwzVfmhwx9XBu50KGF_KoIXr8c3QKUbzg9umg162ceVNc4KBQ/exec';
 
 const TIME_TYPE_MAP = {
   'Рабочее время': 'Приемные часы',
