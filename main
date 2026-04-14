@@ -122,7 +122,7 @@ function sendUpdatedScheduleBitrixMessage_() {
 
   const lines = [
     '<b>Исходные данные обновлены</b>',
-    `Лист "${SHEET_DOCTOR_SCHEDULE}" обновлен.`,
+    ``,
     '',
   ];
 
