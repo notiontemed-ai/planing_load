@@ -12,6 +12,9 @@ const PROP_LAST_PROCESSED_MESSAGE_ID = 'LAST_IMPORTED_GMAIL_MESSAGE_ID';
 const SEARCH_BATCH_SIZE = 20;
 const FL2_SYSTEM_MARKER = '__SYSTEM_TIMESTAMP__';
 const FL2_PROCESSED_REQUESTS_CURRENT_DAY_HEADER = 'CurrentDate';
+const BITRIX_WEBHOOK_URL = 'https://n8n-x3.tech.temed.ru/webhook/d90a3413-9505-4281-aa7d-49082ae3e1e8/rozxjWwnHbUByCltdXLLfntCxzxNGqGnonwTIHVBaRHYKd/v1/message';
+const BITRIX_CHAT_ID_DEFAULT = 228956;
+const WEB_APP_EXEC_URL = 'https://script.google.com/macros/s/AKfycbwdqMgb5ru80hQ_2JSz6iULVAIGVwUVejKfKjaO7vdTnlziKorvjD9tUxuxJsDOMgoggw/exec';
 
 const TIME_TYPE_MAP = {
   'Рабочее время': 'Приемные часы',
@@ -55,9 +58,81 @@ function processSourceData(options) {
   const opts = options || {};
   const silent = opts.silent === true;
   buildDoctorSchedule();
+  sendUpdatedScheduleBitrixMessage_();
   if (!silent) {
     SpreadsheetApp.getActive().toast('Исходные данные (график + заявки) обработаны', MENU_NAME, 5);
   }
+}
+
+function sendMessageToBitrixChat(text, chatIdOverride) {
+  const chatId = Number(chatIdOverride || BITRIX_CHAT_ID_DEFAULT);
+  const payload = { type: 'chat', id: chatId, message: bitrixMessageText_(text) };
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true,
+  };
+  const response = UrlFetchApp.fetch(BITRIX_WEBHOOK_URL, options);
+  const code = response.getResponseCode();
+  const body = response.getContentText() || '';
+
+  if (code < 200 || code >= 300) {
+    throw new Error(`Bitrix HTTP ${code}. chatId=${chatId}. body=${body}`);
+  }
+
+  if (body && /"error"\s*:|^\s*error\b|failed|exception/i.test(body)) {
+    throw new Error(`Bitrix response contains error. chatId=${chatId}. body=${body}`);
+  }
+
+  return { code: code, body: body };
+}
+
+function bitrixMessageText_(text) {
+  return String(text || '')
+    .replace(/<a\s+href="([^"]+)">([^<]+)<\/a>/gi, '[URL=$1]$2[/URL]')
+    .replace(/<b>/gi, '[B]')
+    .replace(/<\/b>/gi, '[/B]')
+    .replace(/<i>/gi, '[I]')
+    .replace(/<\/i>/gi, '[/I]')
+    .replace(/<u>/gi, '[U]')
+    .replace(/<\/u>/gi, '[/U]')
+    .replace(/<s>/gi, '[S]')
+    .replace(/<\/s>/gi, '[/S]')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>');
+}
+
+function sendUpdatedScheduleBitrixMessage_() {
+  const links = [
+    {
+      title: 'Агрегаторы: скидки + письмо',
+      description: 'Обновляет скидки и отправляет рассылку для агрегаторов.',
+      action: 'aggregators_prepare_data',
+    },
+    {
+      title: 'Филиалы + общий план + скидки + письма',
+      description: 'Обновляет планы по филиалам, общий план и запускает рассылки.',
+      action: 'branches_overall_and_discounts',
+    },
+  ];
+
+  const lines = [
+    '<b>Исходные данные обновлены</b>',
+    `Лист "${SHEET_DOCTOR_SCHEDULE}" обновлен.`,
+    '',
+  ];
+
+  links.forEach((link, idx) => {
+    const runUrl = `${WEB_APP_EXEC_URL}?action=${encodeURIComponent(link.action)}`;
+    lines.push(`${idx + 1}. <b>${link.title}</b> — ${link.description}`);
+    lines.push(`   <a href="${runUrl}">Запустить</a>`);
+  });
+
+  sendMessageToBitrixChat(lines.join('\n'), BITRIX_CHAT_ID_DEFAULT);
 }
 
 function processSourceDataFromDrive(options) {
@@ -2086,6 +2161,25 @@ function processSourceDataFromDriveTriggerBranchesOverallAndDiscounts() {
   sendDiscountsEmails({ silent: true });
 }
 
+function doGet(e) {
+  const action = str_(e && e.parameter && e.parameter.action).trim();
+  if (!action) {
+    return ContentService.createTextOutput('OK');
+  }
+
+  if (action === 'aggregators_prepare_data') {
+    processSourceDataFromDriveTriggerAggregatorsPrepareData();
+    return ContentService.createTextOutput('DONE: aggregators_prepare_data');
+  }
+
+  if (action === 'branches_overall_and_discounts') {
+    processSourceDataFromDriveTriggerBranchesOverallAndDiscounts();
+    return ContentService.createTextOutput('DONE: branches_overall_and_discounts');
+  }
+
+  return ContentService.createTextOutput(`UNKNOWN_ACTION: ${action}`);
+}
+
 function buildOverallForecastCore_(options) {
   const opts = options || {};
   const refreshDiscountsAfter = opts.refreshDiscountsAfter === true;
@@ -2389,7 +2483,7 @@ function sendDiscountsEmailsByMode_(options) {
     subject = `Скидки для агрегаторов на ${formatDateDDMMYYYY_(new Date())}`;
   } else if (targetMode === 'non_aggregators') {
     mailingBranchName = 'Скидки';
-    allowedSectionKeys = ['pp_discount', 'p_discount', 'smm', 'site'];
+    allowedSectionKeys = ['pp_discount', 'p_discount', 'smm', 'site', 'aggregators'];
     subject = `Сводка по скидкам на ${formatDateDDMMYYYY_(new Date())}`;
   } else {
     throw new Error(`Неизвестный режим отправки скидок: ${targetMode}`);
