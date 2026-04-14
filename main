@@ -3,14 +3,13 @@ const SHEET_DOCTOR_SCHEDULE = 'Обработанный график';
 const SHEET_EMPLOYEES = 'Сотрудники';
 const SHEET_REQUESTS = 'Заявки';
 const SHEET_PROCESSED_REQUESTS = 'Обработанные заявки';
-const SHEET_REPORT_LOG = 'Лог';
 const SHEET_EXCLUSIONS = 'Исключения';
 const SHEET_DISCOUNTS = 'Скидки';
 const MENU_NAME = 'TEMED';
-const SOURCE_EMAIL_SUBJECT_PREFIX = 'Выгрузка графика и заявок клиника "Темед"';
-const SOURCE_SCHEDULE_ATTACHMENT_PREFIX = 'Графики ';
-const SOURCE_REQUESTS_ATTACHMENT_PREFIX = 'Заявки ';
-const SOURCE_ATTACHMENT_EXT = '.XLSX';
+const GMAIL_QUERY = 'label:графики-и-заявки-из-1с';
+const TARGET_FOLDER_ID = '1LlZSRquXr11iSqLPg4OESmy883vuVpK1';
+const PROP_LAST_PROCESSED_MESSAGE_ID = 'LAST_IMPORTED_GMAIL_MESSAGE_ID';
+const SEARCH_BATCH_SIZE = 20;
 const FL2_SYSTEM_MARKER = '__SYSTEM_TIMESTAMP__';
 const FL2_PROCESSED_REQUESTS_CURRENT_DAY_HEADER = 'CurrentDate';
 
@@ -24,13 +23,12 @@ const TIME_TYPE_MAP = {
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu(MENU_NAME)
-    .addItem('Загрузить график и заявки из почты', 'loadSourceDataFromEmail')
-    .addItem('Загрузить из почты и обработать', 'loadAndProcessSourceDataFromEmail')
+    .addItem('Загрузить исходные XLSX на диск', 'importLatestLabeledXlsxToSheets')
     .addItem('Обработать исходные данные', 'processSourceData')
+    .addItem('Обработать данные с диска', 'processSourceDataFromDrive')
     .addSeparator()
     .addItem('Сформировать план загрузки 3/7 дней', 'buildForwardLoadReport')
     .addItem('Сформировать план загрузки 3/7 дней по всем клиникам', 'buildForwardLoadReportAllBranches')
-    .addItem('Отправить рассылку по всем клиникам (после пакетного плана)', 'confirmAndSendForwardBatchEmails')
     .addSeparator()
     .addItem('Обновить скидки по плану', 'updateDiscountsByPlan')
     .addItem('Отправить скидки', 'sendDiscountsEmails')
@@ -40,194 +38,213 @@ function onOpen() {
     .addSubMenu(
       SpreadsheetApp.getUi()
         .createMenu('Триггеры')
-        .addItem('Агрегаторы: план без baseline + скидки + письмо', 'triggerBuildAggregatorDiscountsAndSend')
-        .addItem('Скидки без агрегаторов: план без baseline + письмо', 'triggerBuildNonAggregatorDiscountsAndSend')
-        .addItem('План с baseline + общий план + письма', 'triggerBuildBaselinePlansAndSend')
+        .addItem('Агрегаторы: скидки + письмо', 'processSourceDataFromDriveTriggerAggregatorsPrepareData')
+        .addItem('Филиалы + общий план + скидки + письма', 'processSourceDataFromDriveTriggerBranchesOverallAndDiscounts')
     )
     .addSeparator()
     .addItem('Архивировать план (ежедневно)', 'archivePlanReportsDaily')
     .addToUi();
 
-  if (typeof maybePromptForwardBatchEmail_ === 'function') {
-    maybePromptForwardBatchEmail_();
-  }
 }
 
-function processSourceData() {
+function processSourceData(options) {
+  const opts = options || {};
+  const silent = opts.silent === true;
   buildDoctorSchedule();
-  SpreadsheetApp.getActive().toast('Исходные данные (график + заявки) обработаны', MENU_NAME, 5);
-}
-
-function loadAndProcessSourceDataFromEmail() {
-  loadSourceDataFromEmail();
-  processSourceData();
-  SpreadsheetApp.getActive().toast('Исходные данные загружены из почты и обработаны', MENU_NAME, 5);
-}
-
-function loadSourceDataFromEmail() {
-  const ss = SpreadsheetApp.getActive();
-  try {
-    const sourceMessage = findSingleSourceMessageForToday_();
-    const subject = str_(sourceMessage.getSubject());
-    fl2Log_('INFO', 'Импорт исходников из почты: найдено письмо', `Тема: ${subject}`);
-    fl2Log_('INFO', 'Импорт исходников из почты: дата письма', formatDateTimeDDMMYYYY_(sourceMessage.getDate()));
-
-    const sourceAttachments = pickSourceAttachments_(sourceMessage.getAttachments());
-    fl2Log_('INFO', 'Импорт исходников из почты: найденные вложения', `${sourceAttachments.schedule.getName()} | ${sourceAttachments.requests.getName()}`);
-
-    deleteSheetIfExists_(ss, SHEET_SCHEDULE_SOURCE);
-    deleteSheetIfExists_(ss, SHEET_REQUESTS);
-    fl2Log_('INFO', 'Импорт исходников из почты: исходные листы удалены', `${SHEET_SCHEDULE_SOURCE} | ${SHEET_REQUESTS}`);
-
-    importXlsxAttachmentToSheet_(sourceAttachments.schedule.copyBlob(), SHEET_SCHEDULE_SOURCE);
-    fl2Log_('INFO', 'Импорт исходников из почты: лист обновлен', SHEET_SCHEDULE_SOURCE);
-
-    importXlsxAttachmentToSheet_(sourceAttachments.requests.copyBlob(), SHEET_REQUESTS);
-    fl2Log_('INFO', 'Импорт исходников из почты: лист обновлен', SHEET_REQUESTS);
-
-    fl2Log_('INFO', 'Импорт исходников из почты: успех', '');
-    ss.toast('Исходные данные загружены из почты', MENU_NAME, 5);
-  } catch (e) {
-    const message = e && e.message ? e.message : String(e);
-    fl2Log_('ERROR', 'Импорт исходников из почты: ошибка', message);
-    ss.toast(message, MENU_NAME, 8);
-    throw e;
+  if (!silent) {
+    SpreadsheetApp.getActive().toast('Исходные данные (график + заявки) обработаны', MENU_NAME, 5);
   }
 }
 
-function findSingleSourceMessageForToday_() {
-  const query = 'has:attachment newer_than:2d';
-  const threads = GmailApp.search(query, 0, 100);
-  const messages = [];
-  threads.forEach((thread) => {
-    messages.push(...thread.getMessages());
-  });
+function processSourceDataFromDrive(options) {
+  const opts = options || {};
+  const interactive = opts.interactive !== false;
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
 
-  const todayMatches = [];
-  const todayLabel = Utilities.formatDate(new Date(), FL2_TIMEZONE, 'dd.MM.yyyy');
-
-  messages.forEach((message) => {
-    const subject = str_(message.getSubject()).replace(/\s+/g, ' ').trim();
-    if (!subject.startsWith(SOURCE_EMAIL_SUBJECT_PREFIX)) return;
-    if (!message.getAttachments() || !message.getAttachments().length) return;
-    const messageDateLabel = Utilities.formatDate(message.getDate(), FL2_TIMEZONE, 'dd.MM.yyyy');
-    if (messageDateLabel === todayLabel) todayMatches.push(message);
-  });
-
-  if (!todayMatches.length) {
-    const checkedCount = messages.length;
-    const examples = messages
-      .slice()
-      .sort((a, b) => b.getDate().getTime() - a.getDate().getTime())
-      .slice(0, 5)
-      .map((message) => {
-        const date = Utilities.formatDate(message.getDate(), FL2_TIMEZONE, 'dd.MM.yyyy HH:mm:ss');
-        const from = str_(message.getFrom());
-        const subject = str_(message.getSubject());
-        return `${date} | ${from} | ${subject}`;
-      });
-    const examplesText = examples.length ? examples.join(' ; ') : 'нет писем';
-    throw new Error(
-      `Не найдено письмо за текущую дату с темой, начинающейся на "${SOURCE_EMAIL_SUBJECT_PREFIX}". ` +
-      `Проверено сообщений: ${checkedCount}. Примеры найденных писем: ${examplesText}`
+  try {
+    const imported = importLatestSourceSheetsFromDrive_(TARGET_FOLDER_ID);
+    processSourceData({ silent: !interactive });
+    notifyExecutionResult_(
+      'Готово.\n' +
+        `Обновлен лист "${SHEET_REQUESTS}" из файла: ${imported.requestsFileName}\n` +
+        `Обновлен лист "${SHEET_SCHEDULE_SOURCE}" из файла: ${imported.scheduleFileName}`,
+      interactive
     );
-  }
-  return pickLatestMessageByDate_(todayMatches);
-}
-
-function pickLatestMessageByDate_(messages) {
-  const list = Array.isArray(messages) ? messages.slice() : [];
-  list.sort((a, b) => {
-    const at = a && a.getDate ? a.getDate().getTime() : 0;
-    const bt = b && b.getDate ? b.getDate().getTime() : 0;
-    if (at === bt) return 0;
-    return at - bt;
-  });
-  return list[list.length - 1] || null;
-}
-
-function pickSourceAttachments_(attachments) {
-  const list = Array.isArray(attachments) ? attachments : [];
-  const scheduleMatches = list.filter((attachment) => {
-    const fileName = str_(attachment.getName());
-    return fileName.startsWith(SOURCE_SCHEDULE_ATTACHMENT_PREFIX) && fileName.endsWith(SOURCE_ATTACHMENT_EXT);
-  });
-  const requestsMatches = list.filter((attachment) => {
-    const fileName = str_(attachment.getName());
-    return fileName.startsWith(SOURCE_REQUESTS_ATTACHMENT_PREFIX) && fileName.endsWith(SOURCE_ATTACHMENT_EXT);
-  });
-
-  if (scheduleMatches.length !== 1) {
-    if (scheduleMatches.length === 0) throw new Error('В письме не найдено вложение "Графики *.XLSX"');
-    throw new Error('В письме найдено больше одного вложения "Графики *.XLSX"');
-  }
-  if (requestsMatches.length !== 1) {
-    if (requestsMatches.length === 0) throw new Error('В письме не найдено вложение "Заявки *.XLSX"');
-    throw new Error('В письме найдено больше одного вложения "Заявки *.XLSX"');
-  }
-  return {
-    schedule: scheduleMatches[0],
-    requests: requestsMatches[0],
-  };
-}
-
-function importXlsxAttachmentToSheet_(attachmentBlob, targetSheetName) {
-  const ss = SpreadsheetApp.getActive();
-  const target = getOrCreateSheet_(ss, targetSheetName);
-  let tempFileId = '';
-  try {
-    const importBlob = attachmentBlob.copyBlob();
-    if (!str_(importBlob.getName()).toLowerCase().endsWith('.xlsx')) {
-      importBlob.setName(`tmp_import_${targetSheetName}_${Date.now()}.xlsx`);
-    }
-    if (!str_(importBlob.getContentType())) {
-      importBlob.setContentType('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    }
-
-    const resource = {
-      title: `tmp_import_${targetSheetName}_${Date.now()}`,
-      mimeType: MimeType.GOOGLE_SHEETS,
-    };
-    const tempFile = Drive.Files.create(resource, importBlob);
-    if (!tempFile || !tempFile.id) throw new Error('Не удалось конвертировать XLSX во временную Google-таблицу');
-    tempFileId = tempFile.id;
-
-    const tempSpreadsheet = SpreadsheetApp.openById(tempFileId);
-    const firstSheet = tempSpreadsheet.getSheets()[0];
-    if (!firstSheet) throw new Error('Импортированный файл пустой');
-
-    const dataRange = firstSheet.getDataRange();
-    const values = dataRange.getValues();
-    if (!hasAnyNonEmptyCell_(values)) throw new Error('Импортированный файл пустой');
-
-    target.clear();
-    target.getRange(1, 1, values.length, values[0].length).setValues(values);
-  } catch (e) {
-    const rootCause = e && e.message ? e.message : String(e);
-    fl2Log_('ERROR', 'Импорт исходников из почты: ошибка импорта XLSX', rootCause);
-    throw new Error(`Не удалось импортировать XLSX в лист "${targetSheetName}": ${rootCause}`);
+  } catch (error) {
+    Logger.log(error && error.stack ? error.stack : error);
+    notifyExecutionResult_('Ошибка: ' + error.message, interactive);
+    throw error;
   } finally {
-    if (tempFileId) {
-      try {
-        Drive.Files.delete(tempFileId);
-      } catch (cleanupError) {
-        try {
-          DriveApp.getFileById(tempFileId).setTrashed(true);
-        } catch (fallbackCleanupError) {
-          fl2Log_(
-            'WARN',
-            'Импорт исходников из почты: не удалось удалить временный файл',
-            `${String(cleanupError)} | fallback: ${String(fallbackCleanupError)}`
-          );
-        }
+    lock.releaseLock();
+  }
+}
+
+function notifyExecutionResult_(message, interactive) {
+  if (interactive) {
+    SpreadsheetApp.getUi().alert(message);
+    return;
+  }
+  Logger.log(message);
+}
+
+function importLatestLabeledXlsxToSheets() {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+
+  try {
+    const latestMessage = findLatestMessage_(GMAIL_QUERY, SEARCH_BATCH_SIZE);
+    if (!latestMessage) {
+      SpreadsheetApp.getUi().alert('Писем по запросу не найдено.');
+      return;
+    }
+
+    const messageId = latestMessage.getId();
+    const props = PropertiesService.getScriptProperties();
+    const lastProcessedMessageId = props.getProperty(PROP_LAST_PROCESSED_MESSAGE_ID);
+
+    if (lastProcessedMessageId === messageId) {
+      SpreadsheetApp.getUi().alert('Последнее письмо уже обработано.');
+      return;
+    }
+
+    const attachments = latestMessage.getAttachments({
+      includeInlineImages: false,
+      includeAttachments: true,
+    });
+
+    const xlsxAttachments = attachments.filter(isXlsxAttachment_);
+
+    if (!xlsxAttachments.length) {
+      props.setProperty(PROP_LAST_PROCESSED_MESSAGE_ID, messageId);
+      SpreadsheetApp.getUi().alert('В последнем письме нет XLSX-вложений.');
+      return;
+    }
+
+    const createdFiles = [];
+
+    for (const attachment of xlsxAttachments) {
+      const originalName = attachment.getName() || 'attachment.xlsx';
+      const baseName = originalName.replace(/\.xlsx$/i, '');
+      const blob = attachment.copyBlob().setName(originalName);
+
+      const resource = {
+        name: baseName,
+        parents: [TARGET_FOLDER_ID],
+        mimeType: 'application/vnd.google-apps.spreadsheet',
+      };
+
+      const createdFile = Drive.Files.create(resource, blob, {
+        fields: 'id,name,webViewLink',
+      });
+
+      createdFiles.push(createdFile.name);
+    }
+
+    props.setProperty(PROP_LAST_PROCESSED_MESSAGE_ID, messageId);
+
+    SpreadsheetApp.getUi().alert(
+      'Готово.\n' +
+      'Импортировано файлов: ' + createdFiles.length + '\n\n' +
+      createdFiles.join('\n')
+    );
+  } catch (error) {
+    Logger.log(error && error.stack ? error.stack : error);
+    SpreadsheetApp.getUi().alert('Ошибка: ' + error.message);
+    throw error;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function findLatestMessage_(query, batchSize) {
+  const threads = GmailApp.search(query, 0, batchSize);
+  let latestMessage = null;
+  let latestTimestamp = -1;
+
+  for (const thread of threads) {
+    const messages = thread.getMessages();
+    for (const message of messages) {
+      const ts = message.getDate().getTime();
+      if (ts > latestTimestamp) {
+        latestTimestamp = ts;
+        latestMessage = message;
       }
     }
   }
+
+  return latestMessage;
 }
 
-function hasAnyNonEmptyCell_(values) {
-  if (!Array.isArray(values) || !values.length) return false;
-  return values.some((row) => Array.isArray(row) && row.some((cell) => cell !== '' && cell !== null));
+function importLatestSourceSheetsFromDrive_(folderId) {
+  const requestsFile = findLatestSpreadsheetFileByKeywords_(folderId, ['заявк']);
+  const scheduleFile = findLatestSpreadsheetFileByKeywords_(folderId, ['график']);
+
+  if (!requestsFile) {
+    throw new Error('Не найден актуальный файл "Заявки" в папке Google Drive.');
+  }
+  if (!scheduleFile) {
+    throw new Error('Не найден актуальный файл "Графики" в папке Google Drive.');
+  }
+
+  const ss = SpreadsheetApp.getActive();
+  copySheetDataFromFileToActiveSheet_(ss, requestsFile.id, SHEET_REQUESTS);
+  copySheetDataFromFileToActiveSheet_(ss, scheduleFile.id, SHEET_SCHEDULE_SOURCE);
+
+  return {
+    requestsFileName: requestsFile.name,
+    scheduleFileName: scheduleFile.name,
+  };
+}
+
+function findLatestSpreadsheetFileByKeywords_(folderId, keywords) {
+  const folder = DriveApp.getFolderById(folderId);
+  const files = folder.getFiles();
+  let latest = null;
+
+  while (files.hasNext()) {
+    const file = files.next();
+    const name = str_(file.getName());
+    const lowerName = name.toLowerCase();
+    const isSpreadsheet = str_(file.getMimeType()) === MimeType.GOOGLE_SHEETS;
+    const matchKeyword = keywords.some((kw) => lowerName.indexOf(str_(kw).toLowerCase()) >= 0);
+    if (!isSpreadsheet || !matchKeyword) continue;
+
+    const updated = file.getLastUpdated();
+    if (!latest || updated.getTime() > latest.updatedAt.getTime()) {
+      latest = {
+        id: file.getId(),
+        name,
+        updatedAt: updated,
+      };
+    }
+  }
+
+  return latest;
+}
+
+function copySheetDataFromFileToActiveSheet_(activeSpreadsheet, sourceFileId, targetSheetName) {
+  const sourceSpreadsheet = SpreadsheetApp.openById(sourceFileId);
+  const sourceSheet = sourceSpreadsheet.getSheetByName(targetSheetName) || sourceSpreadsheet.getSheets()[0];
+  if (!sourceSheet) {
+    throw new Error(`В файле ${sourceSpreadsheet.getName()} нет листов для импорта "${targetSheetName}"`);
+  }
+
+  const sourceValues = sourceSheet.getDataRange().getValues();
+  const targetSheet = getOrCreateSheet_(activeSpreadsheet, targetSheetName);
+  targetSheet.clearContents();
+  if (!sourceValues.length || !sourceValues[0].length) return;
+  targetSheet.getRange(1, 1, sourceValues.length, sourceValues[0].length).setValues(sourceValues);
+}
+
+function isXlsxAttachment_(attachment) {
+  const name = String(attachment.getName() || '').toLowerCase();
+  const contentType = String(attachment.getContentType() || '').toLowerCase();
+
+  return (
+    name.endsWith('.xlsx') ||
+    contentType === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+  );
 }
 
 function buildDoctorSchedule() {
@@ -244,7 +261,6 @@ function buildDoctorSchedule() {
   const employeeRegistry = getEmployeeRegistry_(ss);
   const currentDayKey = detectCurrentDayFromSourceRequestsRows_(requestRows);
   if (!currentDayKey) throw new Error('Не найдены выполненные заявки для определения актуальной даты');
-  fl2Log_('INFO', 'CurrentDate detected for processed requests build', `currentDay=${currentDayKey}, sourceRows=${requestRows.length}`);
   const rangeStartKey = addDaysToDayKey_(currentDayKey, -42);
   const rangeEndKey = addDaysToDayKey_(currentDayKey, 7);
   const requestsRangeEndKey = addDaysToDayKey_(currentDayKey, 8);
@@ -291,20 +307,6 @@ function buildDoctorSchedule() {
     if (scheduleDecision === 'included' && (rowStart === null || rowEnd === null || rowEnd <= rowStart)) {
       scheduleDecision = 'excluded';
       scheduleReason = 'invalid_interval';
-    }
-
-    if (employee === FL2_DEBUG_TRACE_DOCTOR && rowBranch === FL2_DEBUG_TRACE_BRANCH) {
-      fl2DebugTrace_('DEBUG buildDoctorSchedule source row', {
-        branch: rowBranch,
-        doctor: employee,
-        date: rowDate ? dateKey_(rowDate) : str_(row['Дата']),
-        startTime: str_(row['Время начала']),
-        endTime: str_(row['Время окончания']),
-        timeKind: rowTimeKind,
-        timeType: mapTimeType_(rowTimeKind),
-        decision: scheduleDecision,
-        reason: scheduleReason || undefined,
-      });
     }
 
     if (scheduleDecision !== 'included') return;
@@ -469,21 +471,6 @@ function buildProcessedRequestsSheet_(ss, requestsSheet, allowedEmployees, exclu
       reason = 'out_of_range';
     }
 
-    if (employee === FL2_DEBUG_TRACE_DOCTOR && branch === FL2_DEBUG_TRACE_BRANCH) {
-      fl2DebugTrace_('DEBUG buildProcessedRequestsSheet row', {
-        branch,
-        doctor: employee,
-        id: str_(row[headers.indexOf('Номер заявки')] || row[headers.indexOf('Номер')] || ''),
-        status,
-        date: startDayKey || '',
-        startTime: str_(row[idxStart]),
-        endTime: str_(row[idxEnd]),
-        nomenclature: str_(row[headers.indexOf('Номенклатура')]),
-        decision,
-        reason: reason || undefined,
-      });
-    }
-
     if (decision !== 'included') return false;
     return true;
   });
@@ -524,7 +511,6 @@ function buildProcessedRequestsSheet_(ss, requestsSheet, allowedEmployees, exclu
 
   const markerRow = new Array(outHeaders.length).fill('');
   if (idxCurrentDayMetaOut >= 0) markerRow[idxCurrentDayMetaOut] = dayKeyToDateText_(currentDayKey);
-  fl2Log_('INFO', 'CurrentDate marker row prepared', `currentDay=${currentDayKey}, targetSheet=${SHEET_PROCESSED_REQUESTS}`);
 
   outRows.push(markerRow);
 
@@ -536,7 +522,6 @@ function buildProcessedRequestsSheet_(ss, requestsSheet, allowedEmployees, exclu
   }
   applyProcessedRequestsIntervalColumnFormat_(target, outHeaders);
 }
-
 
 function mergeIntervals_(intervals) {
   if (!intervals.length) return [];
@@ -615,8 +600,6 @@ function resolveIntervals_(records) {
 
   return segments;
 }
-
-
 
 function mergeAdjacentSlotsByType_(rows) {
   if (!rows.length) return [];
@@ -733,10 +716,8 @@ function getExcludedEmployeesSet_(ss) {
   return set;
 }
 
-
 function hasStandaloneTestWord_(value) {
-  const tokens = str_(value).toLowerCase().split(/[^a-zа-яё0-9]+/i).filter((t) => t);
-  return tokens.includes('тест');
+  return str_(value).toLowerCase().indexOf('тест') >= 0;
 }
 
 function formatDateDDMMYYYY_(value) {
@@ -781,10 +762,6 @@ function computeReportPeriodFromReferenceMoment_(referenceMoment, baseDayDate) {
     anchorDate: addDays(startDate, -1),
     label: formatReportPeriodLabel_(startDate, endDate),
   };
-}
-
-function computeReportPeriodFromScheduleTimestamp_(builtAt) {
-  return computeReportPeriodFromReferenceMoment_(builtAt);
 }
 
 function buildHorizonPeriodLabels_(reportPeriodLabel) {
@@ -887,12 +864,6 @@ function mapRowsToObjects_(headers, rows) {
     });
     return item;
   });
-}
-
-function formatTimeCell_(value) {
-  const minutes = parseTimeToMinutes_(value);
-  if (minutes === null) return str_(value);
-  return minutesToTimeString_(minutes);
 }
 
 function getOrCreateSheet_(ss, name) {
@@ -1020,11 +991,6 @@ function isDayKeyInRangeInclusive_(dayKey, startKey, endKey) {
   return d >= s && d <= e;
 }
 
-function monthKey_(date) {
-  if (!date) return '';
-  return Utilities.formatDate(date, FL2_TIMEZONE, 'yyyy-MM');
-}
-
 function str_(value) {
   if (value === null || value === undefined) return '';
   return String(value).trim();
@@ -1033,27 +999,10 @@ function str_(value) {
 function round1_(value) {
   return Math.round(value * 10) / 10;
 }
-var FL2_SHEET_FORWARD_LOAD = 'План загрузки';
 var FL2_SHEET_MAILING = 'Отправка';
 var FL2_SHEET_OVERALL_FORECAST = 'Общий план';
 var FL2_SHEET_DISCOUNTS_EMAIL_STATE = 'Состояние рассылки скидок';
-var FL2_PROP_FORWARD_BATCH_STATE = 'FL2_PROP_FORWARD_BATCH_STATE';
-var FL2_PROP_FORWARD_BATCH_PENDING_EMAIL = 'FL2_PROP_FORWARD_BATCH_PENDING_EMAIL';
-var FL2_PROP_FORWARD_BATCH_RUN_ID = 'FL2_PROP_FORWARD_BATCH_RUN_ID';
-var FL2_FORWARD_BATCH_HANDLER = 'runForwardLoadReportAllBranchesStep';
 var FL2_SHEET_BATCH_SERVICE = 'Сервис план';
-var FL2_BATCH_STEP_DELAY_MS = 5000; // 5 секунд
-var FL2_FORWARD_BATCH_WATCHDOG_HANDLER = 'runForwardLoadBatchWatchdog';
-var FL2_BATCH_WATCHDOG_INTERVAL_MIN = 1;
-var FL2_BATCH_STALE_MS = 10 * 60 * 1000;
-var FL2_PROP_FORWARD_BATCH_LOCK_OWNER = 'FL2_PROP_FORWARD_BATCH_LOCK_OWNER';
-var FL2_BATCH_MAX_RUN_MS = 120000;
-var FL2_BATCH_MAX_BRANCHES_PER_RUN = 1;
-var FL2_ENABLE_LOG = false;
-var FL2_ENABLE_TRIGGER_LOG = true;
-var FL2_DEBUG_TRACE_ENABLED = true;
-var FL2_DEBUG_TRACE_BRANCH = 'Темед Пионерская';
-var FL2_DEBUG_TRACE_DOCTOR = 'Алибеков Эйлер Ровшанович';
 var FL2_PLAN_ARCHIVE_SPREADSHEET_ID = '1w9PLSlkxbJX6kigWtxYZElTyCLTM1ceDriA29yeFBgc';
 var FL2_TIMEZONE = 'Europe/Moscow';
 var FL2_ARCHIVE_CATEGORY_SHEET_MAP = {
@@ -1063,81 +1012,11 @@ var FL2_ARCHIVE_CATEGORY_SHEET_MAP = {
   physio: 'Архив Физиотерапия',
 };
 var FL2_ARCHIVE_BASELINE_CACHE = null;
-
-function fl2Log_(level, message, details) {
-  if (!FL2_ENABLE_LOG) return;
-  fl2AppendLogRow_(level, message, details);
-}
-
-function fl2DebugTrace_(stage, payload) {
-  if (!FL2_DEBUG_TRACE_ENABLED) return;
-  const data = payload || {};
-  const branch = str_(data.branch || data.selectedBranch || data['Филиал']);
-  const doctor = str_(data.doctor || data.employee || data['Сотрудник']);
-  if (branch !== FL2_DEBUG_TRACE_BRANCH || doctor !== FL2_DEBUG_TRACE_DOCTOR) return;
-  const jsonDetails = fl2DebugStringify_(data);
-  fl2AppendLogRow_('DEBUG', str_(stage), jsonDetails);
-}
-
-function fl2DebugStringify_(payload) {
-  try {
-    return JSON.stringify(payload, (key, value) => {
-      if (value instanceof Date) return formatDateTimeDDMMYYYY_(value);
-      return value;
-    });
-  } catch (e) {
-    return JSON.stringify({ error: 'debug_payload_not_serializable', message: str_(e && e.message ? e.message : e) });
-  }
-}
-
-function fl2AppendLogRow_(level, message, details) {
-  try {
-    const ss = SpreadsheetApp.getActive();
-    const sheet = getOrCreateSheet_(ss, SHEET_REPORT_LOG);
-    const header = ['Время', 'Уровень', 'Сообщение', 'Детали'];
-    const needHeader = sheet.getLastRow() < 1 || str_(sheet.getRange(1, 1).getDisplayValue()) !== 'Время';
-    if (needHeader) {
-      sheet.clearContents();
-      sheet.getRange(1, 1, 1, header.length).setValues([header]);
-    }
-    sheet.appendRow([new Date(), level || 'INFO', message || '', details || '']);
-  } catch (e) {
-    // намеренно игнорируем ошибки логирования, чтобы не ломать основной сценарий
-  }
-}
-
-function fl2TriggerLog_(level, message, details) {
-  if (!FL2_ENABLE_TRIGGER_LOG) return;
-  fl2AppendLogRow_(level || 'INFO', `[TRIGGER] ${message || ''}`, details || '');
-}
-
-function fl2StateSummary_(state) {
-  if (!state) return 'state=empty';
-  const branches = Array.isArray(state.branches) ? state.branches.length : 0;
-  return `index=${Number(state.index || 0)}, branches=${branches}`;
-}
-
-function fl2StageTimer_() {
-  const startedAt = Date.now();
-  return {
-    ms: function ms() { return Date.now() - startedAt; },
-    sec: function sec() { return (Date.now() - startedAt) / 1000; },
-  };
-}
-
-function fl2LogStage_(level, message, details, timer) {
-  const suffix = timer ? `, elapsedMs=${timer.ms()}` : '';
-  fl2Log_(level, message, `${details || ''}${suffix}`);
-}
 function buildForwardLoadReport() {
   const ss = SpreadsheetApp.getActive();
   const ui = SpreadsheetApp.getUi();
 
   const precheckPrep = prepareForwardLoadInput_(ss, { persistUnassigned: false });
-  if (!warnIfPlanDateDiffersFromActualData_(ui, precheckPrep.currentDay)) {
-    SpreadsheetApp.getActive().toast('Построение плана отменено пользователем', MENU_NAME, 5);
-    return;
-  }
 
   const branches = getBranchesFromEmployeesSheet_(ss);
   const promptText = `Введите филиал (точно как в данных):
@@ -1162,10 +1041,6 @@ ${branches.join('\n')}`;
 function buildForwardLoadReportAllBranches() {
   const ui = SpreadsheetApp.getUi();
   const prep = prepareForwardLoadInput_(SpreadsheetApp.getActive(), { persistUnassigned: false });
-  if (!warnIfPlanDateDiffersFromActualData_(ui, prep.currentDay)) {
-    SpreadsheetApp.getActive().toast('Пакетный план отменен пользователем', MENU_NAME, 5);
-    return;
-  }
   const sendAnswer = ui.alert('Пакетный план по клиникам', 'После завершения очереди отправить письма автоматически?', ui.ButtonSet.YES_NO);
   const sendEmails = sendAnswer === ui.Button.YES;
   runForwardLoadReportAllBranchesCore_({ sendEmails, currentDay: prep.currentDay });
@@ -1234,16 +1109,6 @@ function runForwardLoadReportAllBranchesCore_(options) {
   const sendEmails = opts.sendEmails !== false;
   const includeBaseline = opts.includeBaseline !== false;
   const refreshDiscountsAfter = opts.refreshDiscountsAfter === true;
-  const props = PropertiesService.getScriptProperties();
-  const existing = props.getProperty(FL2_PROP_FORWARD_BATCH_STATE);
-  if (existing) {
-    const staleInfo = getForwardBatchStaleInfo_();
-    fl2Log_('WARN', 'Пакетный план: найдено существующее состояние, принудительный перезапуск', staleInfo.reason);
-  }
-
-  // Переходим на однопроходный сценарий без триггеров/очереди
-  clearForwardLoadBatchState_();
-  props.deleteProperty(FL2_PROP_FORWARD_BATCH_PENDING_EMAIL);
 
   const doctorScheduleSheet = ss.getSheetByName(SHEET_DOCTOR_SCHEDULE);
   const processedRequestsSheet = ss.getSheetByName(SHEET_PROCESSED_REQUESTS);
@@ -1254,13 +1119,8 @@ function runForwardLoadReportAllBranchesCore_(options) {
 
   const prep = prepareForwardLoadInput_(ss, { persistUnassigned: false });
   const currentDay = opts.currentDay || prep.currentDay;
-  const runId = `${Date.now()}`;
   const branches = prep.branches || [];
   const errors = [];
-  fl2Log_('INFO', 'Пакетный план: старт (однопроходный без триггеров)', `runId=${runId}, клиник: ${branches.length}, sendEmails=${sendEmails ? 'YES' : 'NO'}`);
-
-  initForwardBatchServiceSheet_(ss, branches, runId);
-  const serviceSheet = getOrCreateSheet_(ss, FL2_SHEET_BATCH_SERVICE);
 
   const sharedExcluded = prep.excludedEmployees;
   const sharedRegistry = { allowed: prep.allowedEmployees, unassignedFound: prep.unassignedEmployees };
@@ -1268,12 +1128,8 @@ function runForwardLoadReportAllBranchesCore_(options) {
   const sharedMassageSet = prep.massageSet;
   const sharedFtSet = prep.ftSet;
 
-  branches.forEach((branchName, idx) => {
+  branches.forEach((branchName) => {
     const branch = str_(branchName);
-    const rowNum = idx + 2;
-    const stepStartedAt = new Date();
-    serviceSheet.getRange(rowNum, 2, 1, 3).setValues([['В работе', formatDateTimeDDMMYYYY_(stepStartedAt), '']]);
-
     try {
       const branchPrep = prepareForwardLoadInput_(ss, {
         selectedBranch: branch,
@@ -1292,12 +1148,9 @@ function runForwardLoadReportAllBranchesCore_(options) {
       if (sendEmails) {
         sendForwardReportEmail(ss, branch, currentDay);
       }
-
-      serviceSheet.getRange(rowNum, 2, 1, 3).setValues([['Готово', formatDateTimeDDMMYYYY_(stepStartedAt), formatDateTimeDDMMYYYY_(new Date())]]);
     } catch (e) {
       const err = `${branch || '(пусто)'}: ${e && e.message ? e.message : String(e)}`;
       errors.push(err);
-      serviceSheet.getRange(rowNum, 2, 1, 3).setValues([[`Ошибка: ${err}`, formatDateTimeDDMMYYYY_(stepStartedAt), formatDateTimeDDMMYYYY_(new Date())]]);
     }
   });
 
@@ -1314,273 +1167,7 @@ function runForwardLoadReportAllBranchesCore_(options) {
 function refreshDiscountsAfterPlanUpdate_() {
   try {
     updateDiscountsByPlan({ silent: true });
-    fl2Log_('INFO', 'План: скидки обновлены автоматически', 'После обновления плановых листов по клиникам');
   } catch (e) {
-    fl2Log_('ERROR', 'План: не удалось автоматически обновить скидки', e && e.message ? e.message : String(e));
-  }
-}
-
-function warnIfPlanDateDiffersFromActualData_(ui, actualDataDay) {
-  const actual = toDate_(actualDataDay);
-  const formedAt = new Date();
-  if (!actual) return true;
-  const actualDate = new Date(actual.getFullYear(), actual.getMonth(), actual.getDate());
-  const formedDate = new Date(formedAt.getFullYear(), formedAt.getMonth(), formedAt.getDate());
-  if (actualDate.getTime() === formedDate.getTime()) return true;
-
-  const message = [
-    'Внимание: дата формирования не совпадает с актуальной датой данных.',
-    `Дата формирования: ${formatDateDDMMYYYY_(formedDate)}`,
-    `Актуальная дата данных (последняя выполненная заявка): ${formatDateDDMMYYYY_(actualDate)}`,
-    '',
-    'Продолжить построение плана?',
-  ].join('\n');
-
-  let shouldContinue = true;
-  if (ui) {
-    const answer = ui.alert('План загрузки: предупреждение по дате', message, ui.ButtonSet.YES_NO);
-    shouldContinue = answer === ui.Button.YES;
-  }
-  fl2Log_('WARN', 'План: дата формирования отличается от актуальной даты данных', message);
-  return shouldContinue;
-}
-
-
-function runForwardLoadReportAllBranchesStep() {
-  runForwardLoadReportAllBranchesStepInternal_({ scheduleOnLockFail: true, lockRetryMs: 5000 });
-}
-
-function runForwardLoadReportAllBranchesStepInternal_(options) {
-  const opts = options || {};
-  const lockRetryMs = Number(opts.lockRetryMs || 5000);
-  const maxRunMs = Number(opts.maxRunMs || FL2_BATCH_MAX_RUN_MS);
-  const lock = LockService.getScriptLock();
-  const deadline = Date.now() + Math.max(500, lockRetryMs);
-  let locked = false;
-
-  while (Date.now() <= deadline) {
-    if (lock.tryLock(500)) {
-      locked = true;
-      break;
-    }
-    Utilities.sleep(250);
-  }
-
-  if (!locked) {
-    const props = PropertiesService.getScriptProperties();
-    const owner = props.getProperty(FL2_PROP_FORWARD_BATCH_LOCK_OWNER);
-    fl2Log_('WARN', 'Пакетный план: lock не получен', `Повторим шаг позже (delayMs=${FL2_BATCH_STEP_DELAY_MS}), owner=${owner || 'unknown'}`);
-    if (opts.scheduleOnLockFail !== false) {
-      scheduleNextForwardLoadBatchStep_();
-    }
-    return false;
-  }
-
-  try {
-    const props = PropertiesService.getScriptProperties();
-    const raw = props.getProperty(FL2_PROP_FORWARD_BATCH_STATE);
-    if (!raw) {
-      fl2Log_('WARN', 'Пакетный план: состояние не найдено', 'Шаг завершен без выполнения');
-      return true;
-    }
-
-    const state = JSON.parse(raw);
-    const branches = Array.isArray(state.branches) ? state.branches : [];
-    let index = Number(state.index || 0);
-    const runId = str_(state.runId) || str_(props.getProperty(FL2_PROP_FORWARD_BATCH_RUN_ID));
-    props.setProperty(FL2_PROP_FORWARD_BATCH_LOCK_OWNER, JSON.stringify({ runId, index, startedAt: Date.now() }));
-    fl2Log_('INFO', 'Пакетный план: шаг', `runId=${runId}, ${fl2StateSummary_(state)}`);
-
-    if (!branches.length || index >= branches.length) {
-      fl2Log_('INFO', 'Пакетный план: достигнут конец очереди', fl2StateSummary_(state));
-      finishForwardLoadBatch_(state);
-      return true;
-    }
-
-    const ss = SpreadsheetApp.getActive();
-    const serviceSheet = getOrCreateSheet_(ss, FL2_SHEET_BATCH_SERVICE);
-    const excludedEmployees = getExcludedEmployeesSet_(ss);
-    const employeeRegistry = getEmployeeRegistry_(ss);
-    const doctorsSet = getDoctorsSetFromEmployeesSheet_(ss);
-    const startedAtMs = Date.now();
-    let lastStepFinishedAt = Date.now();
-    let processedThisRun = 0;
-
-    while (index < branches.length && (Date.now() - startedAtMs) < maxRunMs && processedThisRun < FL2_BATCH_MAX_BRANCHES_PER_RUN) {
-      const branch = str_(branches[index]);
-      const rowNum = index + 2;
-      const stepStartedAt = new Date();
-      serviceSheet.getRange(rowNum, 2, 1, 3).setValues([['В работе', formatDateTimeDDMMYYYY_(stepStartedAt), '']]);
-
-      try {
-        state.updatedAt = Date.now();
-        props.setProperty(FL2_PROP_FORWARD_BATCH_STATE, JSON.stringify(state));
-        props.setProperty(FL2_PROP_FORWARD_BATCH_LOCK_OWNER, JSON.stringify({ runId, index, branch, startedAt: state.updatedAt }));
-        if (!branch) {
-          state.errors = state.errors || [];
-          state.errors.push('Пустое название филиала в очереди');
-          fl2Log_('ERROR', 'Пакетный план: пустой филиал в очереди', `шаг ${index + 1}/${branches.length}`);
-        } else {
-          const branchTimer = fl2StageTimer_();
-          const stagePrefix = `runId=${runId}, branch=${branch}, step=${index + 1}/${branches.length}`;
-          fl2LogStage_('INFO', 'Пакетный план: начало обработки филиала', stagePrefix, branchTimer);
-
-          touchForwardBatchHeartbeat_(props);
-          const prepTimer = fl2StageTimer_();
-          fl2LogStage_('INFO', 'Пакетный план: этап prepareForwardLoadInput_ START', stagePrefix, prepTimer);
-          const prep = prepareForwardLoadInput_(ss, {
-            selectedBranch: branch,
-            currentDay: state.currentDay,
-            persistUnassigned: false,
-            excludedEmployees,
-            employeeRegistry,
-            doctorsSet,
-            logCtx: { runId, branch, step: `${index + 1}/${branches.length}` },
-            onHeartbeat: () => touchForwardBatchHeartbeat_(props),
-          });
-          fl2LogStage_('INFO', 'Пакетный план: этап prepareForwardLoadInput_ END', `${stagePrefix}, scheduleRows=${prep.scheduleRows.length}, requestRows=${prep.requestRowsRaw.length}`, prepTimer);
-
-          touchForwardBatchHeartbeat_(props);
-          const calcTimer = fl2StageTimer_();
-          fl2LogStage_('INFO', 'Пакетный план: этап buildForwardLoadReportForBranch_ START', stagePrefix, calcTimer);
-          buildForwardLoadReportForBranch_(ss, branch, prep);
-          fl2LogStage_('INFO', 'Пакетный план: этап buildForwardLoadReportForBranch_ END', stagePrefix, calcTimer);
-
-          touchForwardBatchHeartbeat_(props);
-          fl2LogStage_('INFO', 'Пакетный план: филиал обработан', stagePrefix, branchTimer);
-        }
-      } catch (e) {
-        state.errors = state.errors || [];
-        state.errors.push(`${branch || '(пусто)'}: ${e && e.message ? e.message : String(e)}`);
-        fl2Log_('ERROR', 'Пакетный план: ошибка обработки филиала', `${branch || '(пусто)'}: ${e && e.message ? e.message : String(e)}`);
-      }
-
-      index += 1;
-      processedThisRun += 1;
-      lastStepFinishedAt = Date.now();
-      state.index = index;
-      state.updatedAt = lastStepFinishedAt;
-      props.setProperty(FL2_PROP_FORWARD_BATCH_STATE, JSON.stringify(state));
-      serviceSheet.getRange(rowNum, 2, 1, 3).setValues([['Готово', formatDateTimeDDMMYYYY_(stepStartedAt), formatDateTimeDDMMYYYY_(new Date(lastStepFinishedAt))]]);
-    }
-
-    if (index >= branches.length) {
-      fl2Log_('INFO', 'Пакетный план: финал после последнего филиала', fl2StateSummary_(state));
-      finishForwardLoadBatch_(state);
-      return true;
-    }
-
-    scheduleNextForwardLoadBatchStep_(lastStepFinishedAt);
-    fl2Log_('INFO', 'Пакетный план: шаг завершен, продолжаем по триггеру', `runId=${runId}, обработано за запуск=${processedThisRun}, до index=${index}, всего=${branches.length}`);
-    return true;
-  } catch (e) {
-    fl2Log_('ERROR', 'Пакетный план: аварийная ошибка шага', e && e.stack ? e.stack : String(e));
-    scheduleNextForwardLoadBatchStep_();
-    throw e;
-  } finally {
-    try { PropertiesService.getScriptProperties().deleteProperty(FL2_PROP_FORWARD_BATCH_LOCK_OWNER); } catch (e) {}
-    lock.releaseLock();
-  }
-}
-
-function scheduleNextForwardLoadBatchStep_(stepFinishedAtMs) {
-  clearForwardLoadBatchTriggers_();
-  const finishedAt = Number(stepFinishedAtMs || Date.now());
-  const targetAt = finishedAt + FL2_BATCH_STEP_DELAY_MS;
-  const delayMs = Math.max(1000, targetAt - Date.now());
-
-  ScriptApp.newTrigger(FL2_FORWARD_BATCH_HANDLER)
-    .timeBased()
-    .after(delayMs)
-    .create();
-
-  const count = getForwardLoadBatchTriggerCount_();
-  fl2Log_('INFO', 'Пакетный план: триггер создан', `runForwardLoadReportAllBranchesStep через ${Math.round(delayMs / 1000)} сек от времени окончания шага (активных batch-триггеров: ${count})`);
-}
-
-function finishForwardLoadBatch_(state) {
-  const ss = SpreadsheetApp.getActive();
-  const currentDay = str_(state && state.currentDay) || dateKey_(new Date());
-  const props = PropertiesService.getScriptProperties();
-
-  props.setProperty(FL2_PROP_FORWARD_BATCH_PENDING_EMAIL, JSON.stringify({
-    runId: str_(state && state.runId),
-    branches: Array.isArray(state && state.branches) ? state.branches : [],
-    currentDay,
-    errors: Array.isArray(state && state.errors) ? state.errors : [],
-  }));
-
-  clearForwardLoadBatchState_();
-  fl2Log_('INFO', 'Пакетный план: очередь завершена', `runId=${str_(state && state.runId)}, подготовлена рассылка по ${Array.isArray(state && state.branches) ? state.branches.length : 0} клиникам`);
-
-  const shouldSendEmails = Boolean(state && state.sendEmails);
-  if (shouldSendEmails) {
-    fl2Log_('INFO', 'Пакетный план: авторассылка после завершения', 'sendEmails=YES');
-    confirmAndSendForwardBatchEmails();
-    return;
-  }
-
-  fl2Log_('INFO', 'Пакетный план: авторассылка отключена', 'sendEmails=NO');
-  const errors = state && Array.isArray(state.errors) ? state.errors.filter(Boolean) : [];
-  const doneMsg = errors.length
-    ? `Пакетный план завершён с ошибками: ${errors.slice(0, 3).join(' | ')}`
-    : 'Пакетный план по клиникам завершён';
-  SpreadsheetApp.getActive().toast(doneMsg, MENU_NAME, 8);
-}
-
-function confirmAndSendForwardBatchEmails() {
-  const props = PropertiesService.getScriptProperties();
-  const raw = props.getProperty(FL2_PROP_FORWARD_BATCH_PENDING_EMAIL);
-  if (!raw) {
-    fl2Log_('WARN', 'Пакетный план: нет payload для рассылки', 'FL2_PROP_FORWARD_BATCH_PENDING_EMAIL пуст');
-    throw new Error('Нет подготовленного пакетного плана для рассылки');
-  }
-
-  const payload = JSON.parse(raw);
-  const branches = Array.isArray(payload.branches) ? payload.branches : [];
-  const currentDay = str_(payload.currentDay) || dateKey_(new Date());
-  const errors = Array.isArray(payload.errors) ? payload.errors.slice() : [];
-  const ss = SpreadsheetApp.getActive();
-
-  branches.forEach((branch) => {
-    try {
-      if (str_(branch)) sendForwardReportEmail(ss, str_(branch), currentDay);
-      fl2Log_('INFO', 'Пакетный план: письмо отправлено', str_(branch));
-    } catch (e) {
-      errors.push(`Рассылка ${branch || '(пусто)'}: ${e && e.message ? e.message : String(e)}`);
-      fl2Log_('ERROR', 'Пакетный план: ошибка отправки письма', `${branch || '(пусто)'}: ${e && e.message ? e.message : String(e)}`);
-    }
-  });
-
-  props.deleteProperty(FL2_PROP_FORWARD_BATCH_PENDING_EMAIL);
-  const doneMsg = errors.length
-    ? `Рассылка завершена с ошибками: ${errors.slice(0, 3).join(' | ')}`
-    : 'Рассылка пакетного плана завершена';
-  SpreadsheetApp.getActive().toast(doneMsg, MENU_NAME, 8);
-}
-
-function maybePromptForwardBatchEmail_() {
-  const props = PropertiesService.getScriptProperties();
-  const raw = props.getProperty(FL2_PROP_FORWARD_BATCH_PENDING_EMAIL);
-  if (!raw) return;
-
-  const payload = JSON.parse(raw);
-  const branches = Array.isArray(payload.branches) ? payload.branches.length : 0;
-  const ui = tryGetUi_();
-  if (!ui) return;
-
-  const ask = ui.alert('Пакетный план по клиникам', `Пакетный план сформирован (клиник: ${branches}). Отправить рассылку сейчас?`, ui.ButtonSet.YES_NO);
-  fl2Log_('INFO', 'Пакетный план: вопрос о рассылке при открытии', `Ответ: ${ask === ui.Button.YES ? 'YES' : 'NO'}`);
-  if (ask === ui.Button.YES) {
-    confirmAndSendForwardBatchEmails();
-  }
-}
-
-function tryGetUi_() {
-  try {
-    return SpreadsheetApp.getUi();
-  } catch (e) {
-    return null;
   }
 }
 
@@ -1624,14 +1211,6 @@ function ensureProcessedRequestsMeta_(ss) {
 
 function prepareForwardLoadInput_(ss, options) {
   const opts = options || {};
-  const logCtx = opts.logCtx || null;
-  const hb = typeof opts.onHeartbeat === 'function' ? opts.onHeartbeat : null;
-  const stage = (msg, details, timer) => {
-    if (!logCtx) return;
-    const prefix = `runId=${str_(logCtx.runId)}, branch=${str_(logCtx.branch)}, step=${str_(logCtx.step)}`;
-    fl2LogStage_('INFO', `Пакетный план: ${msg}`, `${prefix}${details ? `, ${details}` : ''}`, timer);
-  };
-  const tick = () => { if (hb) hb(); };
 
   const scheduleSheet = ss.getSheetByName(SHEET_DOCTOR_SCHEDULE);
   const requestsSheet = ss.getSheetByName(SHEET_PROCESSED_REQUESTS);
@@ -1644,8 +1223,6 @@ function prepareForwardLoadInput_(ss, options) {
   const excludedEmployees = opts.excludedEmployees ? opts.excludedEmployees : getExcludedEmployeesSet_(ss);
   const employeeRegistry = opts.employeeRegistry ? opts.employeeRegistry : getEmployeeRegistry_(ss);
   const selectedBranch = str_(opts.selectedBranch);
-
-  let requestRowsRawAll = null;
 
   const processedRequestsMeta = ensureProcessedRequestsMeta_(ss);
   const storedCurrentDayKey = processedRequestsMeta.currentDayKey;
@@ -1660,11 +1237,6 @@ function prepareForwardLoadInput_(ss, options) {
   }
 
   if (incomingCurrentDayKey && incomingCurrentDayKey !== storedCurrentDayKey) {
-    fl2Log_(
-      'WARN',
-      'Переданный CurrentDate проигнорирован',
-      `incoming=${incomingCurrentDayKey}, stored=${storedCurrentDayKey}`
-    );
   }
 
   const currentDayKey = storedCurrentDayKey;
@@ -1685,15 +1257,10 @@ function prepareForwardLoadInput_(ss, options) {
   const rangeStart = dayKeyToDate_(rangeStartKey);
   const rangeEnd = dayKeyToDate_(rangeEndKey);
 
-  const readScheduleTimer = fl2StageTimer_();
   const scheduleSourceRows = selectedBranch
     ? getSheetObjectsByBranch_(scheduleSheet, selectedBranch, true)
     : getSheetObjectsDisplay_(scheduleSheet);
 
-  stage('prepare: read schedule source', `rows=${scheduleSourceRows.length}`, readScheduleTimer);
-  tick();
-
-  const filterScheduleTimer = fl2StageTimer_();
   const scheduleRows = scheduleSourceRows
     .filter((r) => {
       const dKey = parseLocalDayKey_(r['Дата']);
@@ -1718,47 +1285,11 @@ function prepareForwardLoadInput_(ss, options) {
       const db = toDate_(b['Дата']);
       return (da ? da.getTime() : 0) - (db ? db.getTime() : 0);
     });
-  stage('prepare: filtered schedule rows', `rows=${scheduleRows.length}`, filterScheduleTimer);
-  tick();
-  fl2DebugTrace_('DEBUG prepareForwardLoadInput overview', {
-    branch: selectedBranch || FL2_DEBUG_TRACE_BRANCH,
-    doctor: FL2_DEBUG_TRACE_DOCTOR,
-    selectedBranch,
-    currentDay: currentDayKey,
-    currentDayKey,
-    anchorDay,
-    anchorDayKey,
-    rangeStart,
-    rangeEnd,
-    rangeStartKey,
-    rangeEndKey,
-    scheduleRowsCount: scheduleRows.length,
-  });
-  scheduleRows.forEach((row, idx) => {
-    const doctor = str_(row['Сотрудник']);
-    const branch = str_(row['Филиал']);
-    if (doctor !== FL2_DEBUG_TRACE_DOCTOR || branch !== FL2_DEBUG_TRACE_BRANCH) return;
-    fl2DebugTrace_('DEBUG prepareForwardLoadInput doctor schedule row', {
-      branch,
-      doctor,
-      index: idx,
-      date: str_(row['Дата']),
-      startTime: str_(row['Время начала']),
-      endTime: str_(row['Время окончания']),
-      timeKind: str_(row['Вид времени']),
-      timeType: str_(row['Тип времени']),
-    });
-  });
 
-  const readRequestsTimer = fl2StageTimer_();
   const requestSourceRows = selectedBranch
     ? getSheetObjectsByBranch_(requestsSheet, selectedBranch, true)
-    : (requestRowsRawAll || getSheetObjectsDisplay_(requestsSheet));
+    : getSheetObjectsDisplay_(requestsSheet);
 
-  stage('prepare: read requests source', `rows=${requestSourceRows.length}`, readRequestsTimer);
-  tick();
-
-  const filterRequestsTimer = fl2StageTimer_();
   const requestRowsRaw = requestSourceRows.filter((r) => {
     const dKey = parseLocalDayKey_(r['Дата']) || parseLocalDayKey_(r['ДатаНачала']);
     const branch = str_(r['Филиал']);
@@ -1766,46 +1297,10 @@ function prepareForwardLoadInput_(ss, options) {
     return isDayKeyInRangeInclusive_(dKey, rangeStartKey, rangeEndKey);
   });
 
-  stage('prepare: filtered request rows', `rows=${requestRowsRaw.length}`, filterRequestsTimer);
-  tick();
-  fl2DebugTrace_('DEBUG prepareForwardLoadInput request overview', {
-    branch: selectedBranch || FL2_DEBUG_TRACE_BRANCH,
-    doctor: FL2_DEBUG_TRACE_DOCTOR,
-    selectedBranch,
-    currentDay: currentDayKey,
-    currentDayKey,
-    anchorDay,
-    anchorDayKey,
-    rangeStart,
-    rangeEnd,
-    rangeStartKey,
-    rangeEndKey,
-    scheduleRowsCount: scheduleRows.length,
-    requestRowsRawCount: requestRowsRaw.length,
-  });
-  requestRowsRaw.forEach((row, idx) => {
-    const doctor = str_(row['Сотрудник']);
-    const branch = str_(row['Филиал']);
-    if (doctor !== FL2_DEBUG_TRACE_DOCTOR || branch !== FL2_DEBUG_TRACE_BRANCH) return;
-    fl2DebugTrace_('DEBUG prepareForwardLoadInput doctor request row', {
-      branch,
-      doctor,
-      index: idx,
-      id: str_(row['Номер заявки'] || row['Номер'] || row['ID']),
-      status: str_(row['Состояние']),
-      date: str_(row['Дата'] || row['ДатаНачала']),
-      startTime: str_(row['Время начала'] || row['ДатаНачала']),
-      endTime: str_(row['Время окончания'] || row['ДатаОкончания']),
-      nomenclature: str_(row['Номенклатура']),
-    });
-  });
 
-  const branchesTimer = fl2StageTimer_();
   const branchesAll = getBranchesFromEmployeesSheet_(ss);
   const branches = selectedBranch ? branchesAll.filter((b) => b === selectedBranch) : branchesAll;
   if (!branches.length) throw new Error('Не удалось определить список филиалов');
-  stage('prepare: branches resolved', `count=${branches.length}`, branchesTimer);
-  tick();
 
   if (!opts || opts.persistUnassigned !== false) {
     saveUnassignedEmployees_(ss, employeeRegistry.unassignedFound);
@@ -1829,8 +1324,6 @@ function prepareForwardLoadInput_(ss, options) {
     doctorsSet: opts && opts.doctorsSet ? opts.doctorsSet : getDoctorsSetFromEmployeesSheet_(ss),
     massageSet: opts && opts.massageSet ? opts.massageSet : getMassageSetFromEmployeesSheet_(ss),
     ftSet: opts && opts.ftSet ? opts.ftSet : getFtSetFromEmployeesSheet_(ss),
-    logCtx,
-    onHeartbeat: hb,
   };
 }
 
@@ -1840,28 +1333,13 @@ function buildForwardLoadReportForBranch_(ss, selectedBranch, prep, options) {
   const opts = options || {};
   const includeBaseline = opts.includeBaseline !== false;
 
-  const logCtx = prep && prep.logCtx ? prep.logCtx : null;
-  const hb = prep && typeof prep.onHeartbeat === 'function' ? prep.onHeartbeat : null;
-  const stage = (msg, details, timer) => {
-    if (!logCtx) return;
-    const prefix = `runId=${str_(logCtx.runId)}, branch=${branchName}, step=${str_(logCtx.step)}`;
-    fl2LogStage_('INFO', `Пакетный план: ${msg}`, `${prefix}${details ? `, ${details}` : ''}`, timer);
-  };
-  const tick = () => { if (hb) hb(); };
-
   const anchorDay = prep.anchorDay ? new Date(prep.anchorDay.getTime()) : addDays(dayKeyToDate_(prep.currentDayKey || prep.currentDay), -1);
   const anchorDayKey = prep.anchorDayKey || parseLocalDayKey_(anchorDay);
 
-  const filterTimer = fl2StageTimer_();
   const filteredScheduleRows = prep.scheduleRows.filter((r) => str_(r['Филиал']) === branchName);
   const filteredRequestRows = prep.requestRowsRaw.filter((r) => str_(r['Филиал']) === branchName);
-  stage('branch: filtered branch rows', `scheduleRows=${filteredScheduleRows.length}, requestRows=${filteredRequestRows.length}`, filterTimer);
-  tick();
 
-  const scheduleIndexTimer = fl2StageTimer_();
   const scheduleByDoctorDay = buildReceptionScheduleIndex(filteredScheduleRows, prep.excludedEmployees, prep.allowedEmployees);
-  stage('branch: buildReceptionScheduleIndex done', `keys=${scheduleByDoctorDay.size}`, scheduleIndexTimer);
-  tick();
 
   const doctorsSet = prep.doctorsSet || getDoctorsSetFromEmployeesSheet_(ss);
   const massageSet = prep.massageSet || getMassageSetFromEmployeesSheet_(ss);
@@ -1872,77 +1350,33 @@ function buildForwardLoadReportForBranch_(ss, selectedBranch, prep, options) {
     const doctor = str_(key.split('|')[2]);
     if (doctorsSet.has(doctor)) doctorScheduleByDoctorDay.set(key, intervals);
   });
-  stage('branch: doctor schedule subset built', `keys=${doctorScheduleByDoctorDay.size}`, fl2StageTimer_());
-  tick();
 
-  const latestReqTimer = fl2StageTimer_();
   const latestRequests = buildLatestRequests(filteredRequestRows, prep.excludedEmployees, prep.allowedEmployees, prep.unassignedEmployees, prep.rangeStartKey, prep.rangeEndKey);
-  stage('branch: buildLatestRequests done', `rows=${latestRequests.length}`, latestReqTimer);
-  tick();
 
   const currentPlanDebug = buildCurrentPlanDebugStats_(latestRequests, scheduleByDoctorDay, doctorScheduleByDoctorDay);
-  fl2Log_(
-    'INFO',
-    'Диагностика текущего плана по филиалу',
-    [
-      `Филиал=${branchName}`,
-      `filteredScheduleRows=${filteredScheduleRows.length}`,
-      `filteredRequestRows=${filteredRequestRows.length}`,
-      `latestRequests=${latestRequests.length}`,
-      `scheduleByDoctorDay.keys=${scheduleByDoctorDay.size}`,
-      `doctorScheduleByDoctorDay.keys=${doctorScheduleByDoctorDay.size}`,
-      `matchedRequestScheduleKeys=${currentPlanDebug.matchedRequestScheduleKeys}`,
-    ].join(', ')
-  );
-
-  const currentDailyDoctorTimer = fl2StageTimer_();
   const currentDailyDoctorBuckets = computeWindowDailyBuckets_(anchorDayKey, 7, doctorScheduleByDoctorDay, latestRequests);
-  stage('branch: computeWindowDailyBuckets_(7) done', `days=${currentDailyDoctorBuckets.size}`, currentDailyDoctorTimer);
-  tick();
 
-  const h3Timer = fl2StageTimer_();
   const horizon3 = aggregateWindowMetricsFromDailyBuckets_(anchorDayKey, 3, currentDailyDoctorBuckets);
-  stage('branch: aggregateWindowMetricsFromDailyBuckets_(3) done', `byBranch=${horizon3.byBranch.size}, byDoctor=${horizon3.byDoctor.size}`, h3Timer);
-  tick();
 
-  const h7Timer = fl2StageTimer_();
   const horizon7 = aggregateWindowMetricsFromDailyBuckets_(anchorDayKey, 7, currentDailyDoctorBuckets);
-  stage('branch: aggregateWindowMetricsFromDailyBuckets_(7) done', `byBranch=${horizon7.byBranch.size}, byDoctor=${horizon7.byDoctor.size}`, h7Timer);
-  tick();
 
   let baseline3;
   let baseline7;
 
-  const currentDailyAllTimer = fl2StageTimer_();
   const currentDailyAllBuckets = computeWindowDailyBuckets_(anchorDayKey, 7, scheduleByDoctorDay, latestRequests, { includeAllNomenclature: true });
-  stage('branch: computeWindowDailyBuckets_(7, all nomenclature) done', `days=${currentDailyAllBuckets.size}`, currentDailyAllTimer);
-  tick();
 
-  const h3AllTimer = fl2StageTimer_();
   const horizon3All = aggregateWindowMetricsFromDailyBuckets_(anchorDayKey, 3, currentDailyAllBuckets);
-  stage('branch: aggregateWindowMetricsFromDailyBuckets_(3, all nomenclature) done', `byBranch=${horizon3All.byBranch.size}, byDoctor=${horizon3All.byDoctor.size}`, h3AllTimer);
-  tick();
 
-  const h7AllTimer = fl2StageTimer_();
   const horizon7All = aggregateWindowMetricsFromDailyBuckets_(anchorDayKey, 7, currentDailyAllBuckets);
-  stage('branch: aggregateWindowMetricsFromDailyBuckets_(7, all nomenclature) done', `byBranch=${horizon7All.byBranch.size}, byDoctor=${horizon7All.byDoctor.size}`, h7AllTimer);
-  tick();
 
   let baseline3All;
   let baseline7All;
 
   if (includeBaseline) {
-    const b3Timer = fl2StageTimer_();
     baseline3 = computeBaselineMetrics(anchorDay, 3, doctorScheduleByDoctorDay, latestRequests, { category: 'doctor' });
-    stage('branch: computeBaselineMetrics(3) done', `byBranch=${baseline3.byBranch.size}, byDoctor=${baseline3.byDoctor.size}`, b3Timer);
-    tick();
 
-    const b7Timer = fl2StageTimer_();
     baseline7 = computeBaselineMetrics(anchorDay, 7, doctorScheduleByDoctorDay, latestRequests, { category: 'doctor' });
-    stage('branch: computeBaselineMetrics(7) done', `byBranch=${baseline7.byBranch.size}, byDoctor=${baseline7.byDoctor.size}`, b7Timer);
-    tick();
 
-    const b3AllTimer = fl2StageTimer_();
     baseline3All = computeBaselineMetrics(anchorDay, 3, scheduleByDoctorDay, latestRequests, {
       includeAllNomenclature: true,
       categoryResolver: (employee) => {
@@ -1951,10 +1385,7 @@ function buildForwardLoadReportForBranch_(ss, selectedBranch, prep, options) {
         return 'doctor';
       },
     });
-    stage('branch: computeBaselineMetrics(3, all nomenclature) done', `byBranch=${baseline3All.byBranch.size}, byDoctor=${baseline3All.byDoctor.size}`, b3AllTimer);
-    tick();
 
-    const b7AllTimer = fl2StageTimer_();
     baseline7All = computeBaselineMetrics(anchorDay, 7, scheduleByDoctorDay, latestRequests, {
       includeAllNomenclature: true,
       categoryResolver: (employee) => {
@@ -1963,8 +1394,6 @@ function buildForwardLoadReportForBranch_(ss, selectedBranch, prep, options) {
         return 'doctor';
       },
     });
-    stage('branch: computeBaselineMetrics(7, all nomenclature) done', `byBranch=${baseline7All.byBranch.size}, byDoctor=${baseline7All.byDoctor.size}`, b7AllTimer);
-    tick();
   } else {
     baseline3 = { byBranch: new Map(), byDoctor: new Map() };
     baseline7 = { byBranch: new Map(), byDoctor: new Map() };
@@ -1972,55 +1401,17 @@ function buildForwardLoadReportForBranch_(ss, selectedBranch, prep, options) {
     baseline7All = { byBranch: new Map(), byDoctor: new Map() };
   }
 
-  const mergeTimer = fl2StageTimer_();
   const rowsBranch = mergeForwardRows(horizon3.byBranch, horizon7.byBranch, baseline3.byBranch, baseline7.byBranch);
   const rowsDoctorAll = mergeForwardRows(horizon3.byDoctor, horizon7.byDoctor, baseline3.byDoctor, baseline7.byDoctor);
   const rowsAllNomenclature = mergeForwardRows(horizon3All.byDoctor, horizon7All.byDoctor, baseline3All.byDoctor, baseline7All.byDoctor);
-  stage('branch: mergeForwardRows done', `rowsBranch=${rowsBranch.length}, rowsDoctorAll=${rowsDoctorAll.length}`, mergeTimer);
-  tick();
 
-  const doctorFilterTimer = fl2StageTimer_();
   const rowsDoctor = rowsDoctorAll.filter((r) => doctorsSet.has(str_(r.doctor)));
-  stage('branch: filtered doctors rows', `rowsDoctor=${rowsDoctor.length}`, doctorFilterTimer);
-  tick();
-
-  rowsDoctorAll.forEach((row) => {
-    if (str_(row.branch) !== FL2_DEBUG_TRACE_BRANCH || str_(row.doctor) !== FL2_DEBUG_TRACE_DOCTOR) return;
-    fl2DebugTrace_('DEBUG buildForwardLoadReportForBranch doctor row all', {
-      branch: row.branch,
-      doctor: row.doctor,
-      c3: row.c3,
-      c7: row.c7,
-      b3: row.b3,
-      b7: row.b7,
-    });
-  });
-  rowsDoctor.forEach((row) => {
-    if (str_(row.branch) !== FL2_DEBUG_TRACE_BRANCH || str_(row.doctor) !== FL2_DEBUG_TRACE_DOCTOR) return;
-    fl2DebugTrace_('DEBUG buildForwardLoadReportForBranch final doctor row', {
-      branch: row.branch,
-      doctor: row.doctor,
-      c3: row.c3,
-      c7: row.c7,
-      b3: row.b3,
-      b7: row.b7,
-    });
-  });
 
   const occupiedDoctorsCount = rowsDoctor.filter((r) => (numOrZero_(r && r.c3 && r.c3.occupiedMin) > 0) || (numOrZero_(r && r.c7 && r.c7.occupiedMin) > 0)).length;
   const zeroDoctorsCount = rowsDoctor.filter((r) => numOrZero_(r && r.c3 && r.c3.occupiedMin) === 0 && numOrZero_(r && r.c7 && r.c7.occupiedMin) === 0).length;
-  fl2Log_(
-    'INFO',
-    'Диагностика занятости врачей по филиалу',
-    `Филиал=${branchName}, doctorsOccupiedPositive=${occupiedDoctorsCount}, doctorsOccupiedZeroBoth=${zeroDoctorsCount}`
-  );
 
   if (currentPlanDebug.participatingRequests > 0 && rowsDoctor.length > 0 && zeroDoctorsCount === rowsDoctor.length) {
-    fl2Log_(
-      'ERROR',
-      'План рассчитан аномально: заявки есть, но занятость по всем врачам = 0',
-      `Филиал=${branchName}, participatingRequests=${currentPlanDebug.participatingRequests}, rowsDoctor=${rowsDoctor.length}`
-    );
+    // keep anomaly guard without debug logging
   }
 
   const massageSummary = aggregateForwardCategorySummary_(rowsAllNomenclature, massageSet);
@@ -2034,12 +1425,9 @@ function buildForwardLoadReportForBranch_(ss, selectedBranch, prep, options) {
     includeBaseline,
   });
 
-  const renderTimer = fl2StageTimer_();
   renderForwardLoadSheet(ss, anchorDay, prep.reportPeriod, branchName, rowsBranch, rowsDoctor, massageSummary, ftSummary, cabinetSummary, massageRows, ftRows, cabinetRows, {
     includeBaseline,
   });
-  stage('branch: renderForwardLoadSheet done', `rowsBranch=${rowsBranch.length}, rowsDoctor=${rowsDoctor.length}`, renderTimer);
-  tick();
 
   return prep.currentDay;
 }
@@ -2068,127 +1456,6 @@ function buildCurrentPlanDebugStats_(latestRequests, scheduleByDoctorDay, doctor
   };
 }
 
-function clearForwardLoadBatchTriggers_() {
-  ScriptApp.getProjectTriggers()
-    .filter((t) => t.getHandlerFunction && t.getHandlerFunction() === FL2_FORWARD_BATCH_HANDLER)
-    .forEach((t) => ScriptApp.deleteTrigger(t));
-}
-
-function getForwardLoadBatchTriggerCount_() {
-  return ScriptApp.getProjectTriggers().filter((t) => t.getHandlerFunction && t.getHandlerFunction() === FL2_FORWARD_BATCH_HANDLER).length;
-}
-
-function getForwardBatchStaleInfo_() {
-  const props = PropertiesService.getScriptProperties();
-  const raw = props.getProperty(FL2_PROP_FORWARD_BATCH_STATE);
-  if (!raw) return { isStale: false, reason: 'Состояние отсутствует' };
-
-  let state = null;
-  try {
-    state = JSON.parse(raw);
-  } catch (e) {
-    return { isStale: true, reason: 'Состояние повреждено (не JSON)' };
-  }
-
-  const triggerCount = getForwardLoadBatchTriggerCount_();
-  const updatedAt = Number(state && state.updatedAt ? state.updatedAt : state && state.startedAt ? state.startedAt : 0);
-  const ageMs = updatedAt > 0 ? Date.now() - updatedAt : null;
-  const staleByNoTrigger = triggerCount === 0;
-  const staleByAge = ageMs !== null && ageMs > 15 * 60 * 1000;
-
-  if (staleByNoTrigger) {
-    return { isStale: true, reason: `Нет активных batch-триггеров (index=${Number(state && state.index || 0)})` };
-  }
-  if (staleByAge) {
-    return { isStale: true, reason: `Состояние не обновлялось более 15 минут (ageMs=${ageMs})` };
-  }
-
-  return {
-    isStale: false,
-    reason: `Очередь активна: triggerCount=${triggerCount}, index=${Number(state && state.index || 0)}`,
-  };
-}
-
-
-function clearForwardLoadBatchWatchdogTriggers_() {
-  ScriptApp.getProjectTriggers()
-    .filter((t) => t.getHandlerFunction && t.getHandlerFunction() === FL2_FORWARD_BATCH_WATCHDOG_HANDLER)
-    .forEach((t) => ScriptApp.deleteTrigger(t));
-}
-
-function ensureForwardLoadBatchWatchdog_() {
-  const exists = ScriptApp.getProjectTriggers().some((t) => t.getHandlerFunction && t.getHandlerFunction() === FL2_FORWARD_BATCH_WATCHDOG_HANDLER);
-  if (exists) return;
-  ScriptApp.newTrigger(FL2_FORWARD_BATCH_WATCHDOG_HANDLER)
-    .timeBased()
-    .everyMinutes(FL2_BATCH_WATCHDOG_INTERVAL_MIN)
-    .create();
-  fl2Log_('INFO', 'Пакетный план: watchdog включен', `interval=${FL2_BATCH_WATCHDOG_INTERVAL_MIN} мин`);
-}
-
-function touchForwardBatchHeartbeat_(props) {
-  try {
-    const raw = props.getProperty(FL2_PROP_FORWARD_BATCH_STATE);
-    if (!raw) return;
-    const state = JSON.parse(raw);
-    state.updatedAt = Date.now();
-    props.setProperty(FL2_PROP_FORWARD_BATCH_STATE, JSON.stringify(state));
-  } catch (e) {
-    // heartbeat best effort
-  }
-}
-
-function runForwardLoadBatchWatchdog() {
-  const props = PropertiesService.getScriptProperties();
-  const raw = props.getProperty(FL2_PROP_FORWARD_BATCH_STATE);
-  if (!raw) {
-    clearForwardLoadBatchWatchdogTriggers_();
-    return;
-  }
-
-  let state = null;
-  try {
-    state = JSON.parse(raw);
-  } catch (e) {
-    fl2Log_('ERROR', 'Пакетный план: watchdog обнаружил поврежденное состояние', String(e));
-    clearForwardLoadBatchState_();
-    return;
-  }
-
-  const updatedAt = Number(state && state.updatedAt ? state.updatedAt : state && state.startedAt ? state.startedAt : 0);
-  const ageMs = updatedAt > 0 ? Date.now() - updatedAt : Number.MAX_SAFE_INTEGER;
-  if (ageMs < FL2_BATCH_STALE_MS) return;
-
-  const owner = props.getProperty(FL2_PROP_FORWARD_BATCH_LOCK_OWNER);
-  fl2Log_('WARN', 'Пакетный план: watchdog обнаружил зависание', `ageMs=${ageMs}, owner=${owner || 'unknown'}`);
-
-  props.deleteProperty(FL2_PROP_FORWARD_BATCH_LOCK_OWNER);
-  clearForwardLoadBatchTriggers_();
-  scheduleNextForwardLoadBatchStep_();
-  fl2Log_('INFO', 'Пакетный план: watchdog', 'Шаговый триггер принудительно пересоздан');
-}
-
-function clearForwardLoadBatchState_() {
-  const props = PropertiesService.getScriptProperties();
-  props.deleteProperty(FL2_PROP_FORWARD_BATCH_STATE);
-  props.deleteProperty(FL2_PROP_FORWARD_BATCH_RUN_ID);
-  props.deleteProperty(FL2_PROP_FORWARD_BATCH_LOCK_OWNER);
-  clearForwardLoadBatchTriggers_();
-  clearForwardLoadBatchWatchdogTriggers_();
-}
-
-function initForwardBatchServiceSheet_(ss, branches, runId) {
-  const sheet = getOrCreateSheet_(ss, FL2_SHEET_BATCH_SERVICE);
-  resetSheetForRender_(sheet);
-  const header = ['Филиал', 'Статус', 'Время старта шага', 'Время окончания шага'];
-  sheet.getRange(1, 1, 1, header.length).setValues([header]);
-  if (branches && branches.length) {
-    const rows = branches.map((b) => [str_(b), 'Ожидание', '', '']);
-    sheet.getRange(2, 1, rows.length, header.length).setValues(rows);
-  }
-  sheet.getRange(1, 6).setValue('runId');
-  sheet.getRange(1, 7).setValue(runId || '');
-}
 function getEmployeesSetByHeader_(ss, headerNames, fallbackColIndex) {
   const sheet = ss.getSheetByName(SHEET_EMPLOYEES);
   if (!sheet) throw new Error('Не найден лист "Сотрудники"');
@@ -2243,18 +1510,6 @@ function getBranchesFromEmployeesSheet_(ss) {
   return branches;
 }
 
-function collectBranches(scheduleRows, requestRows) {
-  const set = new Set();
-  scheduleRows.forEach((r) => {
-    const b = str_(r['Филиал']);
-    if (b) set.add(b);
-  });
-  requestRows.forEach((r) => {
-    const b = str_(r['Филиал']);
-    if (b) set.add(b);
-  });
-  return [...set].sort((a, b) => a.localeCompare(b, 'ru'));
-}
 function detectCurrentDayFromSourceRequestsRows_(rows) {
   let maxDayKey = '';
   let maxRow = null;
@@ -2270,19 +1525,12 @@ function detectCurrentDayFromSourceRequestsRows_(rows) {
     }
   });
   if (maxDayKey && maxRow) {
-    fl2Log_(
-      'INFO',
-      'CurrentDate detect: max completed source request',
-      `currentDay=${maxDayKey}, status=${str_(maxRow['Состояние'])}, request=${str_(maxRow['Номер заявки'] || maxRow['Номер'])}, start=${formatDateTimeDDMMYYYY_(maxRow['ДатаНачала'])}, employee=${str_(maxRow['Сотрудник'])}, branch=${str_(maxRow['Филиал'])}`
-    );
   } else {
-    fl2Log_('WARN', 'CurrentDate detect: no completed source requests found', `rows=${list.length}`);
   }
   return maxDayKey || null;
 }
 function buildReceptionScheduleIndex(scheduleRows, excludedEmployees, allowedEmployees) {
   const map = new Map();
-  const rawByKey = new Map();
   scheduleRows.forEach((row) => {
     const dayKey = parseLocalDayKey_(row['Дата']);
     const doctor = str_(row['Сотрудник']);
@@ -2297,40 +1545,14 @@ function buildReceptionScheduleIndex(scheduleRows, excludedEmployees, allowedEmp
     if (!map.has(key)) map.set(key, []);
     const interval = { type, start, end };
     map.get(key).push(interval);
-    if (doctor === FL2_DEBUG_TRACE_DOCTOR && branch === FL2_DEBUG_TRACE_BRANCH) {
-      if (!rawByKey.has(key)) rawByKey.set(key, []);
-      rawByKey.get(key).push(interval);
-    }
   });
   map.forEach((arr, key) => {
     arr.sort((a, b) => a.start - b.start);
-    const parts = key.split('|');
-    const branch = str_(parts[1]);
-    const doctor = str_(parts[2]);
-    if (doctor !== FL2_DEBUG_TRACE_DOCTOR || branch !== FL2_DEBUG_TRACE_BRANCH) return;
-    const beforeMerge = rawByKey.get(key) || [];
-    const receptionOnly = arr.filter((i) => i.type === 'Приемные часы');
-    const excluded = arr.filter((i) => i.type !== 'Приемные часы');
-    fl2DebugTrace_('DEBUG buildReceptionScheduleIndex doctor day', {
-      branch,
-      doctor,
-      key,
-      rawIntervalsBeforeMerge: beforeMerge,
-      intervalsAfterMerge: arr,
-      receptionIntervals: receptionOnly,
-      nonReceptionIntervals: excluded,
-    });
   });
   return map;
 }
 function buildLatestRequests(rows, excludedEmployees, allowedEmployees, unassignedSet, rangeStartKey, rangeEndKey) {
   const latest = new Map();
-  const logDoctorRequest = (stage, payload) => {
-    const doctor = str_(payload && payload.doctor);
-    const branch = str_(payload && payload.branch);
-    if (doctor !== FL2_DEBUG_TRACE_DOCTOR || branch !== FL2_DEBUG_TRACE_BRANCH) return;
-    fl2DebugTrace_(stage, payload);
-  };
   rows.forEach((row, idx) => {
     const status = str_(row['Состояние']);
     const id = str_(row['Номер заявки']) || str_(row['Номер']) || str_(row['ID']) || `ROW-${idx}`;
@@ -2360,45 +1582,12 @@ function buildLatestRequests(rows, excludedEmployees, allowedEmployees, unassign
     const isDoctorVisit = nomenclature.includes('врача');
     const isPrimary = nomenclature.includes('первичный');
     if (!isAllowedProcessedRequestStatus(status)) {
-      logDoctorRequest('DEBUG buildLatestRequests doctor request', {
-        id,
-        status,
-        doctor,
-        branch,
-        date: intervalParts.dateText || dayKeyToDateText_(intervalParts.dayKey),
-        startTime: intervalParts.startTime,
-        endTime: intervalParts.endTime,
-        nomenclature,
-        isDoctorVisit,
-        isPrimary,
-        skipByName,
-        skipReason,
-        intervalError: intervalParts.error,
-        decision: 'excluded',
-        reason: 'status_not_allowed',
-      });
       return;
     }
     const statusDate = toDate_(row['Дата создания']) || toDate_(row['Дата']) || toDate_(row['ДатаНачала']) || new Date(0);
     const statusSort = Number(Utilities.formatDate(statusDate, FL2_TIMEZONE, 'yyyyMMddHHmmss'));
     const prev = latest.get(id);
     if (!prev || statusSort > prev.statusSort || (statusSort === prev.statusSort && idx > prev.idx)) {
-      logDoctorRequest('DEBUG buildLatestRequests doctor request', {
-        id,
-        status,
-        doctor,
-        branch,
-        date: intervalParts.dateText || dayKeyToDateText_(intervalParts.dayKey),
-        startTime: intervalParts.startTime,
-        endTime: intervalParts.endTime,
-        nomenclature,
-        isDoctorVisit,
-        isPrimary,
-        skipByName,
-        skipReason,
-        intervalError: intervalParts.error,
-        decision: 'included',
-      });
       latest.set(id, {
         idx,
         id,
@@ -2430,204 +1619,21 @@ function buildLatestRequests(rows, excludedEmployees, allowedEmployees, unassign
         if (!inserted.nomenclature && prev.isPrimary) inserted.isPrimary = true;
       }
     } else {
-      logDoctorRequest('DEBUG buildLatestRequests doctor request', {
-        id,
-        status,
-        doctor,
-        branch,
-        date: intervalParts.dateText || dayKeyToDateText_(intervalParts.dayKey),
-        startTime: intervalParts.startTime,
-        endTime: intervalParts.endTime,
-        nomenclature,
-        isDoctorVisit,
-        isPrimary,
-        skipByName,
-        skipReason,
-        intervalError: intervalParts.error,
-        decision: 'excluded',
-        reason: 'older_status',
-      });
     }
   });
   return [...latest.values()].filter((r) => {
     if (r.intervalError) {
-      logDoctorRequest('DEBUG buildLatestRequests doctor request', {
-        id: r.id,
-        status: r.status,
-        doctor: r.doctor,
-        branch: r.branch,
-        date: r.startDate,
-        startTime: r.startTime,
-        endTime: r.endTime,
-        nomenclature: '',
-        isDoctorVisit: r.isDoctorVisit,
-        isPrimary: r.isPrimary,
-        skipByName: r.skipByName,
-        intervalError: r.intervalError,
-        decision: 'excluded',
-        reason: 'interval_error',
-      });
-      fl2Log_('WARN', 'Заявка пропущена: некорректный интервал', `${r.id}: ${r.intervalError}`);
       return false;
     }
     if (r.skipByName) {
-      logDoctorRequest('DEBUG buildLatestRequests doctor request', {
-        id: r.id,
-        status: r.status,
-        doctor: r.doctor,
-        branch: r.branch,
-        date: r.startDate,
-        startTime: r.startTime,
-        endTime: r.endTime,
-        nomenclature: '',
-        isDoctorVisit: r.isDoctorVisit,
-        isPrimary: r.isPrimary,
-        skipByName: r.skipByName,
-        intervalError: r.intervalError,
-        decision: 'excluded',
-        reason: r.skipReason || 'skip_by_name',
-      });
       return false;
     }
     if (rangeStartKey && rangeEndKey && !isDayKeyInRangeInclusive_(r.dayKey, rangeStartKey, rangeEndKey)) {
-      logDoctorRequest('DEBUG buildLatestRequests doctor request', {
-        id: r.id,
-        status: r.status,
-        doctor: r.doctor,
-        branch: r.branch,
-        date: r.startDate,
-        startTime: r.startTime,
-        endTime: r.endTime,
-        nomenclature: '',
-        isDoctorVisit: r.isDoctorVisit,
-        isPrimary: r.isPrimary,
-        skipByName: r.skipByName,
-        intervalError: r.intervalError,
-        decision: 'excluded',
-        reason: 'out_of_range',
-      });
       return false;
     }
-    logDoctorRequest('DEBUG buildLatestRequests doctor request', {
-      id: r.id,
-      status: r.status,
-      doctor: r.doctor,
-      branch: r.branch,
-      date: r.startDate,
-      startTime: r.startTime,
-      endTime: r.endTime,
-      nomenclature: '',
-      isDoctorVisit: r.isDoctorVisit,
-      isPrimary: r.isPrimary,
-      skipByName: r.skipByName,
-      intervalError: r.intervalError,
-      decision: 'included',
-    });
     return true;
   });
 }
-function computeWindowMetrics(anchorDayKey, horizonDays, scheduleByDoctorDay, requests, options) {
-  const startDayKey = addDaysToDayKey_(anchorDayKey, 1);
-  const endDayKey = addDaysToDayKey_(anchorDayKey, horizonDays);
-  const byBranch = new Map();
-  const byDoctor = new Map();
-
-  const includeAllNomenclature = Boolean(options && options.includeAllNomenclature);
-
-  const scheduleKeysInWindow = new Set();
-  scheduleByDoctorDay.forEach((_, key) => {
-    const [dKey] = key.split('|');
-    if (!isDayKeyInRangeInclusive_(dKey, startDayKey, endDayKey)) return;
-    scheduleKeysInWindow.add(key);
-  });
-
-  const requestIndex = new Map();
-  requests.forEach((r) => {
-    if (!isActivePlannedStatus(r.status)) return;
-    if (!includeAllNomenclature && !r.isDoctorVisit) return;
-    const requestDayKey = str_(r.dayKey);
-    if (!isDayKeyInRangeInclusive_(requestDayKey, startDayKey, endDayKey)) return;
-    const key = `${requestDayKey}|${r.branch}|${r.doctor}`;
-    if (!scheduleKeysInWindow.has(key)) {
-      if (str_(r.doctor) === FL2_DEBUG_TRACE_DOCTOR && str_(r.branch) === FL2_DEBUG_TRACE_BRANCH) {
-        fl2DebugTrace_('DEBUG computeWindowMetrics request_without_schedule_key', {
-          branch: r.branch,
-          doctor: r.doctor,
-          key,
-          requestId: r.id,
-          status: r.status,
-          dayKey: requestDayKey,
-        });
-      }
-      return;
-    }
-    if (!requestIndex.has(key)) requestIndex.set(key, { intervals: [], reqCount: 0, primaryCount: 0 });
-    const entry = requestIndex.get(key);
-    entry.intervals.push(requestInterval(r));
-    entry.reqCount += 1;
-    if (r.isPrimary) entry.primaryCount += 1;
-  });
-
-  scheduleByDoctorDay.forEach((intervals, key) => {
-    const [dKey, branch, doctor] = key.split('|');
-    if (!isDayKeyInRangeInclusive_(dKey, startDayKey, endDayKey)) return;
-
-    const req = requestIndex.get(key) || { intervals: [], reqCount: 0, primaryCount: 0 };
-    const reception = mergeIntervals_(intervals.filter((i) => i.type === 'Приемные часы'));
-    const nonReception = mergeIntervals_(intervals.filter((i) => i.type !== 'Приемные часы'));
-    const occupied = mergeIntervals_(req.intervals);
-    const occupiedWithinReception = intersectIntervals(occupied, reception);
-    // Учитываем занятость в не-приемных интервалах только фактическим пересечением
-    // интервалов заявок с интервалами графика на конкретную дату врача.
-    const occupiedWithinNonReception = intersectIntervals(occupied, nonReception);
-    const nonReceptionOccupiedMin = sumIntervalsMin(occupiedWithinNonReception);
-
-    if (!reception.length && nonReceptionOccupiedMin <= 0) return;
-
-    const free = subtractIntervals(reception, occupiedWithinReception);
-
-    const receptionMin = sumIntervalsMin(reception) + nonReceptionOccupiedMin;
-    const occupiedMin = sumIntervalsMin(occupiedWithinReception) + nonReceptionOccupiedMin;
-    const freeMin = sumIntervalsMin(free);
-    const freePP = free.reduce((acc, i) => acc + Math.floor((i.end - i.start) / 60), 0);
-
-    if (doctor === FL2_DEBUG_TRACE_DOCTOR && branch === FL2_DEBUG_TRACE_BRANCH) {
-      fl2DebugTrace_('DEBUG computeWindowMetrics doctor day', {
-        branch,
-        doctor,
-        key,
-        receptionIntervals: reception,
-        nonReceptionIntervals: nonReception,
-        requestIntervalsRaw: req.intervals,
-        occupiedMerged: occupied,
-        occupiedWithinReception,
-        occupiedWithinNonReception,
-        freeIntervals: free,
-        receptionMin,
-        occupiedMin,
-        freeMin,
-        freePP,
-        reqCount: req.reqCount,
-        primaryCount: req.primaryCount,
-      });
-      if (req.reqCount > 0 && sumIntervalsMin(occupiedWithinReception) === 0) {
-        fl2DebugTrace_('DEBUG computeWindowMetrics request_not_mapped_to_reception', {
-          branch,
-          doctor,
-          key,
-          reqCount: req.reqCount,
-          requestIntervalsRaw: req.intervals,
-          receptionIntervals: reception,
-        });
-      }
-    }
-
-    accumulateForward(byBranch, branch, { receptionMin, occupiedMin, freeMin, freePP, reqCount: req.reqCount, primaryCount: req.primaryCount }, branch, '');
-    accumulateForward(byDoctor, `${branch}|${doctor}`, { receptionMin, occupiedMin, freeMin, freePP, reqCount: req.reqCount, primaryCount: req.primaryCount }, branch, doctor);
-  });
-  return { byBranch, byDoctor };
-}
-
 function computeWindowDailyBuckets_(anchorDayKey, maxHorizonDays, scheduleByDoctorDay, requests, options) {
   const startDayKey = addDaysToDayKey_(anchorDayKey, 1);
   const endDayKey = addDaysToDayKey_(anchorDayKey, maxHorizonDays);
@@ -2649,16 +1655,6 @@ function computeWindowDailyBuckets_(anchorDayKey, maxHorizonDays, scheduleByDoct
     if (!isDayKeyInRangeInclusive_(requestDayKey, startDayKey, endDayKey)) return;
     const key = `${requestDayKey}|${r.branch}|${r.doctor}`;
     if (!scheduleKeysInWindow.has(key)) {
-      if (str_(r.doctor) === FL2_DEBUG_TRACE_DOCTOR && str_(r.branch) === FL2_DEBUG_TRACE_BRANCH) {
-        fl2DebugTrace_('DEBUG computeWindowMetrics request_without_schedule_key', {
-          branch: r.branch,
-          doctor: r.doctor,
-          key,
-          requestId: r.id,
-          status: r.status,
-          dayKey: requestDayKey,
-        });
-      }
       return;
     }
     if (!requestIndex.has(key)) requestIndex.set(key, { intervals: [], reqCount: 0, primaryCount: 0 });
@@ -2691,37 +1687,6 @@ function computeWindowDailyBuckets_(anchorDayKey, maxHorizonDays, scheduleByDoct
       reqCount: req.reqCount,
       primaryCount: req.primaryCount,
     };
-
-    if (doctor === FL2_DEBUG_TRACE_DOCTOR && branch === FL2_DEBUG_TRACE_BRANCH) {
-      fl2DebugTrace_('DEBUG computeWindowMetrics doctor day', {
-        branch,
-        doctor,
-        key,
-        receptionIntervals: reception,
-        nonReceptionIntervals: nonReception,
-        requestIntervalsRaw: req.intervals,
-        occupiedMerged: occupied,
-        occupiedWithinReception,
-        occupiedWithinNonReception,
-        freeIntervals: free,
-        receptionMin: metric.receptionMin,
-        occupiedMin: metric.occupiedMin,
-        freeMin: metric.freeMin,
-        freePP: metric.freePP,
-        reqCount: req.reqCount,
-        primaryCount: req.primaryCount,
-      });
-      if (req.reqCount > 0 && sumIntervalsMin(occupiedWithinReception) === 0) {
-        fl2DebugTrace_('DEBUG computeWindowMetrics request_not_mapped_to_reception', {
-          branch,
-          doctor,
-          key,
-          reqCount: req.reqCount,
-          requestIntervalsRaw: req.intervals,
-          receptionIntervals: reception,
-        });
-      }
-    }
 
     if (!dailyBuckets.has(dKey)) dailyBuckets.set(dKey, []);
     dailyBuckets.get(dKey).push({ branch, doctor, metric });
@@ -2783,32 +1748,6 @@ function computeBaselineMetrics(currentDay, horizonDays, scheduleByDoctorDay, re
   });
 
   return { byBranch, byDoctor };
-}
-function pushSeries(seriesMap, key, value, branch, doctor) {
-  if (!seriesMap.has(key)) seriesMap.set(key, { branch, doctor, values: [] });
-  seriesMap.get(key).values.push(value);
-}
-function finalizeSeriesAverage(seriesMap) {
-  const out = new Map();
-  seriesMap.forEach((entry, key) => {
-    const avg = emptyForwardMetric();
-    if (!entry.values.length) {
-      out.set(key, { branch: entry.branch, doctor: entry.doctor, metrics: avg });
-      return;
-    }
-    entry.values.forEach((v) => {
-      avg.receptionMin += v.metrics.receptionMin;
-      avg.occupiedMin += v.metrics.occupiedMin;
-      avg.freeMin += v.metrics.freeMin;
-      avg.freePP += v.metrics.freePP;
-      avg.reqCount += v.metrics.reqCount;
-      avg.primaryCount += v.metrics.primaryCount;
-    });
-    const n = entry.values.length;
-    Object.keys(avg).forEach((k) => { avg[k] /= n; });
-    out.set(key, { branch: entry.branch, doctor: entry.doctor, metrics: avg });
-  });
-  return out;
 }
 function mergeForwardRows(current3, current7, base3, base7) {
   const keys = new Set([...current3.keys(), ...current7.keys(), ...base3.keys(), ...base7.keys()]);
@@ -3045,35 +1984,6 @@ function formatPercentWithOptionalBaseline_(currentValue, baselineValue, include
   return includeBaseline ? `${current} (${baseline})` : `${current}`;
 }
 
-function renderForwardRowsSingle(sheet, startRow, rows, horizon) {
-  let row = startRow;
-  rows.forEach((r) => {
-    const current = horizon === '3d' ? r.c3 : r.c7;
-    if (!current.receptionMin) return;
-    const baseline = horizon === '3d' ? r.b3 : r.b7;
-    const horizonLabel = horizon === '3d' ? '3 дня' : '7 дней';
-    const values = toForwardOutputRowSingle(r.branch, r.doctor, horizonLabel, current, baseline);
-    sheet.getRange(row, 1, 1, values.length).setValues([values]);
-    styleForecastDataRow(sheet, row, values.length);
-    styleForecastRow(sheet, row, current, baseline, horizon);
-    row += 1;
-  });
-  return row;
-}
-function toForwardOutputRowSingle(branch, doctor, horizonLabel, current, baseline) {
-  const currentLoad = current.receptionMin ? (current.occupiedMin / current.receptionMin) * 100 : 0;
-  const usualLoad = baseline.receptionMin ? (baseline.occupiedMin / baseline.receptionMin) * 100 : 0;
-  return [
-    doctor || horizonLabel,
-    round1_(current.receptionMin / 60),
-    `${round1_(current.occupiedMin / 60)} (${round1_(baseline.occupiedMin / 60)})`,
-    `${round1_(current.primaryCount)} (${round1_(baseline.primaryCount)})`,
-    `${round0(currentLoad)} (${round0(usualLoad)})`,
-    round1_(current.freeMin / 60),
-    round1_(current.freePP),
-    round1_(current.reqCount),
-  ];
-}
 function styleForecastHeaderRow(sheet, row, columns) {
   sheet.getRange(row, 1, 1, columns)
     .setFontWeight('bold')
@@ -3138,117 +2048,30 @@ function sendForwardReportEmail(ss, selectedBranch, currentDay) {
   });
 }
 
-function fl2LogTriggerSourceEmailPreview_() {
-  const sourceMessage = findSingleSourceMessageForToday_();
-  const subject = str_(sourceMessage.getSubject());
-  const sourceAttachments = pickSourceAttachments_(sourceMessage.getAttachments());
-  fl2TriggerLog_('INFO', 'Триггер: тема найденного письма', subject);
-  fl2TriggerLog_(
-    'INFO',
-    'Триггер: выбранные вложения',
-    `${sourceAttachments.schedule.getName()} | ${sourceAttachments.requests.getName()}`
-  );
+function processSourceDataFromDriveTriggerAggregatorsPrepareData() {
+  processSourceDataFromDrive({ interactive: false });
+  updateDiscountsByPlan({ silent: true });
+  sendDiscountsEmailsByMode_({
+    targetMode: 'aggregators',
+    silent: true,
+  });
 }
 
-function triggerBuildAggregatorDiscountsAndSend() {
-  fl2TriggerLog_('INFO', 'triggerBuildAggregatorDiscountsAndSend: старт', '');
-  try {
-    fl2TriggerLog_('INFO', 'triggerBuildAggregatorDiscountsAndSend: начало загрузки из письма', '');
-    fl2LogTriggerSourceEmailPreview_();
-    loadAndProcessSourceDataFromEmail();
-    fl2TriggerLog_('INFO', 'triggerBuildAggregatorDiscountsAndSend: завершение loadAndProcessSourceDataFromEmail', '');
+function processSourceDataFromDriveTriggerBranchesOverallAndDiscounts() {
+  processSourceDataFromDrive({ interactive: false });
 
-    fl2TriggerLog_('INFO', 'triggerBuildAggregatorDiscountsAndSend: режим расчета', 'baseline=OFF, sendEmails=OFF, discountsMode=aggregators');
-    fl2TriggerLog_('INFO', 'triggerBuildAggregatorDiscountsAndSend: начало построения планов', '');
-    runForwardLoadReportsDirect_({
-      includeBaseline: false,
-      sendEmails: false,
-    });
-    fl2TriggerLog_('INFO', 'triggerBuildAggregatorDiscountsAndSend: завершение построения планов', '');
+  runForwardLoadReportsDirect_({
+    includeBaseline: true,
+    sendEmails: true,
+  });
 
-    fl2TriggerLog_('INFO', 'triggerBuildAggregatorDiscountsAndSend: начало обновления скидок', '');
-    updateDiscountsByPlan({ silent: true });
-    fl2TriggerLog_('INFO', 'triggerBuildAggregatorDiscountsAndSend: завершение обновления скидок', '');
+  buildOverallForecastCore_({
+    sendEmail: true,
+    refreshDiscountsAfter: false,
+  });
 
-    fl2TriggerLog_('INFO', 'triggerBuildAggregatorDiscountsAndSend: начало отправки письма', 'mode=aggregators');
-    sendDiscountsEmailsByMode_({
-      targetMode: 'aggregators',
-      silent: true,
-    });
-    fl2TriggerLog_('INFO', 'triggerBuildAggregatorDiscountsAndSend: завершение отправки письма', 'mode=aggregators');
-    fl2TriggerLog_('INFO', 'triggerBuildAggregatorDiscountsAndSend: success', '');
-  } catch (e) {
-    const message = e && e.message ? e.message : String(e);
-    const details = e && e.stack ? e.stack : (e && e.message ? e.message : String(e));
-    fl2TriggerLog_('ERROR', 'triggerBuildAggregatorDiscountsAndSend: error', `${message}\n${details}`);
-    throw e;
-  }
-}
-
-function triggerBuildNonAggregatorDiscountsAndSend() {
-  fl2TriggerLog_('INFO', 'triggerBuildNonAggregatorDiscountsAndSend: старт', '');
-  try {
-    fl2TriggerLog_('INFO', 'triggerBuildNonAggregatorDiscountsAndSend: начало загрузки из письма', '');
-    fl2LogTriggerSourceEmailPreview_();
-    loadAndProcessSourceDataFromEmail();
-    fl2TriggerLog_('INFO', 'triggerBuildNonAggregatorDiscountsAndSend: завершение loadAndProcessSourceDataFromEmail', '');
-
-    fl2TriggerLog_('INFO', 'triggerBuildNonAggregatorDiscountsAndSend: режим расчета', 'baseline=OFF, sendEmails=OFF, discountsMode=non_aggregators');
-    fl2TriggerLog_('INFO', 'triggerBuildNonAggregatorDiscountsAndSend: начало построения планов', '');
-    runForwardLoadReportsDirect_({
-      includeBaseline: false,
-      sendEmails: false,
-    });
-    fl2TriggerLog_('INFO', 'triggerBuildNonAggregatorDiscountsAndSend: завершение построения планов', '');
-
-    fl2TriggerLog_('INFO', 'triggerBuildNonAggregatorDiscountsAndSend: начало обновления скидок', '');
-    updateDiscountsByPlan({ silent: true });
-    fl2TriggerLog_('INFO', 'triggerBuildNonAggregatorDiscountsAndSend: завершение обновления скидок', '');
-
-    fl2TriggerLog_('INFO', 'triggerBuildNonAggregatorDiscountsAndSend: начало отправки письма', 'mode=non_aggregators');
-    sendDiscountsEmailsByMode_({
-      targetMode: 'non_aggregators',
-      silent: true,
-    });
-    fl2TriggerLog_('INFO', 'triggerBuildNonAggregatorDiscountsAndSend: завершение отправки письма', 'mode=non_aggregators');
-    fl2TriggerLog_('INFO', 'triggerBuildNonAggregatorDiscountsAndSend: success', '');
-  } catch (e) {
-    const message = e && e.message ? e.message : String(e);
-    const details = e && e.stack ? e.stack : (e && e.message ? e.message : String(e));
-    fl2TriggerLog_('ERROR', 'triggerBuildNonAggregatorDiscountsAndSend: error', `${message}\n${details}`);
-    throw e;
-  }
-}
-
-function triggerBuildBaselinePlansAndSend() {
-  fl2TriggerLog_('INFO', 'triggerBuildBaselinePlansAndSend: старт', '');
-  try {
-    fl2TriggerLog_('INFO', 'triggerBuildBaselinePlansAndSend: начало загрузки из письма', '');
-    fl2LogTriggerSourceEmailPreview_();
-    loadAndProcessSourceDataFromEmail();
-    fl2TriggerLog_('INFO', 'triggerBuildBaselinePlansAndSend: завершение loadAndProcessSourceDataFromEmail', '');
-
-    fl2TriggerLog_('INFO', 'triggerBuildBaselinePlansAndSend: режим расчета', 'baseline=ON, sendEmails=ON, discountsMode=none');
-    fl2TriggerLog_('INFO', 'triggerBuildBaselinePlansAndSend: начало построения планов', '');
-    runForwardLoadReportsDirect_({
-      includeBaseline: true,
-      sendEmails: true,
-    });
-    fl2TriggerLog_('INFO', 'triggerBuildBaselinePlansAndSend: завершение построения планов', '');
-
-    fl2TriggerLog_('INFO', 'triggerBuildBaselinePlansAndSend: начало отправки письма', 'overall forecast');
-    buildOverallForecastCore_({
-      sendEmail: true,
-      refreshDiscountsAfter: false,
-    });
-    fl2TriggerLog_('INFO', 'triggerBuildBaselinePlansAndSend: завершение отправки письма', 'overall forecast');
-    fl2TriggerLog_('INFO', 'triggerBuildBaselinePlansAndSend: success', '');
-  } catch (e) {
-    const message = e && e.message ? e.message : String(e);
-    const details = e && e.stack ? e.stack : (e && e.message ? e.message : String(e));
-    fl2TriggerLog_('ERROR', 'triggerBuildBaselinePlansAndSend: error', `${message}\n${details}`);
-    throw e;
-  }
+  updateDiscountsByPlan({ silent: true });
+  sendDiscountsEmails({ silent: true });
 }
 
 function buildOverallForecastCore_(options) {
@@ -3549,7 +2372,7 @@ function sendDiscountsEmailsByMode_(options) {
   let subject = `Сводка по скидкам на ${formatDateDDMMYYYY_(new Date())}`;
 
   if (targetMode === 'aggregators') {
-    mailingBranchName = 'Агрегатор';
+    mailingBranchName = 'Агрегаторы';
     allowedSectionKeys = ['aggregators'];
     subject = `Скидки для агрегаторов на ${formatDateDDMMYYYY_(new Date())}`;
   } else if (targetMode === 'non_aggregators') {
@@ -4278,84 +3101,6 @@ function aggregateForwardCategorySummary_(rowsDoctorAll, employeeSet) {
   return out;
 }
 
-function toForwardOutputRowLite_(horizonLabel, current, baseline) {
-  const currentLoad = current.receptionMin ? (current.occupiedMin / current.receptionMin) * 100 : 0;
-  const usualLoad = baseline.receptionMin ? (baseline.occupiedMin / baseline.receptionMin) * 100 : 0;
-  return [
-    horizonLabel,
-    round1_(current.receptionMin / 60),
-    `${round1_(current.occupiedMin / 60)} (${round1_(baseline.occupiedMin / 60)})`,
-    `${round0(currentLoad)} (${round0(usualLoad)})`,
-    round1_(current.freeMin / 60),
-    round1_(current.reqCount),
-  ];
-}
-
-function renderForwardCategorySummaryTable_(sheet, row, title, summary) {
-  const header = ['Горизонт', 'Приемные (ч)', 'Занятые (ч)', 'Загрузка (%)', 'Свободные (ч)', 'Заявки (шт)'];
-  sheet.getRange(row, 1, 1, header.length).merge().setValue(title).setFontWeight('bold').setBackground('#cfe2f3');
-  row += 1;
-  sheet.getRange(row, 1, 1, header.length).setValues([header]);
-  styleForecastHeaderRow(sheet, row, header.length);
-  row += 1;
-
-  const c3 = summary && summary.c3 ? summary.c3 : emptyForwardMetric();
-  const c7 = summary && summary.c7 ? summary.c7 : emptyForwardMetric();
-  const b3 = summary && summary.b3 ? summary.b3 : emptyForwardMetric();
-  const b7 = summary && summary.b7 ? summary.b7 : emptyForwardMetric();
-
-  const row3 = toForwardOutputRowLite_('3 дня', c3, b3);
-  sheet.getRange(row, 1, 1, header.length).setValues([row3]);
-  styleForecastDataRow(sheet, row, header.length);
-  styleForecastRow(sheet, row, c3, b3, '3d', 4);
-  row += 1;
-
-  const row7 = toForwardOutputRowLite_('7 дней', c7, b7);
-  sheet.getRange(row, 1, 1, header.length).setValues([row7]);
-  styleForecastDataRow(sheet, row, header.length);
-  styleForecastRow(sheet, row, c7, b7, '7d', 4);
-  row += 1;
-
-  return row;
-}
-
-function renderOverallCategoryCombinedTable_(sheet, row, clinicRows, title) {
-  const columns = 7;
-  const header = ['Клиника', 'Горизонт', 'Приемные (ч)', 'Занятые (ч)', 'Загрузка (%)', 'Свободные (ч)', 'Заявки (шт)'];
-  sheet.getRange(row, 1, 1, columns).merge().setValue(title).setFontWeight('bold').setBackground('#cfe2f3');
-  row += 1;
-  sheet.getRange(row, 1, 1, columns).setValues([header]);
-  styleForecastHeaderRow(sheet, row, columns);
-  row += 1;
-
-  const horizonOrder = { '3 дня': 0, '7 дней': 1 };
-  const subset = (clinicRows || [])
-    .filter((r) => r.horizon === '3 дня' || r.horizon === '7 дней')
-    .sort((a, b) => {
-      if (a.branch !== b.branch) return a.branch.localeCompare(b.branch, 'ru');
-      return (horizonOrder[a.horizon] || 99) - (horizonOrder[b.horizon] || 99);
-    });
-
-  subset.forEach((r) => {
-    const values = [
-      r.branch,
-      r.horizon,
-      round1_(r.reception),
-      `${round1_(r.occupiedCur)} (${round1_(r.occupiedUsual)})`,
-      `${round0(r.loadCur)} (${round0(r.loadUsual)})`,
-      round1_(r.free),
-      round1_(r.requests),
-    ];
-    sheet.getRange(row, 1, 1, columns).setValues([values]);
-    styleForecastDataRow(sheet, row, columns);
-    styleForecastRow(sheet, row, { occupiedMin: r.occupiedCur * 60, receptionMin: Math.max(1, r.reception * 60) }, { occupiedMin: r.occupiedUsual * 60, receptionMin: Math.max(1, r.reception * 60) }, r.horizon === '7 дней' ? '7d' : '3d', 5);
-    row += 1;
-  });
-
-  return row;
-}
-
-
 function mergeCabinetTypeSummary_(summary) {
   const ftl = summary && summary.ftl ? summary.ftl : { c3: emptyForwardMetric(), c7: emptyForwardMetric(), b3: emptyForwardMetric(), b7: emptyForwardMetric() };
   const magnet = summary && summary.magnet ? summary.magnet : { c3: emptyForwardMetric(), c7: emptyForwardMetric(), b3: emptyForwardMetric(), b7: emptyForwardMetric() };
@@ -4426,11 +3171,6 @@ function buildCabinetRequestByNameIndex_(requests, startDate, endDate) {
     e.reqCount += 1;
   });
   return map;
-}
-
-function computeCabinetByNameWindowMetrics_(anchorDate, horizonDays, scheduleRows, requests) {
-  const dailyBuckets = computeCabinetByNameDailyBuckets_(anchorDate, horizonDays, scheduleRows, requests);
-  return aggregateCabinetByNameDailyBuckets_(anchorDate, horizonDays, dailyBuckets);
 }
 
 function computeCabinetByNameDailyBuckets_(anchorDate, maxHorizonDays, scheduleRows, requests) {
@@ -4568,11 +3308,6 @@ function buildCabinetRequestIndex_(requests, startDate, endDate) {
   return map;
 }
 
-function computeCabinetTypeWindowMetrics_(anchorDate, horizonDays, scheduleRows, requests) {
-  const dailyBuckets = computeCabinetTypeDailyBuckets_(anchorDate, horizonDays, scheduleRows, requests);
-  return aggregateCabinetTypeDailyBuckets_(anchorDate, horizonDays, dailyBuckets);
-}
-
 function computeCabinetTypeDailyBuckets_(anchorDate, maxHorizonDays, scheduleRows, requests) {
   const startDate = addDays(anchorDate, 1);
   const endDate = addDays(anchorDate, maxHorizonDays);
@@ -4694,81 +3429,6 @@ function buildCabinetTypeSummary_(currentDay, scheduleRows, requests, options) {
   };
 }
 
-function toForwardOutputRowCabinet_(horizonLabel, current, baseline) {
-  const currentLoad = current.receptionMin ? (current.occupiedMin / current.receptionMin) * 100 : 0;
-  const usualLoad = baseline.receptionMin ? (baseline.occupiedMin / baseline.receptionMin) * 100 : 0;
-  return [
-    horizonLabel,
-    round1_(current.receptionMin / 60),
-    `${round1_(current.occupiedMin / 60)} (${round1_(baseline.occupiedMin / 60)})`,
-    `${round0(currentLoad)} (${round0(usualLoad)})`,
-    round1_(current.freeMin / 60),
-    round1_(current.reqCount),
-  ];
-}
-
-function renderCabinetTypeSummaryTable_(sheet, row, title, summary) {
-  const header = ['Горизонт', 'Рабочие (ч)', 'Занятые (ч)', 'Загрузка (%)', 'Свободные (ч)', 'Заявки (шт)'];
-  sheet.getRange(row, 1, 1, header.length).merge().setValue(title).setFontWeight('bold').setBackground('#cfe2f3');
-  row += 1;
-  sheet.getRange(row, 1, 1, header.length).setValues([header]);
-  styleForecastHeaderRow(sheet, row, header.length);
-  row += 1;
-
-  const c3 = summary && summary.c3 ? summary.c3 : emptyForwardMetric();
-  const c7 = summary && summary.c7 ? summary.c7 : emptyForwardMetric();
-  const b3 = summary && summary.b3 ? summary.b3 : emptyForwardMetric();
-  const b7 = summary && summary.b7 ? summary.b7 : emptyForwardMetric();
-
-  const row3 = toForwardOutputRowCabinet_('3 дня', c3, b3);
-  sheet.getRange(row, 1, 1, header.length).setValues([row3]);
-  styleForecastDataRow(sheet, row, header.length);
-  styleForecastRow(sheet, row, c3, b3, '3d', 4);
-  row += 1;
-
-  const row7 = toForwardOutputRowCabinet_('7 дней', c7, b7);
-  sheet.getRange(row, 1, 1, header.length).setValues([row7]);
-  styleForecastDataRow(sheet, row, header.length);
-  styleForecastRow(sheet, row, c7, b7, '7d', 4);
-  row += 1;
-
-  return row;
-}
-
-function renderOverallCabinetTypeTable_(sheet, row, clinicRows, title) {
-  const columns = 7;
-  const header = ['Клиника', 'Горизонт', 'Рабочие (ч)', 'Занятые (ч)', 'Загрузка (%)', 'Свободные (ч)', 'Заявки (шт)'];
-  sheet.getRange(row, 1, 1, columns).merge().setValue(title).setFontWeight('bold').setBackground('#cfe2f3');
-  row += 1;
-  sheet.getRange(row, 1, 1, columns).setValues([header]);
-  styleForecastHeaderRow(sheet, row, columns);
-  row += 1;
-
-  const horizonOrder = { '3 дня': 0, '7 дней': 1 };
-  const subset = (clinicRows || []).slice().sort((a, b) => {
-    if (a.branch !== b.branch) return a.branch.localeCompare(b.branch, 'ru');
-    return (horizonOrder[a.horizon] || 99) - (horizonOrder[b.horizon] || 99);
-  });
-
-  subset.forEach((r) => {
-    const values = [
-      r.branch,
-      r.horizon,
-      round1_(r.reception),
-      `${round1_(r.occupiedCur)} (${round1_(r.occupiedUsual)})`,
-      `${round0(r.loadCur)} (${round0(r.loadUsual)})`,
-      round1_(r.free),
-      round1_(r.requests),
-    ];
-    sheet.getRange(row, 1, 1, columns).setValues([values]);
-    styleForecastDataRow(sheet, row, columns);
-    styleForecastRow(sheet, row, { occupiedMin: r.occupiedCur * 60, receptionMin: Math.max(1, r.reception * 60) }, { occupiedMin: r.occupiedUsual * 60, receptionMin: Math.max(1, r.reception * 60) }, r.horizon === '7 дней' ? '7d' : '3d', 5);
-    row += 1;
-  });
-
-  return row;
-}
-
 function ensureDoctorScheduleFresh(ss) {
   const doctorScheduleSheet = ss.getSheetByName(SHEET_DOCTOR_SCHEDULE);
   if (!doctorScheduleSheet) {
@@ -4870,7 +3530,6 @@ function collectMailingParticipantsByBranch_(ss, branchName) {
 
 function buildMailingServiceInfoHtml_(ss, branchName, toList, ccList, reportSheet) {
   const participants = collectMailingParticipantsByBranch_(ss, branchName);
-  const reportBuiltAt = detectPlanBuiltAtFromReportSheet_(reportSheet);
 
   const renderList = (arr) => arr && arr.length ? arr.join(', ') : '—';
   const toText = renderList((toList || []).map((v) => str_(v)).filter((v) => v));
@@ -4903,12 +3562,6 @@ function detectPlanBuiltAtFromReportSheet_(sheet) {
     if (d) return d;
   }
   return null;
-}
-
-function isPlanReportSheet_(sheet) {
-  if (!sheet) return false;
-  const a1 = str_(sheet.getRange(1, 1).getDisplayValue());
-  return a1 === 'План загрузки' || a1.startsWith('План загрузки. Отчетный период:') || a1 === 'Общий план по клиникам' || a1.startsWith('Общий план по клиникам. Отчетный период:');
 }
 
 function extractPlanReportDate_(sheet) {
@@ -4964,7 +3617,6 @@ function archiveBaselineKey_(category, branch, objectName, horizon) {
 function loadArchiveBaselineIndex_() {
   if (FL2_ARCHIVE_BASELINE_CACHE && FL2_ARCHIVE_BASELINE_CACHE.index) return FL2_ARCHIVE_BASELINE_CACHE.index;
 
-  const timer = fl2StageTimer_();
   const archive = getArchiveSpreadsheet_();
   const index = new Map();
 
@@ -4999,7 +3651,6 @@ function loadArchiveBaselineIndex_() {
     builtAt: new Date(),
     index,
   };
-  fl2Log_('INFO', 'Baseline архив: индекс построен', `keys=${index.size}, elapsedMs=${timer.ms()}`);
   return index;
 }
 
@@ -5013,12 +3664,9 @@ function getArchiveBaselineMetric_(index, params) {
   const used = filtered.slice(0, maxObs);
 
   const logPrefix = `cat=${str_(p.category)}, branch=${str_(p.branch)}, object=${str_(p.object)}, horizon=${str_(p.horizon)}`;
-  fl2Log_('INFO', 'Baseline архив: найдено наблюдений', `${logPrefix}, found=${filtered.length}, used=${used.length}`);
   if (filtered.length < maxObs) {
-    fl2Log_('INFO', 'Baseline архив: наблюдений меньше лимита', `${logPrefix}, max=${maxObs}, found=${filtered.length}`);
   }
   if (!used.length) {
-    fl2Log_('INFO', 'Baseline архив: наблюдения отсутствуют', logPrefix);
     return emptyForwardMetric();
   }
 
@@ -5586,10 +4234,6 @@ function subtractIntervals(base, sub) {
 }
 function addDays(date, days) {
   return new Date(date.getFullYear(), date.getMonth(), date.getDate() + days);
-}
-function isDateInRangeInclusive_(date, start, end) {
-  if (!date || !start || !end) return false;
-  return date >= start && date <= end;
 }
 function emptyForwardMetric() {
   return { receptionMin: 0, occupiedMin: 0, freeMin: 0, freePP: 0, reqCount: 0, primaryCount: 0 };
