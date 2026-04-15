@@ -14,7 +14,31 @@ const FL2_SYSTEM_MARKER = '__SYSTEM_TIMESTAMP__';
 const FL2_PROCESSED_REQUESTS_CURRENT_DAY_HEADER = 'CurrentDate';
 const BITRIX_WEBHOOK_URL = 'https://n8n-x3.tech.temed.ru/webhook/d90a3413-9505-4281-aa7d-49082ae3e1e8/rozxjWwnHbUByCltdXLLfntCxzxNGqGnonwTIHVBaRHYKd/v1/message';
 const BITRIX_CHAT_ID_DEFAULT = 228956;
-const WEB_APP_EXEC_URL = 'https://script.google.com/macros/s/AKfycbzroexjrG4i89d-zK8KhxwzVfmhwx9XBu50KGF_KoIXr8c3QKUbzg9umg162ceVNc4KBQ/exec';
+const AUTO_CYCLE_AGGREGATORS = 'aggregators';
+const AUTO_CYCLE_BRANCHES = 'branches';
+const AUTO_MAX_BATCH_ATTEMPTS = 3;
+const AUTO_RETRY_DELAY_MINUTES = 10;
+const AUTO_TRIGGER_DELAY_MINUTES = 1;
+const AUTO_AGGREGATORS_PREFIX = 'AUTO_AGGREGATORS_';
+const AUTO_BRANCHES_PREFIX = 'AUTO_BRANCHES_';
+const AUTO_STATE_KEYS = {
+  cycleDate: 'CYCLE_DATE',
+  lastMailCheckAt: 'LAST_MAIL_CHECK_AT',
+  importStatus: 'IMPORT_STATUS',
+  importReason: 'IMPORT_REASON',
+  lastImportSuccessAt: 'LAST_IMPORT_SUCCESS_AT',
+  processPending: 'PROCESS_PENDING',
+  processInProgress: 'PROCESS_IN_PROGRESS',
+  processDone: 'PROCESS_DONE',
+  lastProcessSuccessAt: 'LAST_PROCESS_SUCCESS_AT',
+  batchAttempt: 'BATCH_ATTEMPT',
+  batchPending: 'BATCH_PENDING',
+  batchInProgress: 'BATCH_IN_PROGRESS',
+  batchSuccess: 'BATCH_SUCCESS',
+  batchLastError: 'BATCH_LAST_ERROR',
+  batchTargetTime: 'BATCH_TARGET_TIME',
+  lastBatchSuccessAt: 'LAST_BATCH_SUCCESS_AT',
+};
 
 const TIME_TYPE_MAP = {
   'Рабочее время': 'Приемные часы',
@@ -58,7 +82,6 @@ function processSourceData(options) {
   const opts = options || {};
   const silent = opts.silent === true;
   buildDoctorSchedule();
-  sendUpdatedScheduleBitrixMessage_();
   if (!silent) {
     SpreadsheetApp.getActive().toast('Исходные данные (график + заявки) обработаны', MENU_NAME, 5);
   }
@@ -104,35 +127,6 @@ function bitrixMessageText_(text) {
     .replace(/&amp;/gi, '&')
     .replace(/&lt;/gi, '<')
     .replace(/&gt;/gi, '>');
-}
-
-function sendUpdatedScheduleBitrixMessage_() {
-  const links = [
-    {
-      title: 'Агрегаторы: скидки + письмо',
-      description: 'Обновляет скидки и отправляет рассылку для агрегаторов.',
-      action: 'aggregators_prepare_data',
-    },
-    {
-      title: 'Филиалы + общий план + скидки + письма',
-      description: 'Обновляет планы по филиалам, общий план и запускает рассылки.',
-      action: 'branches_overall_and_discounts',
-    },
-  ];
-
-  const lines = [
-    '<b>Исходные данные обновлены</b>',
-    ``,
-    '',
-  ];
-
-  links.forEach((link, idx) => {
-    const runUrl = `${WEB_APP_EXEC_URL}?action=${encodeURIComponent(link.action)}`;
-    lines.push(`${idx + 1}. <b>${link.title}</b> — ${link.description}`);
-    lines.push(`   <a href="${runUrl}">Запустить</a>`);
-  });
-
-  sendMessageToBitrixChat(lines.join('\n'), BITRIX_CHAT_ID_DEFAULT);
 }
 
 function processSourceDataFromDrive(options) {
@@ -2136,7 +2130,6 @@ function sendForwardReportEmail(ss, selectedBranch, currentDay) {
 }
 
 function processSourceDataFromDriveTriggerAggregatorsPrepareData() {
-  processSourceDataFromDrive({ interactive: false });
   updateDiscountsByPlan({ silent: true });
   sendDiscountsEmailsByMode_({
     targetMode: 'aggregators',
@@ -2145,8 +2138,6 @@ function processSourceDataFromDriveTriggerAggregatorsPrepareData() {
 }
 
 function processSourceDataFromDriveTriggerBranchesOverallAndDiscounts() {
-  processSourceDataFromDrive({ interactive: false });
-
   runForwardLoadReportsDirect_({
     includeBaseline: true,
     sendEmails: true,
@@ -2161,50 +2152,292 @@ function processSourceDataFromDriveTriggerBranchesOverallAndDiscounts() {
   sendDiscountsEmails({ silent: true });
 }
 
-function resolveWebAppAction_(e) {
-  const actionFromQuery = str_(e && e.parameter && e.parameter.action).trim();
-  if (actionFromQuery) {
-    return actionFromQuery;
-  }
 
-  const rawPostData = str_(e && e.postData && e.postData.contents).trim();
-  if (!rawPostData) {
-    return '';
-  }
+function setupAutomationTriggers_() {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
 
   try {
-    const parsed = JSON.parse(rawPostData);
-    return str_(parsed && parsed.action).trim();
-  } catch (error) {
-    return '';
+    const dailyHandlers = [
+      'runEveningImportCycleAggregators_',
+      'runEveningImportCycleBranches_',
+    ];
+    deleteTriggersByHandlers_(dailyHandlers);
+
+    ScriptApp.newTrigger('runEveningImportCycleAggregators_')
+      .timeBased()
+      .everyDays(1)
+      .atHour(18)
+      .nearMinute(55)
+      .create();
+
+    ScriptApp.newTrigger('runEveningImportCycleBranches_')
+      .timeBased()
+      .everyDays(1)
+      .atHour(20)
+      .nearMinute(35)
+      .create();
+
+    Logger.log('Automation daily triggers configured for Europe/Moscow project timezone.');
+  } finally {
+    lock.releaseLock();
   }
 }
 
-function handleWebAppAction_(e) {
-  const action = resolveWebAppAction_(e);
-  if (!action) {
-    return ContentService.createTextOutput('OK');
-  }
-
-  if (action === 'aggregators_prepare_data') {
-    processSourceDataFromDriveTriggerAggregatorsPrepareData();
-    return ContentService.createTextOutput('DONE: aggregators_prepare_data');
-  }
-
-  if (action === 'branches_overall_and_discounts') {
-    processSourceDataFromDriveTriggerBranchesOverallAndDiscounts();
-    return ContentService.createTextOutput('DONE: branches_overall_and_discounts');
-  }
-
-  return ContentService.createTextOutput(`UNKNOWN_ACTION: ${action}`);
+function runEveningImportCycleAggregators_() {
+  runEveningImportCycle_({
+    cycle: AUTO_CYCLE_AGGREGATORS,
+    noDataMessage: 'Агрегаторы: свежие исходные данные не поступили, требуется ручное обновление',
+    importErrorMessage: 'Агрегаторы: ошибка импорта исходных данных из почты',
+    continuationHandler: 'continueCycleAfterImportAggregators_',
+  });
 }
 
-function doGet(e) {
-  return handleWebAppAction_(e);
+function runEveningImportCycleBranches_() {
+  runEveningImportCycle_({
+    cycle: AUTO_CYCLE_BRANCHES,
+    noDataMessage: 'Филиалы: свежие исходные данные не поступили, требуется ручное обновление',
+    importErrorMessage: 'Филиалы: ошибка импорта исходных данных из почты',
+    continuationHandler: 'continueCycleAfterImportBranches_',
+  });
 }
 
-function doPost(e) {
-  return handleWebAppAction_(e);
+function runEveningImportCycle_(config) {
+  withCycleLock_(config.cycle, function () {
+    resetCycleOperationalState_(config.cycle);
+    setCycleState_(config.cycle, AUTO_STATE_KEYS.lastMailCheckAt, new Date().toISOString());
+
+    try {
+      const importResult = importLatestLabeledXlsxToSheets({ interactive: false, throwOnError: true });
+      setCycleState_(config.cycle, AUTO_STATE_KEYS.importStatus, importResult.status || 'unknown');
+
+      if (importResult.status !== 'imported') {
+        setCycleState_(config.cycle, AUTO_STATE_KEYS.importReason, importResult.reason || 'not_imported');
+        notifyCycle_(config.cycle, config.noDataMessage);
+        return;
+      }
+
+      setCycleState_(config.cycle, AUTO_STATE_KEYS.importReason, '');
+      setCycleState_(config.cycle, AUTO_STATE_KEYS.lastImportSuccessAt, new Date().toISOString());
+      scheduleSingleRunTrigger_(config.continuationHandler, minutesFromNow_(AUTO_TRIGGER_DELAY_MINUTES));
+      Logger.log('%s: import succeeded, scheduled %s', cycleNameRu_(config.cycle), config.continuationHandler);
+    } catch (error) {
+      Logger.log(error && error.stack ? error.stack : error);
+      setCycleState_(config.cycle, AUTO_STATE_KEYS.importStatus, 'error');
+      setCycleState_(config.cycle, AUTO_STATE_KEYS.importReason, error.message || 'unknown_error');
+      notifyCycle_(config.cycle, config.importErrorMessage + ': ' + (error.message || 'unknown_error'));
+    }
+  });
+}
+
+function continueCycleAfterImportAggregators_() {
+  continueCycleAfterImport_({
+    cycle: AUTO_CYCLE_AGGREGATORS,
+    firstAttemptHandler: 'runAggregatorsBatchAttempt_1_',
+    targetHour: 19,
+    targetMinute: 0,
+  });
+}
+
+function continueCycleAfterImportBranches_() {
+  continueCycleAfterImport_({
+    cycle: AUTO_CYCLE_BRANCHES,
+    firstAttemptHandler: 'runBranchesBatchAttempt_1_',
+    targetHour: 20,
+    targetMinute: 40,
+  });
+}
+
+function continueCycleAfterImport_(config) {
+  withCycleLock_(config.cycle, function () {
+    setCycleState_(config.cycle, AUTO_STATE_KEYS.processPending, '1');
+    setCycleState_(config.cycle, AUTO_STATE_KEYS.processInProgress, '1');
+
+    try {
+      processSourceDataFromDrive({ interactive: false });
+      setCycleState_(config.cycle, AUTO_STATE_KEYS.processDone, '1');
+      setCycleState_(config.cycle, AUTO_STATE_KEYS.lastProcessSuccessAt, new Date().toISOString());
+      notifyCycle_(config.cycle, cycleNameRu_(config.cycle) + ': processSourceDataFromDrive выполнена успешно');
+
+      const firstAttemptAt = resolveFirstAttemptTime_(config.targetHour, config.targetMinute);
+      setCycleState_(config.cycle, AUTO_STATE_KEYS.batchTargetTime, firstAttemptAt.toISOString());
+      scheduleSingleRunTrigger_(config.firstAttemptHandler, firstAttemptAt);
+      setCycleState_(config.cycle, AUTO_STATE_KEYS.batchPending, '1');
+      Logger.log('%s: processSourceDataFromDrive succeeded, scheduled %s at %s', cycleNameRu_(config.cycle), config.firstAttemptHandler, firstAttemptAt.toISOString());
+    } catch (error) {
+      Logger.log(error && error.stack ? error.stack : error);
+      notifyCycle_(config.cycle, cycleNameRu_(config.cycle) + ': ошибка processSourceDataFromDrive: ' + (error.message || 'unknown_error'));
+      throw error;
+    } finally {
+      setCycleState_(config.cycle, AUTO_STATE_KEYS.processPending, '0');
+      setCycleState_(config.cycle, AUTO_STATE_KEYS.processInProgress, '0');
+    }
+  });
+}
+
+function runAggregatorsBatchAttempt_1_() { runCycleBatchAttempt_(AUTO_CYCLE_AGGREGATORS, 1); }
+function runAggregatorsBatchAttempt_2_() { runCycleBatchAttempt_(AUTO_CYCLE_AGGREGATORS, 2); }
+function runAggregatorsBatchAttempt_3_() { runCycleBatchAttempt_(AUTO_CYCLE_AGGREGATORS, 3); }
+
+function runBranchesBatchAttempt_1_() { runCycleBatchAttempt_(AUTO_CYCLE_BRANCHES, 1); }
+function runBranchesBatchAttempt_2_() { runCycleBatchAttempt_(AUTO_CYCLE_BRANCHES, 2); }
+function runBranchesBatchAttempt_3_() { runCycleBatchAttempt_(AUTO_CYCLE_BRANCHES, 3); }
+
+function runCycleBatchAttempt_(cycle, attemptNumber) {
+  withCycleLock_(cycle, function () {
+    const batchConfig = getBatchConfig_(cycle);
+    setCycleState_(cycle, AUTO_STATE_KEYS.batchAttempt, String(attemptNumber));
+    setCycleState_(cycle, AUTO_STATE_KEYS.batchPending, '0');
+    setCycleState_(cycle, AUTO_STATE_KEYS.batchInProgress, '1');
+
+    try {
+      batchConfig.handler();
+      setCycleState_(cycle, AUTO_STATE_KEYS.batchSuccess, '1');
+      setCycleState_(cycle, AUTO_STATE_KEYS.batchLastError, '');
+      setCycleState_(cycle, AUTO_STATE_KEYS.lastBatchSuccessAt, new Date().toISOString());
+      notifyCycle_(cycle, cycleNameRu_(cycle) + ': функция ' + batchConfig.handlerName + ' выполнена успешно');
+      Logger.log('%s: batch handler %s succeeded on attempt %s', cycleNameRu_(cycle), batchConfig.handlerName, attemptNumber);
+    } catch (error) {
+      const errorMessage = error && error.message ? error.message : 'unknown_error';
+      Logger.log(error && error.stack ? error.stack : error);
+      setCycleState_(cycle, AUTO_STATE_KEYS.batchSuccess, '0');
+      setCycleState_(cycle, AUTO_STATE_KEYS.batchLastError, errorMessage);
+      notifyCycle_(cycle, cycleNameRu_(cycle) + ': попытка ' + attemptNumber + '/' + AUTO_MAX_BATCH_ATTEMPTS + ' функции ' + batchConfig.handlerName + ' завершилась ошибкой: ' + errorMessage);
+
+      if (attemptNumber < AUTO_MAX_BATCH_ATTEMPTS) {
+        const nextHandler = batchConfig.attemptHandlers[attemptNumber];
+        const nextRunAt = minutesFromNow_(AUTO_RETRY_DELAY_MINUTES);
+        scheduleSingleRunTrigger_(nextHandler, nextRunAt);
+        setCycleState_(cycle, AUTO_STATE_KEYS.batchPending, '1');
+        Logger.log('%s: scheduled retry handler %s at %s', cycleNameRu_(cycle), nextHandler, nextRunAt.toISOString());
+        return;
+      }
+
+      notifyCycle_(cycle, cycleNameRu_(cycle) + ': функция ' + batchConfig.handlerName + ' не выполнена после 3 попыток');
+    } finally {
+      setCycleState_(cycle, AUTO_STATE_KEYS.batchInProgress, '0');
+    }
+  });
+}
+
+function getBatchConfig_(cycle) {
+  if (cycle === AUTO_CYCLE_AGGREGATORS) {
+    return {
+      handler: processSourceDataFromDriveTriggerAggregatorsPrepareData,
+      handlerName: 'processSourceDataFromDriveTriggerAggregatorsPrepareData',
+      attemptHandlers: [
+        'runAggregatorsBatchAttempt_1_',
+        'runAggregatorsBatchAttempt_2_',
+        'runAggregatorsBatchAttempt_3_',
+      ],
+    };
+  }
+
+  return {
+    handler: processSourceDataFromDriveTriggerBranchesOverallAndDiscounts,
+    handlerName: 'processSourceDataFromDriveTriggerBranchesOverallAndDiscounts',
+    attemptHandlers: [
+      'runBranchesBatchAttempt_1_',
+      'runBranchesBatchAttempt_2_',
+      'runBranchesBatchAttempt_3_',
+    ],
+  };
+}
+
+function resolveFirstAttemptTime_(targetHour, targetMinute) {
+  const now = new Date();
+  const target = new Date(now);
+  target.setHours(targetHour, targetMinute, 0, 0);
+  if (target.getTime() <= now.getTime()) {
+    return minutesFromNow_(AUTO_TRIGGER_DELAY_MINUTES);
+  }
+  return target;
+}
+
+function minutesFromNow_(minutes) {
+  return new Date(Date.now() + minutes * 60 * 1000);
+}
+
+function withCycleLock_(cycle, fn) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const key = cyclePrefix_(cycle) + 'LOCK';
+    const props = PropertiesService.getScriptProperties();
+    const now = Date.now();
+    const lockUntil = Number(props.getProperty(key) || '0');
+
+    if (lockUntil > now) {
+      Logger.log('%s: skipped because cycle lock is active until %s', cycleNameRu_(cycle), new Date(lockUntil).toISOString());
+      return;
+    }
+
+    props.setProperty(key, String(now + 25 * 60 * 1000));
+    try {
+      fn();
+    } finally {
+      props.deleteProperty(key);
+    }
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function resetCycleOperationalState_(cycle) {
+  const props = PropertiesService.getScriptProperties();
+  const todayKey = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  setCycleState_(cycle, AUTO_STATE_KEYS.cycleDate, todayKey);
+  setCycleState_(cycle, AUTO_STATE_KEYS.importStatus, '');
+  setCycleState_(cycle, AUTO_STATE_KEYS.importReason, '');
+  setCycleState_(cycle, AUTO_STATE_KEYS.processPending, '0');
+  setCycleState_(cycle, AUTO_STATE_KEYS.processInProgress, '0');
+  setCycleState_(cycle, AUTO_STATE_KEYS.processDone, '0');
+  setCycleState_(cycle, AUTO_STATE_KEYS.batchAttempt, '0');
+  setCycleState_(cycle, AUTO_STATE_KEYS.batchPending, '0');
+  setCycleState_(cycle, AUTO_STATE_KEYS.batchInProgress, '0');
+  setCycleState_(cycle, AUTO_STATE_KEYS.batchSuccess, '0');
+  setCycleState_(cycle, AUTO_STATE_KEYS.batchLastError, '');
+  setCycleState_(cycle, AUTO_STATE_KEYS.batchTargetTime, '');
+}
+
+function cyclePrefix_(cycle) {
+  return cycle === AUTO_CYCLE_AGGREGATORS ? AUTO_AGGREGATORS_PREFIX : AUTO_BRANCHES_PREFIX;
+}
+
+function setCycleState_(cycle, key, value) {
+  PropertiesService.getScriptProperties().setProperty(cyclePrefix_(cycle) + key, String(value));
+}
+
+function notifyCycle_(cycle, message) {
+  try {
+    sendMessageToBitrixChat(message, BITRIX_CHAT_ID_DEFAULT);
+  } catch (notifyError) {
+    Logger.log('%s: failed to send Bitrix message. %s', cycleNameRu_(cycle), notifyError && notifyError.stack ? notifyError.stack : notifyError);
+  }
+}
+
+function cycleNameRu_(cycle) {
+  return cycle === AUTO_CYCLE_AGGREGATORS ? 'Агрегаторы' : 'Филиалы';
+}
+
+function scheduleSingleRunTrigger_(handlerName, runAt) {
+  deleteTriggersByHandlers_([handlerName]);
+  ScriptApp.newTrigger(handlerName)
+    .timeBased()
+    .at(runAt)
+    .create();
+}
+
+function deleteTriggersByHandlers_(handlers) {
+  const unique = {};
+  handlers.forEach(function (handler) {
+    unique[handler] = true;
+  });
+  ScriptApp.getProjectTriggers().forEach(function (trigger) {
+    if (unique[trigger.getHandlerFunction()]) {
+      ScriptApp.deleteTrigger(trigger);
+    }
+  });
 }
 
 function buildOverallForecastCore_(options) {
