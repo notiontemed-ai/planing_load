@@ -12,6 +12,33 @@ const PROP_LAST_PROCESSED_MESSAGE_ID = 'LAST_IMPORTED_GMAIL_MESSAGE_ID';
 const SEARCH_BATCH_SIZE = 20;
 const FL2_SYSTEM_MARKER = '__SYSTEM_TIMESTAMP__';
 const FL2_PROCESSED_REQUESTS_CURRENT_DAY_HEADER = 'CurrentDate';
+const BITRIX_WEBHOOK_URL = 'https://n8n-x3.tech.temed.ru/webhook/d90a3413-9505-4281-aa7d-49082ae3e1e8/rozxjWwnHbUByCltdXLLfntCxzxNGqGnonwTIHVBaRHYKd/v1/message';
+const BITRIX_CHAT_ID_DEFAULT = 228956;
+const AUTO_CYCLE_AGGREGATORS = 'aggregators';
+const AUTO_CYCLE_BRANCHES = 'branches';
+const AUTO_MAX_BATCH_ATTEMPTS = 3;
+const AUTO_RETRY_DELAY_MINUTES = 10;
+const AUTO_TRIGGER_DELAY_MINUTES = 1;
+const AUTO_AGGREGATORS_PREFIX = 'AUTO_AGGREGATORS_';
+const AUTO_BRANCHES_PREFIX = 'AUTO_BRANCHES_';
+const AUTO_STATE_KEYS = {
+  cycleDate: 'CYCLE_DATE',
+  lastMailCheckAt: 'LAST_MAIL_CHECK_AT',
+  importStatus: 'IMPORT_STATUS',
+  importReason: 'IMPORT_REASON',
+  lastImportSuccessAt: 'LAST_IMPORT_SUCCESS_AT',
+  processPending: 'PROCESS_PENDING',
+  processInProgress: 'PROCESS_IN_PROGRESS',
+  processDone: 'PROCESS_DONE',
+  lastProcessSuccessAt: 'LAST_PROCESS_SUCCESS_AT',
+  batchAttempt: 'BATCH_ATTEMPT',
+  batchPending: 'BATCH_PENDING',
+  batchInProgress: 'BATCH_IN_PROGRESS',
+  batchSuccess: 'BATCH_SUCCESS',
+  batchLastError: 'BATCH_LAST_ERROR',
+  batchTargetTime: 'BATCH_TARGET_TIME',
+  lastBatchSuccessAt: 'LAST_BATCH_SUCCESS_AT',
+};
 
 const TIME_TYPE_MAP = {
   'Рабочее время': 'Приемные часы',
@@ -23,7 +50,7 @@ const TIME_TYPE_MAP = {
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu(MENU_NAME)
-    .addItem('Загрузить исходные XLSX на диск', 'importLatestLabeledXlsxToSheets')
+    .addItem('Загрузить исходные XLSX на диск', 'importLatestLabeledXlsxToSheetsInteractive')
     .addItem('Обработать исходные данные', 'processSourceData')
     .addItem('Обработать данные с диска', 'processSourceDataFromDrive')
     .addSeparator()
@@ -38,6 +65,8 @@ function onOpen() {
     .addSubMenu(
       SpreadsheetApp.getUi()
         .createMenu('Триггеры')
+        .addItem('Инициализировать триггеры', 'initializeAutomationTriggersFromSheet_')
+        .addSeparator()
         .addItem('Агрегаторы: скидки + письмо', 'processSourceDataFromDriveTriggerAggregatorsPrepareData')
         .addItem('Филиалы + общий план + скидки + письма', 'processSourceDataFromDriveTriggerBranchesOverallAndDiscounts')
     )
@@ -45,6 +74,10 @@ function onOpen() {
     .addItem('Архивировать план (ежедневно)', 'archivePlanReportsDaily')
     .addToUi();
 
+}
+
+function importLatestLabeledXlsxToSheetsInteractive() {
+  return importLatestLabeledXlsxToSheets({ interactive: true, throwOnError: true });
 }
 
 function processSourceData(options) {
@@ -56,11 +89,57 @@ function processSourceData(options) {
   }
 }
 
+function sendMessageToBitrixChat(text, chatIdOverride) {
+  const chatId = Number(chatIdOverride || BITRIX_CHAT_ID_DEFAULT);
+  const payload = { type: 'chat', id: chatId, message: bitrixMessageText_(text) };
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true,
+  };
+  const response = UrlFetchApp.fetch(BITRIX_WEBHOOK_URL, options);
+  const code = response.getResponseCode();
+  const body = response.getContentText() || '';
+
+  if (code < 200 || code >= 300) {
+    throw new Error(`Bitrix HTTP ${code}. chatId=${chatId}. body=${body}`);
+  }
+
+  if (body && /"error"\s*:|^\s*error\b|failed|exception/i.test(body)) {
+    throw new Error(`Bitrix response contains error. chatId=${chatId}. body=${body}`);
+  }
+
+  return { code: code, body: body };
+}
+
+function bitrixMessageText_(text) {
+  return String(text || '')
+    .replace(/<a\s+href="([^"]+)">([^<]+)<\/a>/gi, '[URL=$1]$2[/URL]')
+    .replace(/<b>/gi, '[B]')
+    .replace(/<\/b>/gi, '[/B]')
+    .replace(/<i>/gi, '[I]')
+    .replace(/<\/i>/gi, '[/I]')
+    .replace(/<u>/gi, '[U]')
+    .replace(/<\/u>/gi, '[/U]')
+    .replace(/<s>/gi, '[S]')
+    .replace(/<\/s>/gi, '[/S]')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>');
+}
+
 function processSourceDataFromDrive(options) {
   const opts = options || {};
   const interactive = opts.interactive !== false;
-  const lock = LockService.getScriptLock();
-  lock.waitLock(30000);
+  const skipLock = opts.skipLock === true;
+  let lock = null;
+  if (!skipLock) {
+    lock = LockService.getScriptLock();
+    lock.waitLock(30000);
+  }
 
   try {
     const imported = importLatestSourceSheetsFromDrive_(TARGET_FOLDER_ID);
@@ -76,7 +155,9 @@ function processSourceDataFromDrive(options) {
     notifyExecutionResult_('Ошибка: ' + error.message, interactive);
     throw error;
   } finally {
-    lock.releaseLock();
+    if (lock) {
+      lock.releaseLock();
+    }
   }
 }
 
@@ -88,15 +169,22 @@ function notifyExecutionResult_(message, interactive) {
   Logger.log(message);
 }
 
-function importLatestLabeledXlsxToSheets() {
-  const lock = LockService.getScriptLock();
-  lock.waitLock(30000);
+function importLatestLabeledXlsxToSheets(options) {
+  const opts = options || {};
+  const interactive = opts.interactive === true;
+  const throwOnError = opts.throwOnError === true || interactive;
+  const skipLock = opts.skipLock === true;
+  let lock = null;
+  if (!skipLock) {
+    lock = LockService.getScriptLock();
+    lock.waitLock(30000);
+  }
 
   try {
     const latestMessage = findLatestMessage_(GMAIL_QUERY, SEARCH_BATCH_SIZE);
     if (!latestMessage) {
-      SpreadsheetApp.getUi().alert('Писем по запросу не найдено.');
-      return;
+      notifyExecutionResult_('Писем по запросу не найдено.', interactive);
+      return { status: 'skipped', reason: 'no_messages' };
     }
 
     const messageId = latestMessage.getId();
@@ -104,8 +192,8 @@ function importLatestLabeledXlsxToSheets() {
     const lastProcessedMessageId = props.getProperty(PROP_LAST_PROCESSED_MESSAGE_ID);
 
     if (lastProcessedMessageId === messageId) {
-      SpreadsheetApp.getUi().alert('Последнее письмо уже обработано.');
-      return;
+      notifyExecutionResult_('Последнее письмо уже обработано.', interactive);
+      return { status: 'skipped', reason: 'already_processed' };
     }
 
     const attachments = latestMessage.getAttachments({
@@ -117,8 +205,8 @@ function importLatestLabeledXlsxToSheets() {
 
     if (!xlsxAttachments.length) {
       props.setProperty(PROP_LAST_PROCESSED_MESSAGE_ID, messageId);
-      SpreadsheetApp.getUi().alert('В последнем письме нет XLSX-вложений.');
-      return;
+      notifyExecutionResult_('В последнем письме нет XLSX-вложений.', interactive);
+      return { status: 'skipped', reason: 'no_xlsx_attachments' };
     }
 
     const createdFiles = [];
@@ -143,17 +231,24 @@ function importLatestLabeledXlsxToSheets() {
 
     props.setProperty(PROP_LAST_PROCESSED_MESSAGE_ID, messageId);
 
-    SpreadsheetApp.getUi().alert(
+    notifyExecutionResult_(
       'Готово.\n' +
       'Импортировано файлов: ' + createdFiles.length + '\n\n' +
-      createdFiles.join('\n')
+      createdFiles.join('\n'),
+      interactive
     );
+    return { status: 'imported', importedFiles: createdFiles.length };
   } catch (error) {
     Logger.log(error && error.stack ? error.stack : error);
-    SpreadsheetApp.getUi().alert('Ошибка: ' + error.message);
-    throw error;
+    notifyExecutionResult_('Ошибка: ' + error.message, interactive);
+    if (throwOnError) {
+      throw error;
+    }
+    return { status: 'error', errorMessage: error.message };
   } finally {
-    lock.releaseLock();
+    if (lock) {
+      lock.releaseLock();
+    }
   }
 }
 
@@ -2049,7 +2144,6 @@ function sendForwardReportEmail(ss, selectedBranch, currentDay) {
 }
 
 function processSourceDataFromDriveTriggerAggregatorsPrepareData() {
-  processSourceDataFromDrive({ interactive: false });
   updateDiscountsByPlan({ silent: true });
   sendDiscountsEmailsByMode_({
     targetMode: 'aggregators',
@@ -2058,8 +2152,6 @@ function processSourceDataFromDriveTriggerAggregatorsPrepareData() {
 }
 
 function processSourceDataFromDriveTriggerBranchesOverallAndDiscounts() {
-  processSourceDataFromDrive({ interactive: false });
-
   runForwardLoadReportsDirect_({
     includeBaseline: true,
     sendEmails: true,
@@ -2072,6 +2164,738 @@ function processSourceDataFromDriveTriggerBranchesOverallAndDiscounts() {
 
   updateDiscountsByPlan({ silent: true });
   sendDiscountsEmails({ silent: true });
+}
+
+
+function initializeAutomationTriggersFromSheet_() {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+
+  try {
+    const parseResult = readAndValidateAutomationSheetConfig_();
+    const validConfigs = parseResult.validConfigs;
+    const validationErrors = parseResult.errors;
+    const invalidScenarioCodes = parseResult.invalidScenarioCodes || {};
+    const existingTriggers = ScriptApp.getProjectTriggers();
+    let createdDaily = 0;
+    let deletedDaily = 0;
+    let deletedRetry = 0;
+    const validConfigByCode = {};
+    validConfigs.forEach(function (cfg) {
+      validConfigByCode[cfg.scenarioCode] = cfg;
+    });
+    const knownScenarios = [AUTO_CYCLE_AGGREGATORS, AUTO_CYCLE_BRANCHES];
+
+    knownScenarios.forEach(function (scenarioCode) {
+      const cfg = validConfigByCode[scenarioCode] || null;
+      deletedDaily += deleteDailyTriggersForScenario_(scenarioCode, existingTriggers);
+      deletedRetry += deletePendingRetryTriggersForScenario_(scenarioCode, existingTriggers);
+
+      if (cfg && cfg.active) {
+        saveAppliedConfig_(scenarioCode, cfg);
+        createDailyTrigger_(cfg.dailyHandler, cfg.checkTime);
+
+        const cleanState = createDefaultRuntimeState_();
+        cleanState.lastStatus = 'IDLE';
+        saveRuntimeState_(scenarioCode, cleanState);
+        updateScenarioRuntimeRow_(scenarioCode, {
+          'ПоследнийСтатус': 'IDLE',
+          'ПоследняяОшибка': '',
+          'ТекущаяПопытка': 0,
+          'NextTriggerAt': '',
+          'NextTriggerHandler': '',
+          'CycleId': '',
+        });
+
+        createdDaily += 1;
+        return;
+      }
+
+      clearAppliedConfig_(scenarioCode);
+
+      const idleState = createDefaultRuntimeState_();
+      idleState.lastStatus = invalidScenarioCodes[scenarioCode] ? 'CONFIG_ERROR' : 'IDLE';
+      idleState.lastError = invalidScenarioCodes[scenarioCode] ? 'Scenario config validation failed.' : '';
+      idleState.nextTriggerAt = '';
+      idleState.nextTriggerHandler = '';
+      idleState.pendingRetryHandler = '';
+      idleState.pendingRetryAt = '';
+      saveRuntimeState_(scenarioCode, idleState);
+      updateScenarioRuntimeRow_(scenarioCode, {
+        'ПоследнийСтатус': invalidScenarioCodes[scenarioCode] ? 'CONFIG_ERROR' : 'IDLE',
+        'ПоследняяОшибка': invalidScenarioCodes[scenarioCode] ? 'Scenario config validation failed.' : '',
+        'ТекущаяПопытка': 0,
+        'NextTriggerAt': '',
+        'NextTriggerHandler': '',
+      });
+    });
+
+    const message = [
+      'Инициализация триггеров завершена.',
+      'Создано daily-trigger: ' + createdDaily,
+      'Удалено daily-trigger: ' + deletedDaily,
+      'Удалено retry-trigger: ' + deletedRetry,
+    ];
+
+    if (validationErrors.length) {
+      message.push('Ошибки валидации:');
+      validationErrors.forEach(function (err) {
+        message.push('- ' + err);
+      });
+    }
+
+    SpreadsheetApp.getActive().toast(message.join('\n'), MENU_NAME, 8);
+
+    if (validationErrors.length) {
+      throw new Error('Инициализация завершена с ошибками валидации. Проверьте лист "Триггеры".');
+    }
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function runDailyScenarioAggregators_() {
+  runDailyScenarioByCode_(AUTO_CYCLE_AGGREGATORS);
+}
+
+function runDailyScenarioBranches_() {
+  runDailyScenarioByCode_(AUTO_CYCLE_BRANCHES);
+}
+
+function runRetryScenarioAggregators_() {
+  runRetryScenarioByCode_(AUTO_CYCLE_AGGREGATORS);
+}
+
+function runRetryScenarioBranches_() {
+  runRetryScenarioByCode_(AUTO_CYCLE_BRANCHES);
+}
+
+function runDailyScenarioByCode_(scenarioCode) {
+  withScenarioLock_(scenarioCode, function () {
+    const cfg = getAppliedConfig_(scenarioCode);
+    if (!cfg || !cfg.active) {
+      Logger.log('Scenario %s is not active in applied config', scenarioCode);
+      return;
+    }
+
+    deleteDailyTriggersForScenario_(scenarioCode);
+    createDailyTrigger_(cfg.dailyHandler, cfg.checkTime);
+
+    const now = new Date();
+    const cycleId = buildCycleId_(scenarioCode, now);
+    const state = createDefaultRuntimeState_();
+    state.cycleId = cycleId;
+    state.currentAttempt = 0;
+    state.lastStatus = 'IDLE';
+    state.lastRunAt = now.toISOString();
+    saveRuntimeState_(scenarioCode, state);
+
+    updateScenarioRuntimeRow_(scenarioCode, {
+      'ПоследнийСтатус': 'IDLE',
+      'ПоследнийЗапуск': formatMoscowDateTime_(now),
+      'ПоследняяОшибка': '',
+      'ТекущаяПопытка': 0,
+      'NextTriggerAt': '',
+      'NextTriggerHandler': '',
+      'CycleId': cycleId,
+    });
+
+    const latestMessage = findLatestMessage_(GMAIL_QUERY, SEARCH_BATCH_SIZE);
+    const latestMessageId = latestMessage ? latestMessage.getId() : '';
+    const lastProcessedMessageId = PropertiesService.getScriptProperties().getProperty(PROP_LAST_PROCESSED_MESSAGE_ID) || '';
+
+    if (!latestMessageId || latestMessageId === lastProcessedMessageId) {
+      state.lastStatus = 'NO_DATA';
+      state.lastRunAt = now.toISOString();
+      state.lastError = '';
+      state.currentAttempt = 0;
+      state.nextTriggerAt = '';
+      state.nextTriggerHandler = '';
+      state.pendingRetryHandler = '';
+      state.pendingRetryAt = '';
+      saveRuntimeState_(scenarioCode, state);
+
+      updateScenarioRuntimeRow_(scenarioCode, {
+        'ПоследнийСтатус': 'NO_DATA',
+        'ПоследнийЗапуск': formatMoscowDateTime_(now),
+        'ПоследняяОшибка': '',
+        'ТекущаяПопытка': 0,
+        'NextTriggerAt': '',
+        'NextTriggerHandler': '',
+        'CycleId': cycleId,
+      });
+
+      if (cfg.notifyIfNoData) {
+        sendAutomationNotification_(cfg.textNoData);
+      }
+      return;
+    }
+
+    let importResult = null;
+    try {
+      importResult = importLatestLabeledXlsxToSheets({ interactive: false, throwOnError: true, skipLock: true });
+    } catch (error) {
+      const errorText = extractErrorMessage_(error);
+      state.lastStatus = 'PROCESS_ERROR';
+      state.lastRunAt = now.toISOString();
+      state.lastError = errorText;
+      state.currentAttempt = 0;
+      state.nextTriggerAt = '';
+      state.nextTriggerHandler = '';
+      state.pendingRetryHandler = '';
+      state.pendingRetryAt = '';
+      saveRuntimeState_(scenarioCode, state);
+
+      updateScenarioRuntimeRow_(scenarioCode, {
+        'ПоследнийСтатус': 'PROCESS_ERROR',
+        'ПоследнийЗапуск': formatMoscowDateTime_(now),
+        'ПоследняяОшибка': errorText,
+        'ТекущаяПопытка': 0,
+        'NextTriggerAt': '',
+        'NextTriggerHandler': '',
+        'CycleId': cycleId,
+      });
+
+      if (cfg.notifyIfProcessError) {
+        sendAutomationNotification_(cfg.textProcessError + '\nДетали: ' + errorText);
+      }
+      return;
+    }
+
+    if (!importResult || importResult.status !== 'imported') {
+      const importReason = importResult && importResult.reason ? importResult.reason : (importResult && importResult.status) || 'unknown';
+      state.lastStatus = importResult && importResult.status === 'error' ? 'PROCESS_ERROR' : 'NO_DATA';
+      state.lastRunAt = now.toISOString();
+      state.lastError = state.lastStatus === 'PROCESS_ERROR' ? extractErrorMessage_(importResult.errorMessage || 'import_failed') : '';
+      state.currentAttempt = 0;
+      state.nextTriggerAt = '';
+      state.nextTriggerHandler = '';
+      state.pendingRetryHandler = '';
+      state.pendingRetryAt = '';
+      saveRuntimeState_(scenarioCode, state);
+
+      updateScenarioRuntimeRow_(scenarioCode, {
+        'ПоследнийСтатус': state.lastStatus,
+        'ПоследнийЗапуск': formatMoscowDateTime_(now),
+        'ПоследняяОшибка': state.lastError,
+        'ТекущаяПопытка': 0,
+        'NextTriggerAt': '',
+        'NextTriggerHandler': '',
+        'CycleId': cycleId,
+      });
+
+      if (state.lastStatus === 'NO_DATA' && cfg.notifyIfNoData) {
+        sendAutomationNotification_(cfg.textNoData + '\nПричина: ' + importReason);
+      }
+      if (state.lastStatus === 'PROCESS_ERROR' && cfg.notifyIfProcessError) {
+        sendAutomationNotification_(cfg.textProcessError + '\nДетали: ' + state.lastError);
+      }
+      return;
+    }
+
+    try {
+      processSourceDataFromDrive({ interactive: false, skipLock: true });
+    } catch (error) {
+      const errorText = extractErrorMessage_(error);
+      state.lastStatus = 'PROCESS_ERROR';
+      state.lastRunAt = now.toISOString();
+      state.lastError = errorText;
+      state.currentAttempt = 0;
+      state.nextTriggerAt = '';
+      state.nextTriggerHandler = '';
+      state.pendingRetryHandler = '';
+      state.pendingRetryAt = '';
+      saveRuntimeState_(scenarioCode, state);
+
+      updateScenarioRuntimeRow_(scenarioCode, {
+        'ПоследнийСтатус': 'PROCESS_ERROR',
+        'ПоследнийЗапуск': formatMoscowDateTime_(now),
+        'ПоследняяОшибка': errorText,
+        'ТекущаяПопытка': 0,
+        'NextTriggerAt': '',
+        'NextTriggerHandler': '',
+        'CycleId': cycleId,
+      });
+
+      if (cfg.notifyIfProcessError) {
+        sendAutomationNotification_(cfg.textProcessError + '\nДетали: ' + errorText);
+      }
+      return;
+    }
+
+    const firstAttemptAt = computeFirstRetryDate_(cfg.firstAttemptTime);
+    deletePendingRetryTriggersForScenario_(scenarioCode);
+    createRetryTrigger_(cfg.retryHandler, firstAttemptAt);
+
+    state.lastStatus = 'WAITING_RETRY';
+    state.currentAttempt = 0;
+    state.lastRunAt = now.toISOString();
+    state.lastError = '';
+    state.nextTriggerAt = firstAttemptAt.toISOString();
+    state.nextTriggerHandler = cfg.retryHandler;
+    state.pendingRetryHandler = cfg.retryHandler;
+    state.pendingRetryAt = firstAttemptAt.toISOString();
+    saveRuntimeState_(scenarioCode, state);
+
+    updateScenarioRuntimeRow_(scenarioCode, {
+      'ПоследнийСтатус': 'WAITING_RETRY',
+      'ПоследнийЗапуск': formatMoscowDateTime_(now),
+      'ПоследняяОшибка': '',
+      'ТекущаяПопытка': 0,
+      'NextTriggerAt': formatMoscowDateTime_(firstAttemptAt),
+      'NextTriggerHandler': cfg.retryHandler,
+      'CycleId': cycleId,
+    });
+  });
+}
+
+function runRetryScenarioByCode_(scenarioCode) {
+  withScenarioLock_(scenarioCode, function () {
+    const cfg = getAppliedConfig_(scenarioCode);
+    if (!cfg || !cfg.active) {
+      Logger.log('Scenario %s is not active in applied config', scenarioCode);
+      return;
+    }
+
+    const now = new Date();
+    const state = getRuntimeState_(scenarioCode);
+    const attempt = Number(state.currentAttempt || 0) + 1;
+    state.currentAttempt = attempt;
+    state.lastRunAt = now.toISOString();
+    state.pendingRetryHandler = '';
+    state.pendingRetryAt = '';
+    saveRuntimeState_(scenarioCode, state);
+
+    updateScenarioRuntimeRow_(scenarioCode, {
+      'ТекущаяПопытка': attempt,
+      'ПоследнийЗапуск': formatMoscowDateTime_(now),
+      'CycleId': state.cycleId || '',
+    });
+
+    const batchHandler = resolveBatchHandler_(cfg.batchFunctionName);
+
+    try {
+      batchHandler();
+
+      deletePendingRetryTriggersForScenario_(scenarioCode);
+
+      state.lastStatus = 'SUCCESS';
+      state.lastSuccessAt = now.toISOString();
+      state.lastError = '';
+      state.nextTriggerAt = '';
+      state.nextTriggerHandler = '';
+      state.pendingRetryHandler = '';
+      state.pendingRetryAt = '';
+      saveRuntimeState_(scenarioCode, state);
+
+      updateScenarioRuntimeRow_(scenarioCode, {
+        'ПоследнийСтатус': 'SUCCESS',
+        'ПоследнийЗапуск': formatMoscowDateTime_(now),
+        'ПоследнийУспех': formatMoscowDateTime_(now),
+        'ПоследняяОшибка': '',
+        'ТекущаяПопытка': attempt,
+        'NextTriggerAt': '',
+        'NextTriggerHandler': '',
+        'CycleId': state.cycleId || '',
+      });
+      return;
+    } catch (error) {
+      const errorText = extractErrorMessage_(error);
+      state.lastError = errorText;
+
+      if (attempt < cfg.maxAttempts) {
+        const nextRunAt = new Date(now.getTime() + cfg.retryIntervalMinutes * 60 * 1000);
+        deletePendingRetryTriggersForScenario_(scenarioCode);
+        createRetryTrigger_(cfg.retryHandler, nextRunAt);
+
+        state.lastStatus = 'RETRY_SCHEDULED';
+        state.nextTriggerAt = nextRunAt.toISOString();
+        state.nextTriggerHandler = cfg.retryHandler;
+        state.pendingRetryHandler = cfg.retryHandler;
+        state.pendingRetryAt = nextRunAt.toISOString();
+        saveRuntimeState_(scenarioCode, state);
+
+        updateScenarioRuntimeRow_(scenarioCode, {
+          'ПоследнийСтатус': 'RETRY_SCHEDULED',
+          'ПоследнийЗапуск': formatMoscowDateTime_(now),
+          'ПоследняяОшибка': errorText,
+          'ТекущаяПопытка': attempt,
+          'NextTriggerAt': formatMoscowDateTime_(nextRunAt),
+          'NextTriggerHandler': cfg.retryHandler,
+          'CycleId': state.cycleId || '',
+        });
+        return;
+      }
+
+      deletePendingRetryTriggersForScenario_(scenarioCode);
+      state.lastStatus = 'FAILED';
+      state.nextTriggerAt = '';
+      state.nextTriggerHandler = '';
+      state.pendingRetryHandler = '';
+      state.pendingRetryAt = '';
+      saveRuntimeState_(scenarioCode, state);
+
+      updateScenarioRuntimeRow_(scenarioCode, {
+        'ПоследнийСтатус': 'FAILED',
+        'ПоследнийЗапуск': formatMoscowDateTime_(now),
+        'ПоследняяОшибка': errorText,
+        'ТекущаяПопытка': attempt,
+        'NextTriggerAt': '',
+        'NextTriggerHandler': '',
+        'CycleId': state.cycleId || '',
+      });
+
+      if (cfg.notifyIfAttemptsExhausted) {
+        sendAutomationNotification_(cfg.textBatchError + '\nДетали: ' + errorText);
+      }
+    }
+  });
+}
+
+function readAndValidateAutomationSheetConfig_() {
+  const sheet = getAutomationTriggerSheet_();
+  const data = sheet.getDataRange().getDisplayValues();
+  if (!data.length) {
+    throw new Error('Лист "Триггеры" пуст.');
+  }
+
+  const headers = data[0].map(function (h) { return str_(h); });
+  const requiredHeaders = [
+    'Активен', 'КодСценария', 'Название', 'ВремяПроверки', 'ВремяПервойПопытки',
+    'МаксПопыток', 'ИнтервалМеждуПопыткамиМин', 'ФункцияBatch', 'УведомлятьЕслиНетДанных',
+    'УведомлятьЕслиОшибкаProcess', 'УведомлятьЕслиИсчерпаныПопытки', 'ТекстНетДанных',
+    'ТекстОшибкаProcess', 'ТекстОшибкаBatch', 'ПоследнийСтатус', 'ПоследнийЗапуск',
+    'ПоследнийУспех', 'ПоследняяОшибка', 'ТекущаяПопытка', 'NextTriggerAt', 'NextTriggerHandler', 'CycleId',
+  ];
+
+  requiredHeaders.forEach(function (header) {
+    if (headers.indexOf(header) < 0) {
+      throw new Error('На листе "Триггеры" отсутствует колонка: ' + header);
+    }
+  });
+
+  const validScenarioCodes = {
+    aggregators: true,
+    branches: true,
+  };
+
+  const codesSeen = {};
+  const validConfigs = [];
+  const errors = [];
+  const invalidScenarioCodes = {};
+
+  for (let i = 1; i < data.length; i += 1) {
+    const row = data[i];
+    const rowNumber = i + 1;
+    const scenarioCode = str_(row[headers.indexOf('КодСценария')]).trim();
+    if (!scenarioCode) continue;
+
+    const rowErrors = [];
+    if (codesSeen[scenarioCode]) {
+      rowErrors.push('дублирующийся КодСценария');
+    }
+    codesSeen[scenarioCode] = true;
+
+    if (!validScenarioCodes[scenarioCode]) {
+      rowErrors.push('недопустимый КодСценария: ' + scenarioCode);
+      invalidScenarioCodes[scenarioCode] = true;
+    }
+
+    const active = parseYesNo_(row[headers.indexOf('Активен')]);
+    const scenarioName = str_(row[headers.indexOf('Название')]).trim();
+    const checkTime = parseTimeHHMM_(row[headers.indexOf('ВремяПроверки')], 'ВремяПроверки', rowErrors);
+    const firstAttemptTime = parseTimeHHMM_(row[headers.indexOf('ВремяПервойПопытки')], 'ВремяПервойПопытки', rowErrors);
+    const maxAttempts = parsePositiveInt_(row[headers.indexOf('МаксПопыток')], 'МаксПопыток', rowErrors);
+    const retryIntervalMinutes = parsePositiveInt_(row[headers.indexOf('ИнтервалМеждуПопыткамиМин')], 'ИнтервалМеждуПопыткамиМин', rowErrors);
+    const batchFunctionName = str_(row[headers.indexOf('ФункцияBatch')]).trim();
+
+    if (!scenarioName) rowErrors.push('пустое Название');
+    if (!batchFunctionName) {
+      rowErrors.push('пустая ФункцияBatch');
+    } else if (!isFunctionExists_(batchFunctionName)) {
+      rowErrors.push('ФункцияBatch не найдена: ' + batchFunctionName);
+    }
+
+    if (rowErrors.length) {
+      if (validScenarioCodes[scenarioCode]) invalidScenarioCodes[scenarioCode] = true;
+      errors.push('Строка ' + rowNumber + ' (' + scenarioCode + '): ' + rowErrors.join(', '));
+      continue;
+    }
+
+    const handlers = getScenarioHandlers_(scenarioCode);
+    const cfg = {
+      active: active,
+      scenarioCode: scenarioCode,
+      scenarioName: scenarioName,
+      checkTime: checkTime,
+      firstAttemptTime: firstAttemptTime,
+      maxAttempts: maxAttempts,
+      retryIntervalMinutes: retryIntervalMinutes,
+      batchFunctionName: batchFunctionName,
+      notifyIfNoData: parseYesNo_(row[headers.indexOf('УведомлятьЕслиНетДанных')]),
+      notifyIfProcessError: parseYesNo_(row[headers.indexOf('УведомлятьЕслиОшибкаProcess')]),
+      notifyIfAttemptsExhausted: parseYesNo_(row[headers.indexOf('УведомлятьЕслиИсчерпаныПопытки')]),
+      textNoData: str_(row[headers.indexOf('ТекстНетДанных')]),
+      textProcessError: str_(row[headers.indexOf('ТекстОшибкаProcess')]),
+      textBatchError: str_(row[headers.indexOf('ТекстОшибкаBatch')]),
+      dailyHandler: handlers.daily,
+      retryHandler: handlers.retry,
+    };
+
+    validConfigs.push(cfg);
+  }
+
+  const filteredValidConfigs = validConfigs.filter(function (cfg) {
+    return !invalidScenarioCodes[cfg.scenarioCode];
+  });
+
+  return { validConfigs: filteredValidConfigs, errors: errors, invalidScenarioCodes: invalidScenarioCodes };
+}
+
+function getScenarioHandlers_(scenarioCode) {
+  if (scenarioCode === AUTO_CYCLE_AGGREGATORS) {
+    return { daily: 'runDailyScenarioAggregators_', retry: 'runRetryScenarioAggregators_' };
+  }
+  if (scenarioCode === AUTO_CYCLE_BRANCHES) {
+    return { daily: 'runDailyScenarioBranches_', retry: 'runRetryScenarioBranches_' };
+  }
+  throw new Error('Неизвестный сценарий: ' + scenarioCode);
+}
+
+function getAutomationTriggerSheet_() {
+  const sheet = SpreadsheetApp.getActive().getSheetByName('Триггеры');
+  if (!sheet) throw new Error('Не найден лист "Триггеры"');
+  return sheet;
+}
+
+function saveAppliedConfig_(scenarioCode, config) {
+  PropertiesService.getScriptProperties().setProperty('AUTO_CFG_' + scenarioCode, JSON.stringify(config));
+}
+
+function clearAppliedConfig_(scenarioCode) {
+  PropertiesService.getScriptProperties().deleteProperty('AUTO_CFG_' + scenarioCode);
+}
+
+function getAppliedConfig_(scenarioCode) {
+  const raw = PropertiesService.getScriptProperties().getProperty('AUTO_CFG_' + scenarioCode);
+  return raw ? JSON.parse(raw) : null;
+}
+
+function createDefaultRuntimeState_() {
+  return {
+    cycleId: '',
+    currentAttempt: 0,
+    lastStatus: 'IDLE',
+    lastRunAt: '',
+    lastSuccessAt: '',
+    lastError: '',
+    nextTriggerAt: '',
+    nextTriggerHandler: '',
+    pendingRetryHandler: '',
+    pendingRetryAt: '',
+  };
+}
+
+function getRuntimeState_(scenarioCode) {
+  const raw = PropertiesService.getScriptProperties().getProperty('AUTO_STATE_' + scenarioCode);
+  if (!raw) return createDefaultRuntimeState_();
+  try {
+    const parsed = JSON.parse(raw);
+    return Object.assign(createDefaultRuntimeState_(), parsed || {});
+  } catch (error) {
+    return createDefaultRuntimeState_();
+  }
+}
+
+function saveRuntimeState_(scenarioCode, state) {
+  PropertiesService.getScriptProperties().setProperty('AUTO_STATE_' + scenarioCode, JSON.stringify(state));
+}
+
+function updateScenarioRuntimeRow_(scenarioCode, fields) {
+  const sheet = getAutomationTriggerSheet_();
+  const data = sheet.getDataRange().getDisplayValues();
+  if (!data.length) return;
+  const headers = data[0].map(function (h) { return str_(h); });
+
+  let targetRow = -1;
+  const codeCol = headers.indexOf('КодСценария');
+  for (let i = 1; i < data.length; i += 1) {
+    if (str_(data[i][codeCol]).trim() === scenarioCode) {
+      targetRow = i + 1;
+      break;
+    }
+  }
+  if (targetRow < 0) return;
+
+  Object.keys(fields).forEach(function (fieldName) {
+    const colIdx = headers.indexOf(fieldName);
+    if (colIdx < 0) return;
+    sheet.getRange(targetRow, colIdx + 1).setValue(fields[fieldName]);
+  });
+}
+
+function parseYesNo_(value) {
+  const normalized = str_(value).trim().toLowerCase();
+  if (normalized === 'да' || normalized === 'yes' || normalized === 'true' || normalized === '1') return true;
+  if (normalized === 'нет' || normalized === 'no' || normalized === 'false' || normalized === '0' || normalized === '') return false;
+  return false;
+}
+
+function parseTimeHHMM_(value, fieldName, errors) {
+  const raw = str_(value).trim();
+  if (!/^([01]\d|2[0-3]):([0-5]\d)$/.test(raw)) {
+    errors.push('некорректный формат ' + fieldName + ' (ожидается HH:mm)');
+    return raw;
+  }
+  return raw;
+}
+
+function parsePositiveInt_(value, fieldName, errors) {
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 1) {
+    errors.push(fieldName + ' должно быть целым числом >= 1');
+  }
+  return n;
+}
+
+function buildMoscowDateTimeFromParts_(moscowDateText, timeHHMM) {
+  return new Date(moscowDateText + 'T' + timeHHMM + ':00+03:00');
+}
+
+function computeNextMoscowRunAt_(timeHHMM, now) {
+  const current = now ? new Date(now) : new Date();
+  const todayMoscowText = Utilities.formatDate(current, 'Europe/Moscow', 'yyyy-MM-dd');
+  let runAt = buildMoscowDateTimeFromParts_(todayMoscowText, timeHHMM);
+
+  if (runAt.getTime() <= current.getTime()) {
+    runAt = new Date(runAt.getTime() + 24 * 60 * 60 * 1000);
+  }
+
+  return runAt;
+}
+
+function createDailyTrigger_(handlerName, timeHHMM) {
+  const runAt = computeNextMoscowRunAt_(timeHHMM, new Date());
+  ScriptApp.newTrigger(handlerName)
+    .timeBased()
+    .at(runAt)
+    .create();
+  return runAt;
+}
+
+function createRetryTrigger_(handlerName, runAt) {
+  ScriptApp.newTrigger(handlerName)
+    .timeBased()
+    .at(runAt)
+    .create();
+}
+
+function deleteDailyTriggersForScenario_(scenarioCode, triggers) {
+  const handler = getScenarioHandlers_(scenarioCode).daily;
+  return deleteTriggersByHandlerName_(handler, triggers);
+}
+
+function deletePendingRetryTriggersForScenario_(scenarioCode, triggers) {
+  const handler = getScenarioHandlers_(scenarioCode).retry;
+  return deleteTriggersByHandlerName_(handler, triggers);
+}
+
+function deleteTriggersByHandlerName_(handlerName, triggers) {
+  const sourceTriggers = triggers || ScriptApp.getProjectTriggers();
+  let count = 0;
+  sourceTriggers.forEach(function (trigger) {
+    if (trigger.getHandlerFunction() === handlerName) {
+      ScriptApp.deleteTrigger(trigger);
+      count += 1;
+    }
+  });
+  return count;
+}
+
+function sendAutomationNotification_(text) {
+  if (!text) return;
+  try {
+    sendMessageToBitrixChat(text, BITRIX_CHAT_ID_DEFAULT);
+  } catch (error) {
+    Logger.log('Bitrix notification failed: %s', extractErrorMessage_(error));
+  }
+}
+
+function computeFirstRetryDate_(timeHHMM) {
+  const now = new Date();
+  const todayMoscowText = Utilities.formatDate(now, 'Europe/Moscow', 'yyyy-MM-dd');
+  const planned = buildMoscowDateTimeFromParts_(todayMoscowText, timeHHMM);
+
+  if (planned.getTime() <= now.getTime()) {
+    const nearMinute = new Date(now.getTime() + 60 * 1000);
+    nearMinute.setSeconds(0, 0);
+    return nearMinute;
+  }
+
+  return planned;
+}
+
+function formatMoscowDateTime_(date) {
+  if (!date) return '';
+  return Utilities.formatDate(new Date(date), 'Europe/Moscow', 'dd.MM.yyyy HH:mm:ss');
+}
+
+function buildCycleId_(scenarioCode, date) {
+  return scenarioCode + '_' + Utilities.formatDate(new Date(date), 'Europe/Moscow', 'yyyyMMdd_HHmmss');
+}
+
+function withScenarioLock_(scenarioCode, fn) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const lockKey = 'AUTO_LOCK_' + scenarioCode;
+    const props = PropertiesService.getScriptProperties();
+    const now = Date.now();
+    const lockedUntil = Number(props.getProperty(lockKey) || '0');
+    if (lockedUntil > now) {
+      Logger.log('Scenario %s skipped because lock is active', scenarioCode);
+      return;
+    }
+
+    props.setProperty(lockKey, String(now + 20 * 60 * 1000));
+    try {
+      fn();
+    } finally {
+      props.deleteProperty(lockKey);
+    }
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function resolveBatchHandler_(name) {
+  if (!name) throw new Error('Не задано имя batch-функции');
+  const fn = getBatchFunctionMap_()[name];
+  if (typeof fn !== 'function') {
+    throw new Error('Batch-функция не найдена: ' + name);
+  }
+  return fn;
+}
+
+function isFunctionExists_(name) {
+  return typeof getBatchFunctionMap_()[name] === 'function';
+}
+
+function getBatchFunctionMap_() {
+  return {
+    processSourceDataFromDriveTriggerAggregatorsPrepareData: processSourceDataFromDriveTriggerAggregatorsPrepareData,
+    processSourceDataFromDriveTriggerBranchesOverallAndDiscounts: processSourceDataFromDriveTriggerBranchesOverallAndDiscounts,
+  };
+}
+
+function extractErrorMessage_(error) {
+  if (!error) return 'unknown_error';
+  if (error.message) return String(error.message);
+  return String(error);
+}
+
+function setupAutomationTriggers_() {
+  initializeAutomationTriggersFromSheet_();
 }
 
 function buildOverallForecastCore_(options) {
@@ -2377,7 +3201,7 @@ function sendDiscountsEmailsByMode_(options) {
     subject = `Скидки для агрегаторов на ${formatDateDDMMYYYY_(new Date())}`;
   } else if (targetMode === 'non_aggregators') {
     mailingBranchName = 'Скидки';
-    allowedSectionKeys = ['pp_discount', 'p_discount', 'smm', 'site'];
+    allowedSectionKeys = ['pp_discount', 'p_discount', 'smm', 'site', 'aggregators'];
     subject = `Сводка по скидкам на ${formatDateDDMMYYYY_(new Date())}`;
   } else {
     throw new Error(`Неизвестный режим отправки скидок: ${targetMode}`);
