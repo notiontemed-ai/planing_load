@@ -2163,32 +2163,46 @@ function initializeAutomationTriggersFromSheet_() {
     const parseResult = readAndValidateAutomationSheetConfig_();
     const validConfigs = parseResult.validConfigs;
     const validationErrors = parseResult.errors;
+    const invalidScenarioCodes = parseResult.invalidScenarioCodes || {};
     const existingTriggers = ScriptApp.getProjectTriggers();
     let createdDaily = 0;
     let deletedDaily = 0;
     let deletedRetry = 0;
-
+    const validConfigByCode = {};
     validConfigs.forEach(function (cfg) {
-      saveAppliedConfig_(cfg.scenarioCode, cfg);
+      validConfigByCode[cfg.scenarioCode] = cfg;
+    });
+    const knownScenarios = [AUTO_CYCLE_AGGREGATORS, AUTO_CYCLE_BRANCHES];
 
-      deletedDaily += deleteDailyTriggersForScenario_(cfg.scenarioCode, existingTriggers);
+    knownScenarios.forEach(function (scenarioCode) {
+      const cfg = validConfigByCode[scenarioCode] || null;
+      deletedDaily += deleteDailyTriggersForScenario_(scenarioCode, existingTriggers);
+      deletedRetry += deletePendingRetryTriggersForScenario_(scenarioCode, existingTriggers);
 
-      if (cfg.active) {
+      if (cfg && cfg.active) {
+        saveAppliedConfig_(scenarioCode, cfg);
         createDailyTrigger_(cfg.dailyHandler, cfg.checkTime);
         createdDaily += 1;
         return;
       }
 
-      deletedRetry += deletePendingRetryTriggersForScenario_(cfg.scenarioCode, existingTriggers);
+      if (cfg) {
+        saveAppliedConfig_(scenarioCode, cfg);
+      } else if (invalidScenarioCodes[scenarioCode]) {
+        clearAppliedConfig_(scenarioCode);
+      }
+
       const idleState = createDefaultRuntimeState_();
-      idleState.lastStatus = 'IDLE';
+      idleState.lastStatus = invalidScenarioCodes[scenarioCode] ? 'CONFIG_ERROR' : 'IDLE';
+      idleState.lastError = invalidScenarioCodes[scenarioCode] ? 'Scenario config validation failed.' : '';
       idleState.nextTriggerAt = '';
       idleState.nextTriggerHandler = '';
       idleState.pendingRetryHandler = '';
       idleState.pendingRetryAt = '';
-      saveRuntimeState_(cfg.scenarioCode, idleState);
-      updateScenarioRuntimeRow_(cfg.scenarioCode, {
-        'ПоследнийСтатус': 'IDLE',
+      saveRuntimeState_(scenarioCode, idleState);
+      updateScenarioRuntimeRow_(scenarioCode, {
+        'ПоследнийСтатус': invalidScenarioCodes[scenarioCode] ? 'CONFIG_ERROR' : 'IDLE',
+        'ПоследняяОшибка': invalidScenarioCodes[scenarioCode] ? 'Scenario config validation failed.' : '',
         'ТекущаяПопытка': 0,
         'NextTriggerAt': '',
         'NextTriggerHandler': '',
@@ -2286,6 +2300,68 @@ function runDailyScenarioByCode_(scenarioCode) {
 
       if (cfg.notifyIfNoData) {
         sendAutomationNotification_(cfg.textNoData);
+      }
+      return;
+    }
+
+    let importResult = null;
+    try {
+      importResult = importLatestLabeledXlsxToSheets({ interactive: false, throwOnError: true });
+    } catch (error) {
+      const errorText = extractErrorMessage_(error);
+      state.lastStatus = 'PROCESS_ERROR';
+      state.lastRunAt = now.toISOString();
+      state.lastError = errorText;
+      state.currentAttempt = 0;
+      state.nextTriggerAt = '';
+      state.nextTriggerHandler = '';
+      state.pendingRetryHandler = '';
+      state.pendingRetryAt = '';
+      saveRuntimeState_(scenarioCode, state);
+
+      updateScenarioRuntimeRow_(scenarioCode, {
+        'ПоследнийСтатус': 'PROCESS_ERROR',
+        'ПоследнийЗапуск': formatMoscowDateTime_(now),
+        'ПоследняяОшибка': errorText,
+        'ТекущаяПопытка': 0,
+        'NextTriggerAt': '',
+        'NextTriggerHandler': '',
+        'CycleId': cycleId,
+      });
+
+      if (cfg.notifyIfProcessError) {
+        sendAutomationNotification_(cfg.textProcessError + '\nДетали: ' + errorText);
+      }
+      return;
+    }
+
+    if (!importResult || importResult.status !== 'imported') {
+      const importReason = importResult && importResult.reason ? importResult.reason : (importResult && importResult.status) || 'unknown';
+      state.lastStatus = importResult && importResult.status === 'error' ? 'PROCESS_ERROR' : 'NO_DATA';
+      state.lastRunAt = now.toISOString();
+      state.lastError = state.lastStatus === 'PROCESS_ERROR' ? extractErrorMessage_(importResult.errorMessage || 'import_failed') : '';
+      state.currentAttempt = 0;
+      state.nextTriggerAt = '';
+      state.nextTriggerHandler = '';
+      state.pendingRetryHandler = '';
+      state.pendingRetryAt = '';
+      saveRuntimeState_(scenarioCode, state);
+
+      updateScenarioRuntimeRow_(scenarioCode, {
+        'ПоследнийСтатус': state.lastStatus,
+        'ПоследнийЗапуск': formatMoscowDateTime_(now),
+        'ПоследняяОшибка': state.lastError,
+        'ТекущаяПопытка': 0,
+        'NextTriggerAt': '',
+        'NextTriggerHandler': '',
+        'CycleId': cycleId,
+      });
+
+      if (state.lastStatus === 'NO_DATA' && cfg.notifyIfNoData) {
+        sendAutomationNotification_(cfg.textNoData + '\nПричина: ' + importReason);
+      }
+      if (state.lastStatus === 'PROCESS_ERROR' && cfg.notifyIfProcessError) {
+        sendAutomationNotification_(cfg.textProcessError + '\nДетали: ' + state.lastError);
       }
       return;
     }
@@ -2479,6 +2555,7 @@ function readAndValidateAutomationSheetConfig_() {
   const codesSeen = {};
   const validConfigs = [];
   const errors = [];
+  const invalidScenarioCodes = {};
 
   for (let i = 1; i < data.length; i += 1) {
     const row = data[i];
@@ -2531,7 +2608,10 @@ function readAndValidateAutomationSheetConfig_() {
     };
 
     if (rowErrors.length) {
-      if (active) {
+      if (validScenarioCodes[scenarioCode]) {
+        invalidScenarioCodes[scenarioCode] = true;
+      }
+      if (active || validScenarioCodes[scenarioCode]) {
         errors.push('Строка ' + rowNumber + ' (' + scenarioCode + '): ' + rowErrors.join(', '));
       }
       continue;
@@ -2540,7 +2620,11 @@ function readAndValidateAutomationSheetConfig_() {
     validConfigs.push(cfg);
   }
 
-  return { validConfigs: validConfigs, errors: errors };
+  const filteredValidConfigs = validConfigs.filter(function (cfg) {
+    return !invalidScenarioCodes[cfg.scenarioCode];
+  });
+
+  return { validConfigs: filteredValidConfigs, errors: errors, invalidScenarioCodes: invalidScenarioCodes };
 }
 
 function getScenarioHandlers_(scenarioCode) {
@@ -2561,6 +2645,10 @@ function getAutomationTriggerSheet_() {
 
 function saveAppliedConfig_(scenarioCode, config) {
   PropertiesService.getScriptProperties().setProperty('AUTO_CFG_' + scenarioCode, JSON.stringify(config));
+}
+
+function clearAppliedConfig_(scenarioCode) {
+  PropertiesService.getScriptProperties().deleteProperty('AUTO_CFG_' + scenarioCode);
 }
 
 function getAppliedConfig_(scenarioCode) {
@@ -2693,7 +2781,11 @@ function deleteTriggersByHandlerName_(handlerName, triggers) {
 
 function sendAutomationNotification_(text) {
   if (!text) return;
-  sendMessageToBitrixChat(text, BITRIX_CHAT_ID_DEFAULT);
+  try {
+    sendMessageToBitrixChat(text, BITRIX_CHAT_ID_DEFAULT);
+  } catch (error) {
+    Logger.log('Bitrix notification failed: %s', extractErrorMessage_(error));
+  }
 }
 
 function computeFirstRetryDate_(timeHHMM) {
@@ -2742,7 +2834,7 @@ function withScenarioLock_(scenarioCode, fn) {
 
 function resolveBatchHandler_(name) {
   if (!name) throw new Error('Не задано имя batch-функции');
-  const fn = globalThis[name];
+  const fn = getBatchFunctionMap_()[name];
   if (typeof fn !== 'function') {
     throw new Error('Batch-функция не найдена: ' + name);
   }
@@ -2750,7 +2842,14 @@ function resolveBatchHandler_(name) {
 }
 
 function isFunctionExists_(name) {
-  return typeof globalThis[name] === 'function';
+  return typeof getBatchFunctionMap_()[name] === 'function';
+}
+
+function getBatchFunctionMap_() {
+  return {
+    processSourceDataFromDriveTriggerAggregatorsPrepareData: processSourceDataFromDriveTriggerAggregatorsPrepareData,
+    processSourceDataFromDriveTriggerBranchesOverallAndDiscounts: processSourceDataFromDriveTriggerBranchesOverallAndDiscounts,
+  };
 }
 
 function extractErrorMessage_(error) {
