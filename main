@@ -134,8 +134,12 @@ function bitrixMessageText_(text) {
 function processSourceDataFromDrive(options) {
   const opts = options || {};
   const interactive = opts.interactive !== false;
-  const lock = LockService.getScriptLock();
-  lock.waitLock(30000);
+  const skipLock = opts.skipLock === true;
+  let lock = null;
+  if (!skipLock) {
+    lock = LockService.getScriptLock();
+    lock.waitLock(30000);
+  }
 
   try {
     const imported = importLatestSourceSheetsFromDrive_(TARGET_FOLDER_ID);
@@ -151,7 +155,9 @@ function processSourceDataFromDrive(options) {
     notifyExecutionResult_('Ошибка: ' + error.message, interactive);
     throw error;
   } finally {
-    lock.releaseLock();
+    if (lock) {
+      lock.releaseLock();
+    }
   }
 }
 
@@ -167,8 +173,12 @@ function importLatestLabeledXlsxToSheets(options) {
   const opts = options || {};
   const interactive = opts.interactive === true;
   const throwOnError = opts.throwOnError === true || interactive;
-  const lock = LockService.getScriptLock();
-  lock.waitLock(30000);
+  const skipLock = opts.skipLock === true;
+  let lock = null;
+  if (!skipLock) {
+    lock = LockService.getScriptLock();
+    lock.waitLock(30000);
+  }
 
   try {
     const latestMessage = findLatestMessage_(GMAIL_QUERY, SEARCH_BATCH_SIZE);
@@ -236,7 +246,9 @@ function importLatestLabeledXlsxToSheets(options) {
     }
     return { status: 'error', errorMessage: error.message };
   } finally {
-    lock.releaseLock();
+    if (lock) {
+      lock.releaseLock();
+    }
   }
 }
 
@@ -2186,11 +2198,7 @@ function initializeAutomationTriggersFromSheet_() {
         return;
       }
 
-      if (cfg) {
-        saveAppliedConfig_(scenarioCode, cfg);
-      } else if (invalidScenarioCodes[scenarioCode]) {
-        clearAppliedConfig_(scenarioCode);
-      }
+      clearAppliedConfig_(scenarioCode);
 
       const idleState = createDefaultRuntimeState_();
       idleState.lastStatus = invalidScenarioCodes[scenarioCode] ? 'CONFIG_ERROR' : 'IDLE';
@@ -2269,6 +2277,7 @@ function runDailyScenarioByCode_(scenarioCode) {
     updateScenarioRuntimeRow_(scenarioCode, {
       'ПоследнийСтатус': 'IDLE',
       'ПоследнийЗапуск': formatMoscowDateTime_(now),
+      'ПоследняяОшибка': '',
       'ТекущаяПопытка': 0,
       'NextTriggerAt': '',
       'NextTriggerHandler': '',
@@ -2282,6 +2291,7 @@ function runDailyScenarioByCode_(scenarioCode) {
     if (!latestMessageId || latestMessageId === lastProcessedMessageId) {
       state.lastStatus = 'NO_DATA';
       state.lastRunAt = now.toISOString();
+      state.lastError = '';
       state.currentAttempt = 0;
       state.nextTriggerAt = '';
       state.nextTriggerHandler = '';
@@ -2292,6 +2302,7 @@ function runDailyScenarioByCode_(scenarioCode) {
       updateScenarioRuntimeRow_(scenarioCode, {
         'ПоследнийСтатус': 'NO_DATA',
         'ПоследнийЗапуск': formatMoscowDateTime_(now),
+        'ПоследняяОшибка': '',
         'ТекущаяПопытка': 0,
         'NextTriggerAt': '',
         'NextTriggerHandler': '',
@@ -2306,7 +2317,7 @@ function runDailyScenarioByCode_(scenarioCode) {
 
     let importResult = null;
     try {
-      importResult = importLatestLabeledXlsxToSheets({ interactive: false, throwOnError: true });
+      importResult = importLatestLabeledXlsxToSheets({ interactive: false, throwOnError: true, skipLock: true });
     } catch (error) {
       const errorText = extractErrorMessage_(error);
       state.lastStatus = 'PROCESS_ERROR';
@@ -2367,7 +2378,7 @@ function runDailyScenarioByCode_(scenarioCode) {
     }
 
     try {
-      processSourceDataFromDrive({ interactive: false });
+      processSourceDataFromDrive({ interactive: false, skipLock: true });
     } catch (error) {
       const errorText = extractErrorMessage_(error);
       state.lastStatus = 'PROCESS_ERROR';
@@ -2571,6 +2582,7 @@ function readAndValidateAutomationSheetConfig_() {
 
     if (!validScenarioCodes[scenarioCode]) {
       rowErrors.push('недопустимый КодСценария: ' + scenarioCode);
+      invalidScenarioCodes[scenarioCode] = true;
     }
 
     const active = parseYesNo_(row[headers.indexOf('Активен')]);
@@ -2588,6 +2600,13 @@ function readAndValidateAutomationSheetConfig_() {
       rowErrors.push('ФункцияBatch не найдена: ' + batchFunctionName);
     }
 
+    if (rowErrors.length) {
+      if (validScenarioCodes[scenarioCode]) invalidScenarioCodes[scenarioCode] = true;
+      errors.push('Строка ' + rowNumber + ' (' + scenarioCode + '): ' + rowErrors.join(', '));
+      continue;
+    }
+
+    const handlers = getScenarioHandlers_(scenarioCode);
     const cfg = {
       active: active,
       scenarioCode: scenarioCode,
@@ -2603,19 +2622,9 @@ function readAndValidateAutomationSheetConfig_() {
       textNoData: str_(row[headers.indexOf('ТекстНетДанных')]),
       textProcessError: str_(row[headers.indexOf('ТекстОшибкаProcess')]),
       textBatchError: str_(row[headers.indexOf('ТекстОшибкаBatch')]),
-      dailyHandler: getScenarioHandlers_(scenarioCode).daily,
-      retryHandler: getScenarioHandlers_(scenarioCode).retry,
+      dailyHandler: handlers.daily,
+      retryHandler: handlers.retry,
     };
-
-    if (rowErrors.length) {
-      if (validScenarioCodes[scenarioCode]) {
-        invalidScenarioCodes[scenarioCode] = true;
-      }
-      if (active || validScenarioCodes[scenarioCode]) {
-        errors.push('Строка ' + rowNumber + ' (' + scenarioCode + '): ' + rowErrors.join(', '));
-      }
-      continue;
-    }
 
     validConfigs.push(cfg);
   }
