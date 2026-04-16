@@ -2194,6 +2194,19 @@ function initializeAutomationTriggersFromSheet_() {
       if (cfg && cfg.active) {
         saveAppliedConfig_(scenarioCode, cfg);
         createDailyTrigger_(cfg.dailyHandler, cfg.checkTime);
+
+        const cleanState = createDefaultRuntimeState_();
+        cleanState.lastStatus = 'IDLE';
+        saveRuntimeState_(scenarioCode, cleanState);
+        updateScenarioRuntimeRow_(scenarioCode, {
+          'ПоследнийСтатус': 'IDLE',
+          'ПоследняяОшибка': '',
+          'ТекущаяПопытка': 0,
+          'NextTriggerAt': '',
+          'NextTriggerHandler': '',
+          'CycleId': '',
+        });
+
         createdDaily += 1;
         return;
       }
@@ -2264,6 +2277,9 @@ function runDailyScenarioByCode_(scenarioCode) {
       Logger.log('Scenario %s is not active in applied config', scenarioCode);
       return;
     }
+
+    deleteDailyTriggersForScenario_(scenarioCode);
+    createDailyTrigger_(cfg.dailyHandler, cfg.checkTime);
 
     const now = new Date();
     const cycleId = buildCycleId_(scenarioCode, now);
@@ -2742,21 +2758,29 @@ function parsePositiveInt_(value, fieldName, errors) {
   return n;
 }
 
-function buildDateByTimeToday_(timeHHMM) {
-  const parts = timeHHMM.split(':');
-  const date = new Date();
-  date.setHours(Number(parts[0]), Number(parts[1]), 0, 0);
-  return date;
+function buildMoscowDateTimeFromParts_(moscowDateText, timeHHMM) {
+  return new Date(moscowDateText + 'T' + timeHHMM + ':00+03:00');
+}
+
+function computeNextMoscowRunAt_(timeHHMM, now) {
+  const current = now ? new Date(now) : new Date();
+  const todayMoscowText = Utilities.formatDate(current, 'Europe/Moscow', 'yyyy-MM-dd');
+  let runAt = buildMoscowDateTimeFromParts_(todayMoscowText, timeHHMM);
+
+  if (runAt.getTime() <= current.getTime()) {
+    runAt = new Date(runAt.getTime() + 24 * 60 * 60 * 1000);
+  }
+
+  return runAt;
 }
 
 function createDailyTrigger_(handlerName, timeHHMM) {
-  const parts = timeHHMM.split(':');
+  const runAt = computeNextMoscowRunAt_(timeHHMM, new Date());
   ScriptApp.newTrigger(handlerName)
     .timeBased()
-    .everyDays(1)
-    .atHour(Number(parts[0]))
-    .nearMinute(Number(parts[1]))
+    .at(runAt)
     .create();
+  return runAt;
 }
 
 function createRetryTrigger_(handlerName, runAt) {
@@ -2798,13 +2822,16 @@ function sendAutomationNotification_(text) {
 }
 
 function computeFirstRetryDate_(timeHHMM) {
-  const planned = buildDateByTimeToday_(timeHHMM);
   const now = new Date();
+  const todayMoscowText = Utilities.formatDate(now, 'Europe/Moscow', 'yyyy-MM-dd');
+  const planned = buildMoscowDateTimeFromParts_(todayMoscowText, timeHHMM);
+
   if (planned.getTime() <= now.getTime()) {
     const nearMinute = new Date(now.getTime() + 60 * 1000);
     nearMinute.setSeconds(0, 0);
     return nearMinute;
   }
+
   return planned;
 }
 
