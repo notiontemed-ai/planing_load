@@ -5,6 +5,7 @@ const SHEET_REQUESTS = 'Заявки';
 const SHEET_PROCESSED_REQUESTS = 'Обработанные заявки';
 const SHEET_EXCLUSIONS = 'Исключения';
 const SHEET_DISCOUNTS = 'Скидки';
+const SHEET_LOG = 'Лог';
 const MENU_NAME = 'TEMED';
 const GMAIL_QUERY = 'label:графики-и-заявки-из-1с';
 const TARGET_FOLDER_ID = '1LlZSRquXr11iSqLPg4OESmy883vuVpK1';
@@ -965,6 +966,69 @@ function getOrCreateSheet_(ss, name) {
   return ss.getSheetByName(name) || ss.insertSheet(name);
 }
 
+function getLogSheet_() {
+  const ss = SpreadsheetApp.getActive();
+  const sheet = getOrCreateSheet_(ss, SHEET_LOG);
+
+  if (sheet.getLastRow() < 1) {
+    sheet.getRange(1, 1, 1, 10).setValues([[
+      'ДатаВремя',
+      'RunId',
+      'Сценарий',
+      'Источник',
+      'Попытка',
+      'Этап',
+      'Статус',
+      'ДлительностьСек',
+      'Детали',
+      'Ошибка',
+    ]]);
+  }
+
+  return sheet;
+}
+
+function logAutomationStep_(ctx, step, status, details, error, startedAt) {
+  try {
+    const sheet = getLogSheet_();
+    const now = new Date();
+    const durationSec = startedAt
+      ? Math.round((now.getTime() - startedAt.getTime()) / 1000)
+      : '';
+
+    sheet.appendRow([
+      formatDateTimeDDMMYYYY_(now),
+      ctx && ctx.runId ? ctx.runId : '',
+      ctx && ctx.scenarioCode ? ctx.scenarioCode : '',
+      ctx && ctx.source ? ctx.source : '',
+      ctx && ctx.attempt !== undefined ? ctx.attempt : '',
+      step || '',
+      status || '',
+      durationSec,
+      details ? String(details).slice(0, 1000) : '',
+      error ? extractErrorMessage_(error).slice(0, 1000) : '',
+    ]);
+
+    SpreadsheetApp.flush();
+  } catch (logError) {
+    Logger.log('logAutomationStep_ failed: %s', extractErrorMessage_(logError));
+  }
+}
+
+function runLoggedAutomationStep_(ctx, step, details, fn) {
+  const startedAt = new Date();
+  logAutomationStep_(ctx, step, 'START', details || '', '', startedAt);
+
+  try {
+    const result = fn();
+    logAutomationStep_(ctx, step, 'OK', details || '', '', startedAt);
+    return result;
+  } catch (error) {
+    logAutomationStep_(ctx, step, 'ERROR', details || '', error, startedAt);
+    throw error;
+  }
+}
+
 function deleteSheetIfExists_(ss, name) {
   const sheet = ss.getSheetByName(name);
   if (sheet) ss.deleteSheet(sheet);
@@ -1167,6 +1231,14 @@ function runForwardLoadReportsDirect_(options) {
 
   branches.forEach((branchName) => {
     const branch = str_(branchName);
+    const branchCtx = {
+      runId: 'branches_loop_' + Utilities.formatDate(new Date(), 'Europe/Moscow', 'yyyyMMdd_HHmmss'),
+      scenarioCode: 'branches',
+      source: 'branch_loop',
+      attempt: '',
+    };
+    const branchStartedAt = new Date();
+    logAutomationStep_(branchCtx, 'branch_start', 'START', branch);
     try {
       const branchPrep = prepareForwardLoadInput_(ss, {
         selectedBranch: branch,
@@ -1184,7 +1256,9 @@ function runForwardLoadReportsDirect_(options) {
       if (sendEmails) {
         sendForwardReportEmail(ss, branch, currentDay);
       }
+      logAutomationStep_(branchCtx, 'branch_finish', 'OK', branch, '', branchStartedAt);
     } catch (e) {
+      logAutomationStep_(branchCtx, 'branch_finish', 'ERROR', branch, e, branchStartedAt);
       const err = `${branch || '(пусто)'}: ${e && e.message ? e.message : String(e)}`;
       errors.push(err);
     }
@@ -2144,26 +2218,54 @@ function sendForwardReportEmail(ss, selectedBranch, currentDay) {
 }
 
 function processSourceDataFromDriveTriggerAggregatorsPrepareData() {
-  updateDiscountsByPlan({ silent: true });
-  sendDiscountsEmailsByMode_({
-    targetMode: 'aggregators',
-    silent: true,
+  const ctx = {
+    runId: 'aggregators_batch_' + Utilities.formatDate(new Date(), 'Europe/Moscow', 'yyyyMMdd_HHmmss'),
+    scenarioCode: 'aggregators',
+    source: 'batch_function',
+    attempt: '',
+  };
+
+  runLoggedAutomationStep_(ctx, 'update_discounts_by_plan', 'updateDiscountsByPlan', function () {
+    updateDiscountsByPlan({ silent: true });
+  });
+
+  runLoggedAutomationStep_(ctx, 'send_aggregators_discounts', 'sendDiscountsEmailsByMode_', function () {
+    sendDiscountsEmailsByMode_({
+      targetMode: 'aggregators',
+      silent: true,
+    });
   });
 }
 
 function processSourceDataFromDriveTriggerBranchesOverallAndDiscounts() {
-  runForwardLoadReportsDirect_({
-    includeBaseline: true,
-    sendEmails: true,
+  const ctx = {
+    runId: 'branches_batch_' + Utilities.formatDate(new Date(), 'Europe/Moscow', 'yyyyMMdd_HHmmss'),
+    scenarioCode: 'branches',
+    source: 'batch_function',
+    attempt: '',
+  };
+
+  runLoggedAutomationStep_(ctx, 'build_branch_reports_and_send_emails', 'runForwardLoadReportsDirect_', function () {
+    runForwardLoadReportsDirect_({
+      includeBaseline: true,
+      sendEmails: true,
+    });
   });
 
-  buildOverallForecastCore_({
-    sendEmail: true,
-    refreshDiscountsAfter: false,
+  runLoggedAutomationStep_(ctx, 'build_overall_forecast_and_send_email', 'buildOverallForecastCore_', function () {
+    buildOverallForecastCore_({
+      sendEmail: true,
+      refreshDiscountsAfter: false,
+    });
   });
 
-  updateDiscountsByPlan({ silent: true });
-  sendDiscountsEmails({ silent: true });
+  runLoggedAutomationStep_(ctx, 'update_discounts_by_plan', 'updateDiscountsByPlan', function () {
+    updateDiscountsByPlan({ silent: true });
+  });
+
+  runLoggedAutomationStep_(ctx, 'send_discounts_emails', 'sendDiscountsEmails', function () {
+    sendDiscountsEmails({ silent: true });
+  });
 }
 
 
@@ -2283,6 +2385,14 @@ function runDailyScenarioByCode_(scenarioCode) {
 
     const now = new Date();
     const cycleId = buildCycleId_(scenarioCode, now);
+    const logCtx = {
+      runId: cycleId,
+      scenarioCode: scenarioCode,
+      source: 'daily_trigger',
+      attempt: 0,
+    };
+
+    logAutomationStep_(logCtx, 'run_daily_start', 'START', 'daily scenario started');
     const state = createDefaultRuntimeState_();
     state.cycleId = cycleId;
     state.currentAttempt = 0;
@@ -2300,7 +2410,14 @@ function runDailyScenarioByCode_(scenarioCode) {
       'CycleId': cycleId,
     });
 
-    const latestMessage = findLatestMessage_(GMAIL_QUERY, SEARCH_BATCH_SIZE);
+    const latestMessage = runLoggedAutomationStep_(
+      logCtx,
+      'gmail_check',
+      GMAIL_QUERY,
+      function () {
+        return findLatestMessage_(GMAIL_QUERY, SEARCH_BATCH_SIZE);
+      }
+    );
     const latestMessageId = latestMessage ? latestMessage.getId() : '';
     const lastProcessedMessageId = PropertiesService.getScriptProperties().getProperty(PROP_LAST_PROCESSED_MESSAGE_ID) || '';
 
@@ -2333,7 +2450,25 @@ function runDailyScenarioByCode_(scenarioCode) {
 
     let importResult = null;
     try {
-      importResult = importLatestLabeledXlsxToSheets({ interactive: false, throwOnError: true, skipLock: true });
+      importResult = runLoggedAutomationStep_(
+        logCtx,
+        'import_xlsx_to_drive',
+        'importLatestLabeledXlsxToSheets',
+        function () {
+          return importLatestLabeledXlsxToSheets({
+            interactive: false,
+            throwOnError: true,
+            skipLock: true,
+          });
+        }
+      );
+
+      logAutomationStep_(
+        logCtx,
+        'import_xlsx_result',
+        'OK',
+        JSON.stringify(importResult || {})
+      );
     } catch (error) {
       const errorText = extractErrorMessage_(error);
       state.lastStatus = 'PROCESS_ERROR';
@@ -2394,7 +2529,17 @@ function runDailyScenarioByCode_(scenarioCode) {
     }
 
     try {
-      processSourceDataFromDrive({ interactive: false, skipLock: true });
+      runLoggedAutomationStep_(
+        logCtx,
+        'process_source_data_from_drive',
+        'processSourceDataFromDrive',
+        function () {
+          processSourceDataFromDrive({
+            interactive: false,
+            skipLock: true,
+          });
+        }
+      );
     } catch (error) {
       const errorText = extractErrorMessage_(error);
       state.lastStatus = 'PROCESS_ERROR';
@@ -2424,8 +2569,15 @@ function runDailyScenarioByCode_(scenarioCode) {
     }
 
     const firstAttemptAt = computeFirstRetryDate_(cfg.firstAttemptTime);
-    deletePendingRetryTriggersForScenario_(scenarioCode);
-    createRetryTrigger_(cfg.retryHandler, firstAttemptAt);
+    runLoggedAutomationStep_(
+      logCtx,
+      'create_retry_trigger',
+      'handler=' + cfg.retryHandler + ', firstAttemptAt=' + formatMoscowDateTime_(firstAttemptAt),
+      function () {
+        deletePendingRetryTriggersForScenario_(scenarioCode);
+        createRetryTrigger_(cfg.retryHandler, firstAttemptAt);
+      }
+    );
 
     state.lastStatus = 'WAITING_RETRY';
     state.currentAttempt = 0;
@@ -2446,6 +2598,7 @@ function runDailyScenarioByCode_(scenarioCode) {
       'NextTriggerHandler': cfg.retryHandler,
       'CycleId': cycleId,
     });
+    logAutomationStep_(logCtx, 'run_daily_finish', 'OK', 'daily scenario finished');
   });
 }
 
@@ -2460,6 +2613,19 @@ function runRetryScenarioByCode_(scenarioCode) {
     const now = new Date();
     const state = getRuntimeState_(scenarioCode);
     const attempt = Number(state.currentAttempt || 0) + 1;
+    const logCtx = {
+      runId: state.cycleId || buildCycleId_(scenarioCode, now),
+      scenarioCode: scenarioCode,
+      source: 'retry_trigger',
+      attempt: attempt,
+    };
+
+    logAutomationStep_(
+      logCtx,
+      'run_retry_start',
+      'START',
+      'batchFunction=' + cfg.batchFunctionName
+    );
     state.currentAttempt = attempt;
     state.lastRunAt = now.toISOString();
     state.pendingRetryHandler = '';
@@ -2475,7 +2641,14 @@ function runRetryScenarioByCode_(scenarioCode) {
     const batchHandler = resolveBatchHandler_(cfg.batchFunctionName);
 
     try {
-      batchHandler();
+      runLoggedAutomationStep_(
+        logCtx,
+        'batch_handler',
+        cfg.batchFunctionName,
+        function () {
+          batchHandler();
+        }
+      );
 
       deletePendingRetryTriggersForScenario_(scenarioCode);
 
@@ -2498,10 +2671,23 @@ function runRetryScenarioByCode_(scenarioCode) {
         'NextTriggerHandler': '',
         'CycleId': state.cycleId || '',
       });
+      logAutomationStep_(
+        logCtx,
+        'run_retry_finish',
+        'OK',
+        'retry scenario finished'
+      );
       return;
     } catch (error) {
       const errorText = extractErrorMessage_(error);
       state.lastError = errorText;
+      logAutomationStep_(
+        logCtx,
+        'run_retry_finish',
+        'ERROR',
+        'retry scenario failed',
+        error
+      );
 
       if (attempt < cfg.maxAttempts) {
         const nextRunAt = new Date(now.getTime() + cfg.retryIntervalMinutes * 60 * 1000);
