@@ -1590,7 +1590,7 @@ function buildForwardLoadReportForBranch_(ss, selectedBranch, prep, options) {
   });
   const massageRows = rowsAllNomenclature.filter((r) => massageSet.has(str_(r.doctor)));
   const ftRows = rowsAllNomenclature.filter((r) => ftSet.has(str_(r.doctor)));
-  const cabinetRows = buildCabinetRowsByName_(anchorDay, filteredScheduleRows, latestRequests, {
+  const cabinetRows = buildCabinetRowsByType_(anchorDay, filteredScheduleRows, latestRequests, {
     includeBaseline,
   });
 
@@ -1891,29 +1891,45 @@ function computeBaselineMetrics(currentDay, horizonDays, scheduleByDoctorDay, re
   const byBranch = new Map();
   const byDoctor = new Map();
   const index = loadArchiveBaselineIndex_();
-  const seen = new Set();
+  const seenObjects = new Set();
+  const seenBranchCategories = new Set();
+  const weekdayKey = getArchiveWeekdayKey_(currentDay);
 
   scheduleByDoctorDay.forEach((intervals, key) => {
     const parts = str_(key).split('|');
     const branch = str_(parts[1]);
     const doctor = str_(parts[2]);
     if (!branch || !doctor) return;
-    const uniq = `${branch}|${doctor}`;
-    if (seen.has(uniq)) return;
-    seen.add(uniq);
 
     const category = str_(categoryResolver(doctor, branch)) || 'doctor';
-    const metric = getArchiveBaselineMetric_(index, {
-      category,
-      branch,
-      object: doctor,
-      horizon: horizonLabel,
-      reportDate: currentDay,
-      maxObservations: 6,
-    });
+    const objectKey = `${category}|${branch}|${doctor}`;
+    if (!seenObjects.has(objectKey)) {
+      seenObjects.add(objectKey);
+      const objectMetric = getArchiveBaselineMetric_(index, {
+        category,
+        branch,
+        object: doctor,
+        horizon: horizonLabel,
+        reportDate: currentDay,
+        weekdayKey,
+        maxObservations: 6,
+      });
+      byDoctor.set(`${branch}|${doctor}`, { branch, doctor, metrics: objectMetric });
+    }
 
-    byDoctor.set(uniq, { branch, doctor, metrics: metric });
-    accumulateForward(byBranch, branch, metric, branch, '');
+    const branchCategoryKey = `${category}|${branch}`;
+    if (!seenBranchCategories.has(branchCategoryKey)) {
+      seenBranchCategories.add(branchCategoryKey);
+      const branchMetric = getArchiveCategoryBaselineMetric_(index, {
+        category,
+        branch,
+        horizon: horizonLabel,
+        reportDate: currentDay,
+        weekdayKey,
+        maxObservations: 6,
+      });
+      accumulateForward(byBranch, branch, branchMetric, branch, '');
+    }
   });
 
   return { byBranch, byDoctor };
@@ -2041,7 +2057,7 @@ function renderPlanBlockByHorizon_(sheet, row, horizonLabel, periodLabel, ctx) {
   row += 1;
   row = renderForwardDetailsTable_(sheet, row, `Таблица ${ctx.tableBase + 2} — ФТ (${horizonLabel})`, 'Сотрудник', ctx.ftRows, h, false, includeBaseline);
   row += 1;
-  row = renderCabinetDetailsTable_(sheet, row, `Таблица ${ctx.tableBase + 3} — Кабинеты физиотерапии (${horizonLabel})`, ctx.cabinetRows, h, includeBaseline);
+  row = renderCabinetDetailsTable_(sheet, row, `Таблица ${ctx.tableBase + 3} — Типы кабинетов физиотерапии (${horizonLabel})`, ctx.cabinetRows, h, includeBaseline);
 
   return row;
 }
@@ -2111,7 +2127,7 @@ function renderForwardDetailsTable_(sheet, row, title, firstColTitle, rows, hori
 
 function renderCabinetDetailsTable_(sheet, row, title, rows, horizon, includeBaseline) {
   const columns = 6;
-  const header = ['Кабинет', 'Приемные (ч)', 'Занятые (ч)', 'Загрузка (%)', 'Свободные (ч)', 'Заявки (шт)'];
+  const header = ['Тип кабинета', 'Приемные (ч)', 'Занятые (ч)', 'Загрузка (%)', 'Свободные (ч)', 'Заявки (шт)'];
   sheet.getRange(row, 1, 1, columns).merge().setValue(title).setFontWeight('bold').setBackground('#cfe2f3');
   row += 1;
   sheet.getRange(row, 1, 1, columns).setValues([header]);
@@ -4148,6 +4164,38 @@ function buildCabinetRowsByName_(currentDay, scheduleRows, requests, options) {
   })).sort((a, b) => str_(a.cabinet).localeCompare(str_(b.cabinet), 'ru'));
 }
 
+function buildCabinetRowsByType_(currentDay, scheduleRows, requests, options) {
+  const opts = options || {};
+  const includeBaseline = opts.includeBaseline !== false;
+
+  const dailyBuckets = computeCabinetTypeDailyBuckets_(currentDay, 7, scheduleRows, requests);
+  const c3Map = aggregateCabinetTypeDailyBuckets_(currentDay, 3, dailyBuckets);
+  const c7Map = aggregateCabinetTypeDailyBuckets_(currentDay, 7, dailyBuckets);
+
+  const b3Map = includeBaseline
+    ? computeCabinetTypeBaselineMetrics_(currentDay, 3, scheduleRows, requests)
+    : new Map();
+
+  const b7Map = includeBaseline
+    ? computeCabinetTypeBaselineMetrics_(currentDay, 7, scheduleRows, requests)
+    : new Map();
+
+  const keys = new Set([
+    ...c3Map.keys(),
+    ...c7Map.keys(),
+    ...b3Map.keys(),
+    ...b7Map.keys(),
+  ]);
+
+  return [...keys].map((type) => ({
+    cabinet: type,
+    c3: c3Map.get(type) ? c3Map.get(type).metrics : emptyForwardMetric(),
+    c7: c7Map.get(type) ? c7Map.get(type).metrics : emptyForwardMetric(),
+    b3: b3Map.get(type) || emptyForwardMetric(),
+    b7: b7Map.get(type) || emptyForwardMetric(),
+  })).sort((a, b) => str_(a.cabinet).localeCompare(str_(b.cabinet), 'ru'));
+}
+
 function buildCabinetScheduleByNameIndex_(scheduleRows) {
   const map = new Map();
   (scheduleRows || []).forEach((row) => {
@@ -4383,31 +4431,94 @@ function aggregateCabinetTypeDailyBuckets_(anchorDate, horizonDays, dailyBuckets
   return out;
 }
 
+function getArchiveCabinetTypeBaselineMetric_(index, params) {
+  const p = params || {};
+  const maxObs = Number(p.maxObservations) > 0 ? Number(p.maxObservations) : 6;
+  const branch = str_(p.branch);
+  const cabinetType = str_(p.cabinetType);
+  const horizon = toArchiveHorizonLabel_(p.horizon);
+  const reportDate = toDate_(p.reportDate);
+  const weekdayKey = str_(p.weekdayKey);
+
+  if (!branch || !cabinetType || !horizon) return emptyForwardMetric();
+
+  const periodMap = new Map();
+
+  index.forEach((arr, key) => {
+    const parts = str_(key).split('|');
+    const keyCategory = str_(parts[0]);
+    const keyBranch = str_(parts[1]);
+    const objectName = str_(parts[2]);
+    const keyHorizon = toArchiveHorizonLabel_(parts[3]);
+
+    if (keyCategory !== 'physio') return;
+    if (keyBranch !== branch) return;
+    if (keyHorizon !== horizon) return;
+    if (detectCabinetType_(objectName) !== cabinetType) return;
+
+    (arr || []).forEach((item) => {
+      if (!item || !item.reportDate) return;
+      if (reportDate && item.reportDate.getTime() >= reportDate.getTime()) return;
+      if (weekdayKey && item.weekdayKey !== weekdayKey) return;
+
+      const periodKey = Utilities.formatDate(item.reportDate, FL2_TIMEZONE, 'yyyy-MM-dd');
+
+      if (!periodMap.has(periodKey)) {
+        periodMap.set(periodKey, {
+          reportDate: item.reportDate,
+          metric: emptyForwardMetric(),
+        });
+      }
+
+      addForwardMetric(periodMap.get(periodKey).metric, item.metric || emptyForwardMetric());
+    });
+  });
+
+  const periods = [...periodMap.values()]
+    .sort((a, b) => b.reportDate.getTime() - a.reportDate.getTime())
+    .slice(0, maxObs);
+
+  if (!periods.length) return emptyForwardMetric();
+
+  const out = emptyForwardMetric();
+
+  periods.forEach((period) => {
+    addForwardMetric(out, period.metric || emptyForwardMetric());
+  });
+
+  Object.keys(out).forEach((k) => {
+    out[k] /= periods.length;
+  });
+
+  return out;
+}
+
 function computeCabinetTypeBaselineMetrics_(currentDay, horizonDays, scheduleRows, requests) {
   const horizonLabel = Number(horizonDays) === 7 ? '7 дней' : '3 дня';
   const index = loadArchiveBaselineIndex_();
   const out = new Map();
   const seen = new Set();
+  const weekdayKey = getArchiveWeekdayKey_(currentDay);
 
   (scheduleRows || []).forEach((row) => {
-    const cabinet = str_(row['Кабинет']);
     const branch = str_(row['Филиал']);
+    const cabinet = str_(row['Кабинет']);
     const type = detectCabinetType_(cabinet);
-    if (!cabinet || !branch || !type) return;
-    const key = `${branch}|${cabinet}`;
+
+    if (!branch || !type) return;
+
+    const key = `${branch}|${type}`;
     if (seen.has(key)) return;
     seen.add(key);
 
-    const metric = getArchiveBaselineMetric_(index, {
-      category: 'physio',
+    out.set(type, getArchiveCabinetTypeBaselineMetric_(index, {
       branch,
-      object: cabinet,
+      cabinetType: type,
       horizon: horizonLabel,
       reportDate: currentDay,
+      weekdayKey,
       maxObservations: 6,
-    });
-    if (!out.has(type)) out.set(type, emptyForwardMetric());
-    addForwardMetric(out.get(type), metric);
+    }));
   });
 
   return out;
@@ -4620,6 +4731,12 @@ function toArchiveMetricFromRow_(row) {
   };
 }
 
+function getArchiveWeekdayKey_(value) {
+  const d = toDate_(value);
+  if (!d) return '';
+  return Utilities.formatDate(d, FL2_TIMEZONE, 'u');
+}
+
 function archiveBaselineKey_(category, branch, objectName, horizon) {
   return [str_(category), str_(branch), str_(objectName), toArchiveHorizonLabel_(horizon)].join('|');
 }
@@ -4648,6 +4765,7 @@ function loadArchiveBaselineIndex_() {
       if (!index.has(key)) index.set(key, []);
       index.get(key).push({
         reportDate,
+        weekdayKey: getArchiveWeekdayKey_(reportDate),
         metric: toArchiveMetricFromRow_(row),
       });
     });
@@ -4670,7 +4788,12 @@ function getArchiveBaselineMetric_(index, params) {
   const key = archiveBaselineKey_(p.category, p.branch, p.object, p.horizon);
   const arr = index && index.get(key) ? index.get(key) : [];
   const reportDate = toDate_(p.reportDate);
-  const filtered = arr.filter((item) => !reportDate || item.reportDate.getTime() < reportDate.getTime());
+  const weekdayKey = str_(p.weekdayKey);
+  const filtered = arr.filter((item) => {
+    if (reportDate && item.reportDate.getTime() >= reportDate.getTime()) return false;
+    if (weekdayKey && item.weekdayKey !== weekdayKey) return false;
+    return true;
+  });
   const used = filtered.slice(0, maxObs);
 
   const logPrefix = `cat=${str_(p.category)}, branch=${str_(p.branch)}, object=${str_(p.object)}, horizon=${str_(p.horizon)}`;
@@ -4685,6 +4808,66 @@ function getArchiveBaselineMetric_(index, params) {
   Object.keys(out).forEach((k) => {
     out[k] /= used.length;
   });
+  return out;
+}
+
+function getArchiveCategoryBaselineMetric_(index, params) {
+  const p = params || {};
+  const maxObs = Number(p.maxObservations) > 0 ? Number(p.maxObservations) : 6;
+  const category = str_(p.category);
+  const branch = str_(p.branch);
+  const horizon = toArchiveHorizonLabel_(p.horizon);
+  const reportDate = toDate_(p.reportDate);
+  const weekdayKey = str_(p.weekdayKey);
+
+  if (!category || !branch || !horizon) return emptyForwardMetric();
+
+  const periodMap = new Map();
+
+  index.forEach((arr, key) => {
+    const parts = str_(key).split('|');
+    const keyCategory = str_(parts[0]);
+    const keyBranch = str_(parts[1]);
+    const keyHorizon = toArchiveHorizonLabel_(parts[3]);
+
+    if (keyCategory !== category) return;
+    if (keyBranch !== branch) return;
+    if (keyHorizon !== horizon) return;
+
+    (arr || []).forEach((item) => {
+      if (!item || !item.reportDate) return;
+      if (reportDate && item.reportDate.getTime() >= reportDate.getTime()) return;
+      if (weekdayKey && item.weekdayKey !== weekdayKey) return;
+
+      const periodKey = Utilities.formatDate(item.reportDate, FL2_TIMEZONE, 'yyyy-MM-dd');
+
+      if (!periodMap.has(periodKey)) {
+        periodMap.set(periodKey, {
+          reportDate: item.reportDate,
+          metric: emptyForwardMetric(),
+        });
+      }
+
+      addForwardMetric(periodMap.get(periodKey).metric, item.metric || emptyForwardMetric());
+    });
+  });
+
+  const periods = [...periodMap.values()]
+    .sort((a, b) => b.reportDate.getTime() - a.reportDate.getTime())
+    .slice(0, maxObs);
+
+  if (!periods.length) return emptyForwardMetric();
+
+  const out = emptyForwardMetric();
+
+  periods.forEach((period) => {
+    addForwardMetric(out, period.metric || emptyForwardMetric());
+  });
+
+  Object.keys(out).forEach((k) => {
+    out[k] /= periods.length;
+  });
+
   return out;
 }
 
