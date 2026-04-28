@@ -2307,6 +2307,7 @@ function initializeAutomationTriggersFromSheet_() {
     knownScenarios.forEach(function (scenarioCode) {
       const cfg = validConfigByCode[scenarioCode] || null;
       deletedDaily += deleteDailyTriggersForScenario_(scenarioCode, existingTriggers);
+      deletedRetry += deletePendingProcessTriggersForScenario_(scenarioCode, existingTriggers);
       deletedRetry += deletePendingRetryTriggersForScenario_(scenarioCode, existingTriggers);
 
       if (cfg && cfg.active) {
@@ -2386,6 +2387,14 @@ function runRetryScenarioAggregators_() {
 
 function runRetryScenarioBranches_() {
   runRetryScenarioByCode_(AUTO_CYCLE_BRANCHES);
+}
+
+function runProcessScenarioAggregators_() {
+  runProcessScenarioByCode_(AUTO_CYCLE_AGGREGATORS);
+}
+
+function runProcessScenarioBranches_() {
+  runProcessScenarioByCode_(AUTO_CYCLE_BRANCHES);
 }
 
 function runDailyScenarioByCode_(scenarioCode) {
@@ -2544,6 +2553,111 @@ function runDailyScenarioByCode_(scenarioCode) {
       return;
     }
 
+    const processRunAt = new Date(now.getTime() + AUTO_TRIGGER_DELAY_MINUTES * 60 * 1000);
+    deletePendingProcessTriggersForScenario_(scenarioCode);
+    createRetryTrigger_(cfg.processHandler, processRunAt);
+
+    state.lastStatus = 'WAITING_PROCESS';
+    state.currentAttempt = 0;
+    state.lastRunAt = now.toISOString();
+    state.lastError = '';
+    state.nextTriggerAt = processRunAt.toISOString();
+    state.nextTriggerHandler = cfg.processHandler;
+    state.pendingRetryHandler = cfg.processHandler;
+    state.pendingRetryAt = processRunAt.toISOString();
+    saveRuntimeState_(scenarioCode, state);
+
+    updateScenarioRuntimeRow_(scenarioCode, {
+      'ПоследнийСтатус': 'WAITING_PROCESS',
+      'ПоследнийЗапуск': formatMoscowDateTime_(now),
+      'ПоследняяОшибка': '',
+      'ТекущаяПопытка': 0,
+      'NextTriggerAt': formatMoscowDateTime_(processRunAt),
+      'NextTriggerHandler': cfg.processHandler,
+      'CycleId': cycleId,
+    });
+    logAutomationStep_(logCtx, 'create_process_trigger', 'OK', 'handler=' + cfg.processHandler + ', processRunAt=' + formatMoscowDateTime_(processRunAt));
+    logAutomationStep_(logCtx, 'run_daily_finish', 'OK', 'daily scenario finished, waiting process');
+    return;
+  });
+}
+
+function runProcessScenarioByCode_(scenarioCode) {
+  withScenarioLock_(scenarioCode, function () {
+    const cfg = getAppliedConfig_(scenarioCode);
+
+    if (!cfg || !cfg.active) {
+      Logger.log('Scenario %s is not active in applied config', scenarioCode);
+      return;
+    }
+
+    const now = new Date();
+    const state = getRuntimeState_(scenarioCode);
+    const attempt = Number(state.currentAttempt || 0) + 1;
+
+    state.currentAttempt = attempt;
+    state.lastRunAt = now.toISOString();
+    state.pendingRetryHandler = '';
+    state.pendingRetryAt = '';
+
+    const logCtx = {
+      runId: state.cycleId || buildCycleId_(scenarioCode, now),
+      scenarioCode: scenarioCode,
+      source: 'process_trigger',
+      attempt: attempt,
+    };
+
+    logAutomationStep_(
+      logCtx,
+      'run_process_start',
+      'START',
+      'processSourceDataFromDrive'
+    );
+
+    updateScenarioRuntimeRow_(scenarioCode, {
+      'ПоследнийСтатус': 'PROCESS_IN_PROGRESS',
+      'ПоследнийЗапуск': formatMoscowDateTime_(now),
+      'ПоследняяОшибка': '',
+      'ТекущаяПопытка': attempt,
+      'NextTriggerAt': '',
+      'NextTriggerHandler': '',
+      'CycleId': state.cycleId || '',
+    });
+
+    saveRuntimeState_(scenarioCode, state);
+
+    let preScheduledNextProcessAt = null;
+
+    if (attempt < cfg.maxAttempts) {
+      preScheduledNextProcessAt = new Date(now.getTime() + cfg.retryIntervalMinutes * 60 * 1000);
+
+      deletePendingProcessTriggersForScenario_(scenarioCode);
+      createRetryTrigger_(cfg.processHandler, preScheduledNextProcessAt);
+
+      state.lastStatus = 'PROCESS_IN_PROGRESS';
+      state.nextTriggerAt = preScheduledNextProcessAt.toISOString();
+      state.nextTriggerHandler = cfg.processHandler;
+      state.pendingRetryHandler = cfg.processHandler;
+      state.pendingRetryAt = preScheduledNextProcessAt.toISOString();
+
+      saveRuntimeState_(scenarioCode, state);
+
+      updateScenarioRuntimeRow_(scenarioCode, {
+        'ПоследнийСтатус': 'PROCESS_IN_PROGRESS',
+        'ТекущаяПопытка': attempt,
+        'NextTriggerAt': formatMoscowDateTime_(preScheduledNextProcessAt),
+        'NextTriggerHandler': cfg.processHandler,
+        'CycleId': state.cycleId || '',
+      });
+
+      logAutomationStep_(
+        logCtx,
+        'pre_schedule_process_retry',
+        'OK',
+        'handler=' + cfg.processHandler + ', nextRunAt=' + formatMoscowDateTime_(preScheduledNextProcessAt)
+      );
+    }
+
     try {
       runLoggedAutomationStep_(
         logCtx,
@@ -2556,65 +2670,116 @@ function runDailyScenarioByCode_(scenarioCode) {
           });
         }
       );
+
+      deletePendingProcessTriggersForScenario_(scenarioCode);
+
+      const firstAttemptAt = computeFirstRetryDate_(cfg.firstAttemptTime);
+
+      deletePendingRetryTriggersForScenario_(scenarioCode);
+      createRetryTrigger_(cfg.retryHandler, firstAttemptAt);
+
+      state.lastStatus = 'WAITING_RETRY';
+      state.currentAttempt = 0;
+      state.lastError = '';
+      state.nextTriggerAt = firstAttemptAt.toISOString();
+      state.nextTriggerHandler = cfg.retryHandler;
+      state.pendingRetryHandler = cfg.retryHandler;
+      state.pendingRetryAt = firstAttemptAt.toISOString();
+
+      saveRuntimeState_(scenarioCode, state);
+
+      updateScenarioRuntimeRow_(scenarioCode, {
+        'ПоследнийСтатус': 'WAITING_RETRY',
+        'ПоследнийЗапуск': formatMoscowDateTime_(now),
+        'ПоследняяОшибка': '',
+        'ТекущаяПопытка': 0,
+        'NextTriggerAt': formatMoscowDateTime_(firstAttemptAt),
+        'NextTriggerHandler': cfg.retryHandler,
+        'CycleId': state.cycleId || '',
+      });
+
+      logAutomationStep_(
+        logCtx,
+        'create_batch_retry_trigger',
+        'OK',
+        'handler=' + cfg.retryHandler + ', firstAttemptAt=' + formatMoscowDateTime_(firstAttemptAt)
+      );
+
+      logAutomationStep_(
+        logCtx,
+        'run_process_finish',
+        'OK',
+        'process scenario finished, waiting batch'
+      );
+
+      return;
     } catch (error) {
       const errorText = extractErrorMessage_(error);
-      state.lastStatus = 'PROCESS_ERROR';
-      state.lastRunAt = now.toISOString();
+
       state.lastError = errorText;
-      state.currentAttempt = 0;
+
+      if (attempt < cfg.maxAttempts) {
+        state.lastStatus = 'PROCESS_RETRY_SCHEDULED';
+        state.nextTriggerAt = preScheduledNextProcessAt ? preScheduledNextProcessAt.toISOString() : '';
+        state.nextTriggerHandler = cfg.processHandler;
+        state.pendingRetryHandler = cfg.processHandler;
+        state.pendingRetryAt = preScheduledNextProcessAt ? preScheduledNextProcessAt.toISOString() : '';
+
+        saveRuntimeState_(scenarioCode, state);
+
+        updateScenarioRuntimeRow_(scenarioCode, {
+          'ПоследнийСтатус': 'PROCESS_RETRY_SCHEDULED',
+          'ПоследнийЗапуск': formatMoscowDateTime_(now),
+          'ПоследняяОшибка': errorText,
+          'ТекущаяПопытка': attempt,
+          'NextTriggerAt': preScheduledNextProcessAt ? formatMoscowDateTime_(preScheduledNextProcessAt) : '',
+          'NextTriggerHandler': cfg.processHandler,
+          'CycleId': state.cycleId || '',
+        });
+
+        logAutomationStep_(
+          logCtx,
+          'run_process_finish',
+          'ERROR',
+          'process retry scheduled',
+          error
+        );
+
+        return;
+      }
+
+      deletePendingProcessTriggersForScenario_(scenarioCode);
+
+      state.lastStatus = 'PROCESS_FAILED';
       state.nextTriggerAt = '';
       state.nextTriggerHandler = '';
       state.pendingRetryHandler = '';
       state.pendingRetryAt = '';
+
       saveRuntimeState_(scenarioCode, state);
 
       updateScenarioRuntimeRow_(scenarioCode, {
-        'ПоследнийСтатус': 'PROCESS_ERROR',
+        'ПоследнийСтатус': 'PROCESS_FAILED',
         'ПоследнийЗапуск': formatMoscowDateTime_(now),
         'ПоследняяОшибка': errorText,
-        'ТекущаяПопытка': 0,
+        'ТекущаяПопытка': attempt,
         'NextTriggerAt': '',
         'NextTriggerHandler': '',
-        'CycleId': cycleId,
+        'CycleId': state.cycleId || '',
       });
 
       if (cfg.notifyIfProcessError) {
         sendAutomationNotification_(cfg.textProcessError + '\nДетали: ' + errorText);
       }
-      return;
+
+      logAutomationStep_(
+        logCtx,
+        'run_process_finish',
+        'ERROR',
+        'process attempts exhausted',
+        error
+      );
     }
-
-    const firstAttemptAt = computeFirstRetryDate_(cfg.firstAttemptTime);
-    runLoggedAutomationStep_(
-      logCtx,
-      'create_retry_trigger',
-      'handler=' + cfg.retryHandler + ', firstAttemptAt=' + formatMoscowDateTime_(firstAttemptAt),
-      function () {
-        deletePendingRetryTriggersForScenario_(scenarioCode);
-        createRetryTrigger_(cfg.retryHandler, firstAttemptAt);
-      }
-    );
-
-    state.lastStatus = 'WAITING_RETRY';
-    state.currentAttempt = 0;
-    state.lastRunAt = now.toISOString();
-    state.lastError = '';
-    state.nextTriggerAt = firstAttemptAt.toISOString();
-    state.nextTriggerHandler = cfg.retryHandler;
-    state.pendingRetryHandler = cfg.retryHandler;
-    state.pendingRetryAt = firstAttemptAt.toISOString();
-    saveRuntimeState_(scenarioCode, state);
-
-    updateScenarioRuntimeRow_(scenarioCode, {
-      'ПоследнийСтатус': 'WAITING_RETRY',
-      'ПоследнийЗапуск': formatMoscowDateTime_(now),
-      'ПоследняяОшибка': '',
-      'ТекущаяПопытка': 0,
-      'NextTriggerAt': formatMoscowDateTime_(firstAttemptAt),
-      'NextTriggerHandler': cfg.retryHandler,
-      'CycleId': cycleId,
-    });
-    logAutomationStep_(logCtx, 'run_daily_finish', 'OK', 'daily scenario finished');
   });
 }
 
@@ -2655,6 +2820,27 @@ function runRetryScenarioByCode_(scenarioCode) {
     });
 
     const batchHandler = resolveBatchHandler_(cfg.batchFunctionName);
+    let preScheduledNextRetryAt = null;
+    if (attempt < cfg.maxAttempts) {
+      preScheduledNextRetryAt = new Date(now.getTime() + cfg.retryIntervalMinutes * 60 * 1000);
+      deletePendingRetryTriggersForScenario_(scenarioCode);
+      createRetryTrigger_(cfg.retryHandler, preScheduledNextRetryAt);
+
+      state.lastStatus = 'RETRY_SCHEDULED';
+      state.nextTriggerAt = preScheduledNextRetryAt.toISOString();
+      state.nextTriggerHandler = cfg.retryHandler;
+      state.pendingRetryHandler = cfg.retryHandler;
+      state.pendingRetryAt = preScheduledNextRetryAt.toISOString();
+      saveRuntimeState_(scenarioCode, state);
+
+      updateScenarioRuntimeRow_(scenarioCode, {
+        'ПоследнийСтатус': 'RETRY_SCHEDULED',
+        'ТекущаяПопытка': attempt,
+        'NextTriggerAt': formatMoscowDateTime_(preScheduledNextRetryAt),
+        'NextTriggerHandler': cfg.retryHandler,
+        'CycleId': state.cycleId || '',
+      });
+    }
 
     try {
       runLoggedAutomationStep_(
@@ -2706,15 +2892,11 @@ function runRetryScenarioByCode_(scenarioCode) {
       );
 
       if (attempt < cfg.maxAttempts) {
-        const nextRunAt = new Date(now.getTime() + cfg.retryIntervalMinutes * 60 * 1000);
-        deletePendingRetryTriggersForScenario_(scenarioCode);
-        createRetryTrigger_(cfg.retryHandler, nextRunAt);
-
         state.lastStatus = 'RETRY_SCHEDULED';
-        state.nextTriggerAt = nextRunAt.toISOString();
+        state.nextTriggerAt = preScheduledNextRetryAt ? preScheduledNextRetryAt.toISOString() : '';
         state.nextTriggerHandler = cfg.retryHandler;
         state.pendingRetryHandler = cfg.retryHandler;
-        state.pendingRetryAt = nextRunAt.toISOString();
+        state.pendingRetryAt = preScheduledNextRetryAt ? preScheduledNextRetryAt.toISOString() : '';
         saveRuntimeState_(scenarioCode, state);
 
         updateScenarioRuntimeRow_(scenarioCode, {
@@ -2722,7 +2904,7 @@ function runRetryScenarioByCode_(scenarioCode) {
           'ПоследнийЗапуск': formatMoscowDateTime_(now),
           'ПоследняяОшибка': errorText,
           'ТекущаяПопытка': attempt,
-          'NextTriggerAt': formatMoscowDateTime_(nextRunAt),
+          'NextTriggerAt': preScheduledNextRetryAt ? formatMoscowDateTime_(preScheduledNextRetryAt) : '',
           'NextTriggerHandler': cfg.retryHandler,
           'CycleId': state.cycleId || '',
         });
@@ -2841,6 +3023,7 @@ function readAndValidateAutomationSheetConfig_() {
       textProcessError: str_(row[headers.indexOf('ТекстОшибкаProcess')]),
       textBatchError: str_(row[headers.indexOf('ТекстОшибкаBatch')]),
       dailyHandler: handlers.daily,
+      processHandler: handlers.process,
       retryHandler: handlers.retry,
     };
 
@@ -2856,10 +3039,18 @@ function readAndValidateAutomationSheetConfig_() {
 
 function getScenarioHandlers_(scenarioCode) {
   if (scenarioCode === AUTO_CYCLE_AGGREGATORS) {
-    return { daily: 'runDailyScenarioAggregators_', retry: 'runRetryScenarioAggregators_' };
+    return {
+      daily: 'runDailyScenarioAggregators_',
+      process: 'runProcessScenarioAggregators_',
+      retry: 'runRetryScenarioAggregators_',
+    };
   }
   if (scenarioCode === AUTO_CYCLE_BRANCHES) {
-    return { daily: 'runDailyScenarioBranches_', retry: 'runRetryScenarioBranches_' };
+    return {
+      daily: 'runDailyScenarioBranches_',
+      process: 'runProcessScenarioBranches_',
+      retry: 'runRetryScenarioBranches_',
+    };
   }
   throw new Error('Неизвестный сценарий: ' + scenarioCode);
 }
@@ -2999,6 +3190,11 @@ function deleteDailyTriggersForScenario_(scenarioCode, triggers) {
 
 function deletePendingRetryTriggersForScenario_(scenarioCode, triggers) {
   const handler = getScenarioHandlers_(scenarioCode).retry;
+  return deleteTriggersByHandlerName_(handler, triggers);
+}
+
+function deletePendingProcessTriggersForScenario_(scenarioCode, triggers) {
+  const handler = getScenarioHandlers_(scenarioCode).process;
   return deleteTriggersByHandlerName_(handler, triggers);
 }
 
