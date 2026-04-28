@@ -2404,6 +2404,9 @@ function runDailyScenarioByCode_(scenarioCode) {
       Logger.log('Scenario %s is not active in applied config', scenarioCode);
       return;
     }
+    if (!cfg.processHandler) {
+      throw new Error('processHandler is missing for scenario: ' + scenarioCode + '. Run initializeAutomationTriggersFromSheet_.');
+    }
 
     deleteDailyTriggersForScenario_(scenarioCode);
     createDailyTrigger_(cfg.dailyHandler, cfg.checkTime);
@@ -2554,31 +2557,70 @@ function runDailyScenarioByCode_(scenarioCode) {
     }
 
     const processRunAt = new Date(now.getTime() + AUTO_TRIGGER_DELAY_MINUTES * 60 * 1000);
-    deletePendingProcessTriggersForScenario_(scenarioCode);
-    createRetryTrigger_(cfg.processHandler, processRunAt);
 
-    state.lastStatus = 'WAITING_PROCESS';
-    state.currentAttempt = 0;
-    state.lastRunAt = now.toISOString();
-    state.lastError = '';
-    state.nextTriggerAt = processRunAt.toISOString();
-    state.nextTriggerHandler = cfg.processHandler;
-    state.pendingRetryHandler = cfg.processHandler;
-    state.pendingRetryAt = processRunAt.toISOString();
-    saveRuntimeState_(scenarioCode, state);
+    try {
+      runLoggedAutomationStep_(
+        logCtx,
+        'create_process_trigger',
+        'handler=' + cfg.processHandler + ', processRunAt=' + formatMoscowDateTime_(processRunAt),
+        function () {
+          if (!cfg.processHandler) {
+            throw new Error('processHandler is missing for scenario: ' + scenarioCode);
+          }
 
-    updateScenarioRuntimeRow_(scenarioCode, {
-      'ПоследнийСтатус': 'WAITING_PROCESS',
-      'ПоследнийЗапуск': formatMoscowDateTime_(now),
-      'ПоследняяОшибка': '',
-      'ТекущаяПопытка': 0,
-      'NextTriggerAt': formatMoscowDateTime_(processRunAt),
-      'NextTriggerHandler': cfg.processHandler,
-      'CycleId': cycleId,
-    });
-    logAutomationStep_(logCtx, 'create_process_trigger', 'OK', 'handler=' + cfg.processHandler + ', processRunAt=' + formatMoscowDateTime_(processRunAt));
-    logAutomationStep_(logCtx, 'run_daily_finish', 'OK', 'daily scenario finished, waiting process');
-    return;
+          deletePendingProcessTriggersForScenario_(scenarioCode);
+          createRetryTrigger_(cfg.processHandler, processRunAt);
+        }
+      );
+
+      state.lastStatus = 'WAITING_PROCESS';
+      state.currentAttempt = 0;
+      state.lastRunAt = now.toISOString();
+      state.lastError = '';
+      state.nextTriggerAt = processRunAt.toISOString();
+      state.nextTriggerHandler = cfg.processHandler;
+      state.pendingRetryHandler = cfg.processHandler;
+      state.pendingRetryAt = processRunAt.toISOString();
+      saveRuntimeState_(scenarioCode, state);
+
+      updateScenarioRuntimeRow_(scenarioCode, {
+        'ПоследнийСтатус': 'WAITING_PROCESS',
+        'ПоследнийЗапуск': formatMoscowDateTime_(now),
+        'ПоследняяОшибка': '',
+        'ТекущаяПопытка': 0,
+        'NextTriggerAt': formatMoscowDateTime_(processRunAt),
+        'NextTriggerHandler': cfg.processHandler,
+        'CycleId': cycleId,
+      });
+      logAutomationStep_(logCtx, 'run_daily_finish', 'OK', 'daily scenario finished, waiting process');
+      return;
+    } catch (error) {
+      const errorText = extractErrorMessage_(error);
+      state.lastStatus = 'PROCESS_ERROR';
+      state.lastRunAt = now.toISOString();
+      state.lastError = errorText;
+      state.currentAttempt = 0;
+      state.nextTriggerAt = '';
+      state.nextTriggerHandler = '';
+      state.pendingRetryHandler = '';
+      state.pendingRetryAt = '';
+      saveRuntimeState_(scenarioCode, state);
+
+      updateScenarioRuntimeRow_(scenarioCode, {
+        'ПоследнийСтатус': 'PROCESS_ERROR',
+        'ПоследнийЗапуск': formatMoscowDateTime_(now),
+        'ПоследняяОшибка': errorText,
+        'ТекущаяПопытка': 0,
+        'NextTriggerAt': '',
+        'NextTriggerHandler': '',
+        'CycleId': cycleId,
+      });
+
+      if (cfg.notifyIfProcessError) {
+        sendAutomationNotification_(cfg.textProcessError + '\nДетали: ' + errorText);
+      }
+      return;
+    }
   });
 }
 
@@ -3071,7 +3113,16 @@ function clearAppliedConfig_(scenarioCode) {
 
 function getAppliedConfig_(scenarioCode) {
   const raw = PropertiesService.getScriptProperties().getProperty('AUTO_CFG_' + scenarioCode);
-  return raw ? JSON.parse(raw) : null;
+  if (!raw) return null;
+
+  const cfg = JSON.parse(raw);
+  const handlers = getScenarioHandlers_(scenarioCode);
+
+  if (!cfg.dailyHandler) cfg.dailyHandler = handlers.daily;
+  if (!cfg.processHandler) cfg.processHandler = handlers.process;
+  if (!cfg.retryHandler) cfg.retryHandler = handlers.retry;
+
+  return cfg;
 }
 
 function createDefaultRuntimeState_() {
